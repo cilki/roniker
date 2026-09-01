@@ -876,6 +876,7 @@ fn type_to_string(ty: &syn::Type) -> String {
 /// to users verbatim in completions, hover, and inline type hints, so collapse
 /// the spurious punctuation spacing back to the conventional form
 /// (`Vec<String>`, `HashMap<String, u32>`, `crate::foo::Bar`).
+#[cfg(feature = "analyze")]
 fn normalize_type_tokens(s: &str) -> String {
     let mut out = s.to_string();
     for (from, to) in [
