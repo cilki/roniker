@@ -121,6 +121,12 @@ fn markdown_docs(value: String) -> Documentation {
     })
 }
 
+/// Convert an optional docstring into LSP documentation, cloning the text when
+/// present. Used for type/variant docs that are stored as `Option<String>`.
+fn optional_markdown_docs(docs: &Option<String>) -> Option<Documentation> {
+    docs.as_ref().map(|value| markdown_docs(value.clone()))
+}
+
 /// Build a completion item for a struct/variant field, labeled with the name
 /// serde expects in the RON file.
 fn field_completion(name: &str, field: &FieldInfo) -> CompletionItem {
@@ -275,7 +281,7 @@ fn enum_variant_value_completions(
                 label: name.clone(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some(format!("Variant of {}", type_info.name)),
-                documentation: variant.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
+                documentation: optional_markdown_docs(&variant.docs),
                 insert_text: Some(name),
                 ..Default::default()
             }
@@ -308,7 +314,7 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
                 label: type_name.to_string(),
                 kind: Some(CompletionItemKind::STRUCT),
                 detail: Some(format!("struct {}", type_info.name)),
-                documentation: type_info.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
+                documentation: optional_markdown_docs(&type_info.docs),
                 insert_text: Some(snippet),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
@@ -320,7 +326,7 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
                 label: type_name.to_string(),
                 kind: Some(CompletionItemKind::ENUM),
                 detail: Some(format!("enum {}", type_info.name)),
-                documentation: type_info.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
+                documentation: optional_markdown_docs(&type_info.docs),
                 insert_text: Some(format!("{}($0)", type_name)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
