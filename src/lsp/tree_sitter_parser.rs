@@ -1,4 +1,7 @@
-use super::ts_utils::{ancestors, child_by_kind, field_name, node_at_position, struct_name};
+use super::ts_utils::{
+    ancestors, child_by_kind, field_name, node_at_position, node_text, position_to_byte_offset,
+    struct_name,
+};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -37,9 +40,42 @@ pub fn find_type_context_at_position(
 
 /// Get the field name at a specific position in RON content using tree-sitter
 pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> Option<String> {
-    // Walk up to find a field node
     let current = node_at_position(tree, content, position)?;
+
+    // While a value is still being typed with no terminator (e.g. `mode: ` with
+    // no trailing comma yet), tree-sitter can't build a `field` node: the field
+    // name parses as a bare `identifier` and the dangling `:` becomes an `ERROR`
+    // sibling. The ancestor walk below would then skip past the real field and
+    // report the enclosing field instead (or nothing at all), so value
+    // completion falls back to offering every workspace type. Recover the field
+    // name from that `identifier ERROR(":")` pair first.
+    if let Some(field) = field_of_unterminated_value(current, content, position) {
+        return Some(field);
+    }
+
+    // Walk up to find a field node
     ancestors(current).find_map(|node| field_name(&node, content).map(str::to_string))
+}
+
+/// Recover the field name for a value that is mid-edit and has no terminator.
+///
+/// Such a value defeats tree-sitter's `field` production, leaving the field name
+/// as a bare `identifier` immediately followed by an `ERROR` node holding the
+/// `:`. When the cursor sits at or past that identifier within the same struct,
+/// treat it as the field being edited. The cursor check keeps a well-formed
+/// earlier field on the same struct from being misattributed to the dangling one.
+fn field_of_unterminated_value(node: Node, content: &str, position: Position) -> Option<String> {
+    let cursor_byte = position_to_byte_offset(content, position);
+    let struct_node = ancestors(node).find(|n| n.kind() == "struct")?;
+
+    let mut walk = struct_node.walk();
+    let children: Vec<Node> = struct_node.children(&mut walk).collect();
+    children
+        .windows(2)
+        .filter(|pair| pair[0].kind() == "identifier" && pair[1].kind() == "ERROR")
+        .filter(|pair| node_text(&pair[1], content).map(str::trim) == Some(":"))
+        .rfind(|pair| cursor_byte >= pair[0].start_byte())
+        .and_then(|pair| node_text(&pair[0], content).map(str::to_string))
 }
 
 /// Find the current variant context (enum variant name) at a position
@@ -207,8 +243,8 @@ fn collect_direct_field_names(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ts_utils::RonParser;
+    use super::*;
 
     fn parse(content: &str) -> Tree {
         RonParser::new().parse(content).unwrap()
@@ -234,7 +270,8 @@ mod tests {
     ),
 ))"#;
         // Position inside User
-        let contexts = find_type_context_at_position(&parse(content), content, Position::new(3, 20));
+        let contexts =
+            find_type_context_at_position(&parse(content), content, Position::new(3, 20));
         assert_eq!(contexts.len(), 3);
         assert_eq!(contexts[0].type_name, "PostReference");
         assert_eq!(contexts[1].type_name, "Post");
@@ -250,6 +287,39 @@ mod tests {
         // Position on "name" field
         let field = get_field_at_position(&parse(content), content, Position::new(1, 8));
         assert_eq!(field, Some("name".to_string()));
+    }
+
+    #[test]
+    fn test_get_field_at_position_unterminated_value() {
+        // A value being typed with no trailing comma: the field name parses as a
+        // bare identifier and the `:` becomes an ERROR node, so the plain
+        // ancestor walk can't see the `mode` field. The recovery should still
+        // report it.
+        let content = "AppConfig(\n    server: ServerConfig(\n        mode: \n    ),\n)";
+        // Cursor just after `mode: `.
+        let field = get_field_at_position(&parse(content), content, Position::new(2, 14));
+        assert_eq!(field, Some("mode".to_string()));
+    }
+
+    #[test]
+    fn test_get_field_at_position_unterminated_toplevel() {
+        // Same situation at the top level: the walk finds no enclosing field, so
+        // without recovery the field would come back as None.
+        let content = "Config(\n    mode: \n)";
+        let field = get_field_at_position(&parse(content), content, Position::new(1, 10));
+        assert_eq!(field, Some("mode".to_string()));
+    }
+
+    #[test]
+    fn test_get_field_at_position_unterminated_after_prior_field() {
+        // A well-formed earlier field must not be misattributed to the dangling
+        // one. Cursor on the earlier field's value still resolves to that field.
+        let content = "S(\n    name: \"x\",\n    mode: \n)";
+        let on_name = get_field_at_position(&parse(content), content, Position::new(1, 12));
+        assert_eq!(on_name, Some("name".to_string()));
+        // Cursor on the unterminated field resolves to it.
+        let on_mode = get_field_at_position(&parse(content), content, Position::new(2, 10));
+        assert_eq!(on_mode, Some("mode".to_string()));
     }
 
     #[test]
