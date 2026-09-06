@@ -76,13 +76,19 @@ pub fn generate_completions_for_type(
         CompletionContext::FieldValue => {
             // Find the field we're completing the value for
             if let Some(field_name) = find_current_field(tree, content, position) {
-                let mut completions =
+                let completions =
                     generate_value_completions_for_field(field_name, type_info, analyzer.clone());
 
-                // Also add all workspace symbols as potential completions
-                completions.extend(get_all_workspace_types(analyzer));
-
-                completions
+                // Only fall back to offering every workspace type when the field
+                // type couldn't be resolved to concrete value completions.
+                // Otherwise the type-directed suggestions above are the right
+                // (and only) ones — appending all types just buries them under,
+                // e.g., unrelated struct constructors for a `bool` or enum field.
+                if completions.is_empty() {
+                    get_all_workspace_types(analyzer)
+                } else {
+                    completions
+                }
             } else {
                 get_all_workspace_types(analyzer)
             }
@@ -624,6 +630,69 @@ mod tests {
         assert!(
             !labels.contains(&"ServerMode"),
             "the enum type name is not a valid value and should not be offered: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_field_value_completion_excludes_unrelated_types() {
+        // Completing an enum-typed field's value should offer that enum's
+        // variants only — not every other struct/enum registered in the
+        // workspace. Regression test: the FieldValue arm used to append
+        // `get_all_workspace_types` even when the field type resolved.
+        let parent = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "mode".to_string(),
+                type_name: "ServerMode".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let enum_type = TypeInfo {
+            name: "ServerMode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        // An unrelated type that must not leak into the suggestions.
+        let unrelated = TypeInfo {
+            name: "OtherConfig".to_string(),
+            kind: TypeKind::Struct(vec![]),
+            ..Default::default()
+        };
+
+        let mut analyzer = crate::rust_analyzer::RustAnalyzer::new();
+        analyzer.add_type(parent.clone());
+        analyzer.add_type(enum_type);
+        analyzer.add_type(unrelated);
+        let analyzer = std::sync::Arc::new(analyzer);
+
+        // A quoted value puts the cursor in `FieldValue` (not `StructType`)
+        // context, since the value text isn't a bare identifier.
+        let content = "Config(\n    mode: \"\"\n)";
+        let position = Position::new(1, 11); // inside the quotes, after `mode: `
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, position, &parent, analyzer);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"Development") && labels.contains(&"Production"),
+            "enum variants should be offered: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"OtherConfig") && !labels.contains(&"Config"),
+            "unrelated workspace types should not be appended: {:?}",
             labels
         );
     }
