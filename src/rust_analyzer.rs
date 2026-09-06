@@ -13,6 +13,11 @@ pub struct FieldInfo {
     /// `#[serde(rename = "...")]` on the field
     #[serde(default)]
     pub rename: Option<String>,
+    /// `#[serde(alias = "...")]` names on the field. Serde accepts each of these
+    /// (in addition to the serialized name) when deserializing, so they must not
+    /// be flagged as unknown fields.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// `#[serde(skip)]` or `#[serde(skip_deserializing)]` on the field
     #[serde(default)]
     pub skip: bool,
@@ -49,6 +54,15 @@ impl FieldInfo {
             return rename_all_field(&self.name, convention);
         }
         self.name.clone()
+    }
+
+    /// Whether serde would accept `name` for this field when deserializing:
+    /// its serialized name (honoring rename/rename_all), its Rust name, or any
+    /// `#[serde(alias = "...")]`.
+    pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
+        self.serialized_name(container_rename_all) == name
+            || self.name == name
+            || self.aliases.iter().any(|a| a == name)
     }
 }
 
@@ -214,13 +228,11 @@ impl TypeInfo {
         match &self.kind {
             TypeKind::Struct(fields) => fields
                 .iter()
-                .find(|f| f.serialized_name(rename_all) == field_name)
-                .or_else(|| fields.iter().find(|f| f.name == field_name)),
+                .find(|f| f.accepts_name(field_name, rename_all)),
             TypeKind::Enum(variants) => variants
                 .iter()
                 .flat_map(|v| &v.fields)
-                .find(|f| f.serialized_name(None) == field_name)
-                .or_else(|| self.find_field(field_name)),
+                .find(|f| f.accepts_name(field_name, None)),
         }
     }
 

@@ -299,6 +299,7 @@ fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
                     column,
                     has_default: serde_attrs.has_default,
                     rename: serde_attrs.rename,
+                    aliases: serde_attrs.aliases,
                     skip: serde_attrs.skip,
                     flatten: serde_attrs.flatten,
                 }
@@ -318,6 +319,7 @@ fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
                     column: None,
                     has_default: serde_attrs.has_default,
                     rename: serde_attrs.rename,
+                    aliases: serde_attrs.aliases,
                     skip: serde_attrs.skip,
                     flatten: serde_attrs.flatten,
                 }
@@ -418,6 +420,7 @@ mod serde_attributes {
     pub struct SerdeAttributes {
         pub has_default: bool,
         pub rename: Option<String>,
+        pub aliases: Vec<String>,
         pub rename_all: Option<String>,
         pub skip: bool,
         pub flatten: bool,
@@ -449,6 +452,10 @@ mod serde_attributes {
                             Ok(())
                         })?;
                     }
+                } else if meta.path.is_ident("alias") {
+                    // #[serde(alias = "...")], repeatable
+                    let lit: LitStr = meta.value()?.parse()?;
+                    out.aliases.push(lit.value());
                 } else if meta.path.is_ident("rename_all") {
                     if meta.input.peek(Token![=]) {
                         let lit: LitStr = meta.value()?.parse()?;
@@ -929,6 +936,7 @@ mod tests {
         let fields = info.fields().unwrap();
         assert_eq!(fields[0].name, "debug");
         assert_eq!(fields[0].rename, None);
+        assert!(fields[0].aliases.is_empty());
         assert!(!fields[0].skip);
         assert!(!fields[0].flatten);
 
@@ -1034,6 +1042,39 @@ mod tests {
         let config = config.clone();
         analyzer.remove_type("crate::Extra");
         assert!(config.has_unresolved_flatten(&analyzer));
+    }
+
+    #[test]
+    fn test_extract_field_aliases() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                #[derive(serde::Deserialize)]
+                pub struct Config {
+                    #[serde(alias = "old_port", alias = "legacy_port")]
+                    pub port: u16,
+                    pub host: String,
+                }
+                "#,
+            )
+            .unwrap();
+
+        let config = analyzer.get_type_info("crate::Config").unwrap();
+        let port = config.find_field("port").unwrap();
+        assert_eq!(port.aliases, vec!["old_port", "legacy_port"]);
+        assert!(config.find_field("host").unwrap().aliases.is_empty());
+
+        // An alias is an accepted deserialization name; the canonical serialized
+        // name is unchanged.
+        assert!(port.accepts_name("port", None));
+        assert!(port.accepts_name("old_port", None));
+        assert!(port.accepts_name("legacy_port", None));
+        assert!(!port.accepts_name("nonsense", None));
+
+        // Lookup by alias resolves to the field
+        assert!(config.find_field_serialized("old_port").is_some());
     }
 
     #[test]
