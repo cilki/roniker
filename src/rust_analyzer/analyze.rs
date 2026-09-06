@@ -189,8 +189,13 @@ impl RustAnalyzer {
         let start = struct_item.ident.span().start();
         let line = Some(start.line);
         let column = Some(start.column);
-        let has_default = has_default_derive(&struct_item.attrs);
-        let rename_all = serde_attributes::extract_serde_attributes(&struct_item.attrs).rename_all;
+        let serde_attrs = serde_attributes::extract_serde_attributes(&struct_item.attrs);
+        // A struct's fields are all optional when it can be filled from a
+        // default: either `#[derive(Default)]` or a container `#[serde(default)]`
+        // (the latter often paired with a hand-written `Default` impl, so the
+        // derive check alone would miss it).
+        let has_default = has_default_derive(&struct_item.attrs) || serde_attrs.has_default;
+        let rename_all = serde_attrs.rename_all;
 
         Some(TypeInfo {
             name: full_path,
@@ -575,6 +580,32 @@ mod tests {
 
         let status = analyzer.get_type_info("crate::models::Status");
         assert!(status.is_some(), "Status type should exist");
+    }
+
+    #[test]
+    fn test_container_serde_default_marks_struct_optional() {
+        let mut analyzer = RustAnalyzer::new();
+
+        // A container `#[serde(default)]` without `#[derive(Default)]` (paired
+        // with a manual `Default` impl) makes every field optional in serde, so
+        // roniker must not treat the fields as required.
+        let source = r#"
+            #[serde(default)]
+            pub struct ServerConfig {
+                pub host: String,
+                pub port: u16,
+            }
+        "#;
+
+        analyzer.add_source_with_prefix("crate", source).unwrap();
+
+        let info = analyzer
+            .get_type_info("crate::ServerConfig")
+            .expect("ServerConfig should exist");
+        assert!(
+            info.has_default,
+            "container #[serde(default)] should mark the struct as having a default"
+        );
     }
 
     #[test]
