@@ -84,48 +84,50 @@ impl RustAnalyzer {
         module_prefix: &str,
         file_path: Option<&Path>,
     ) {
-        for item in &syntax_tree.items {
-            if let Item::Struct(struct_item) = item {
-                if let Some(type_info) =
-                    self.extract_struct_info(struct_item, module_prefix, file_path)
-                {
-                    self.type_cache.insert(type_info.name.clone(), type_info);
-                }
-            } else if let Item::Enum(enum_item) = item {
-                if let Some(type_info) = self.extract_enum_info(enum_item, module_prefix, file_path)
-                {
-                    self.type_cache.insert(type_info.name.clone(), type_info);
-                }
-            } else if let Item::Type(type_item) = item {
-                self.extract_type_alias(type_item, module_prefix);
-            } else if let Item::Mod(mod_item) = item {
-                // Handle inline modules
-                if let Some((_, items)) = &mod_item.content {
-                    let mod_name = mod_item.ident.to_string();
-                    let nested_prefix = if module_prefix.is_empty() {
-                        mod_name
-                    } else {
-                        format!("{}::{}", module_prefix, mod_name)
-                    };
+        self.extract_types_from_items(&syntax_tree.items, module_prefix, file_path);
+    }
 
-                    for item in items {
-                        if let Item::Struct(struct_item) = item {
-                            if let Some(type_info) =
-                                self.extract_struct_info(struct_item, &nested_prefix, file_path)
-                            {
-                                self.type_cache.insert(type_info.name.clone(), type_info);
-                            }
-                        } else if let Item::Enum(enum_item) = item {
-                            if let Some(type_info) =
-                                self.extract_enum_info(enum_item, &nested_prefix, file_path)
-                            {
-                                self.type_cache.insert(type_info.name.clone(), type_info);
-                            }
-                        } else if let Item::Type(type_item) = item {
-                            self.extract_type_alias(type_item, &nested_prefix);
-                        }
+    /// Extract type definitions from a list of items, recursing into inline
+    /// modules so structs/enums/aliases nested at any depth are picked up under
+    /// their full module path.
+    fn extract_types_from_items(
+        &mut self,
+        items: &[Item],
+        module_prefix: &str,
+        file_path: Option<&Path>,
+    ) {
+        for item in items {
+            match item {
+                Item::Struct(struct_item) => {
+                    if let Some(type_info) =
+                        self.extract_struct_info(struct_item, module_prefix, file_path)
+                    {
+                        self.type_cache.insert(type_info.name.clone(), type_info);
                     }
                 }
+                Item::Enum(enum_item) => {
+                    if let Some(type_info) =
+                        self.extract_enum_info(enum_item, module_prefix, file_path)
+                    {
+                        self.type_cache.insert(type_info.name.clone(), type_info);
+                    }
+                }
+                Item::Type(type_item) => {
+                    self.extract_type_alias(type_item, module_prefix);
+                }
+                Item::Mod(mod_item) => {
+                    // Recurse into inline modules, extending the module path.
+                    if let Some((_, items)) = &mod_item.content {
+                        let mod_name = mod_item.ident.to_string();
+                        let nested_prefix = if module_prefix.is_empty() {
+                            mod_name
+                        } else {
+                            format!("{}::{}", module_prefix, mod_name)
+                        };
+                        self.extract_types_from_items(items, &nested_prefix, file_path);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -733,6 +735,51 @@ mod tests {
 
         let inner_type = analyzer.get_type_info("crate::inner::InnerType");
         assert!(inner_type.is_some(), "InnerType should be found");
+    }
+
+    #[test]
+    fn test_nested_inline_modules() {
+        let mut analyzer = RustAnalyzer::new();
+
+        // Modules nested more than one level deep, plus a type alias, must all
+        // be extracted under their full module path.
+        let source = r#"
+            pub mod outer {
+                pub struct OuterType {
+                    pub a: i32,
+                }
+
+                pub mod middle {
+                    pub mod inner {
+                        pub struct DeepType {
+                            pub b: i32,
+                        }
+
+                        pub type DeepAlias = DeepType;
+                    }
+                }
+            }
+        "#;
+
+        analyzer.add_source_with_prefix("crate", source).unwrap();
+
+        assert!(
+            analyzer.get_type_info("crate::outer::OuterType").is_some(),
+            "OuterType should be found"
+        );
+        assert!(
+            analyzer
+                .get_type_info("crate::outer::middle::inner::DeepType")
+                .is_some(),
+            "DeepType nested three modules deep should be found"
+        );
+        // The alias resolves to the deeply-nested type.
+        assert!(
+            analyzer
+                .get_type_info("crate::outer::middle::inner::DeepAlias")
+                .is_some(),
+            "DeepAlias nested three modules deep should resolve"
+        );
     }
 
     #[test]
