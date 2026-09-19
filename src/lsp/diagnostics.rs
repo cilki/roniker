@@ -105,7 +105,7 @@ pub async fn validate_ron_with_analyzer(
     match &type_info.kind {
         TypeKind::Struct(_) => {
             diagnostics.extend(
-                validate_struct_fields(tree, content, type_info, &parsed_value, Some(&analyzer))
+                validate_struct_fields(tree, content, type_info, &parsed_value, &analyzer)
                     .await,
             );
         }
@@ -330,7 +330,7 @@ async fn validate_struct_fields(
     content: &str,
     type_info: &TypeInfo,
     parsed_value: &Result<Value, ron::error::SpannedError>,
-    analyzer: Option<&Arc<RustAnalyzer>>,
+    analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
@@ -351,22 +351,9 @@ async fn validate_struct_fields(
 
     // The names serde accepts: serialized names, `skip` excluded, `flatten`
     // expanded when the analyzer can resolve the flattened type.
-    let effective_fields: Vec<(String, FieldInfo)> = match analyzer {
-        Some(analyzer) => type_info.effective_fields(analyzer),
-        None => fields
-            .iter()
-            .filter(|f| !f.skip)
-            .map(|f| {
-                (
-                    f.serialized_name(type_info.rename_all.as_deref()),
-                    f.clone(),
-                )
-            })
-            .collect(),
-    };
+    let effective_fields: Vec<(String, FieldInfo)> = type_info.effective_fields(analyzer);
     // A flatten target we can't resolve (e.g. HashMap) accepts arbitrary keys.
-    let allow_unknown_fields =
-        analyzer.is_some_and(|analyzer| type_info.has_unresolved_flatten(analyzer));
+    let allow_unknown_fields = type_info.has_unresolved_flatten(analyzer);
 
     if let Some(main_value) = ts_utils::find_main_value(tree)
         && main_value.kind() == "struct"
@@ -435,18 +422,16 @@ async fn validate_struct_fields(
                         // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
                         // validate_field_value_node handles all generic-wrapper cases
                         // uniformly, so there are no per-container special cases here.
-                        if let Some(analyzer) = analyzer {
-                            let deep_diags = Box::pin(validate_field_value_node(
-                                &value_node,
-                                content,
-                                &field_info.type_name,
-                                analyzer,
-                            ))
-                            .await;
-                            if !deep_diags.is_empty() {
-                                diagnostics.extend(deep_diags);
-                                continue; // skip primitive check for this field
-                            }
+                        let deep_diags = Box::pin(validate_field_value_node(
+                            &value_node,
+                            content,
+                            &field_info.type_name,
+                            analyzer,
+                        ))
+                        .await;
+                        if !deep_diags.is_empty() {
+                            diagnostics.extend(deep_diags);
+                            continue; // skip primitive check for this field
                         }
 
                         // Primitive / surface-level type check (uses RON-parsed typed values).
@@ -455,25 +440,15 @@ async fn validate_struct_fields(
                             && let Some(field_value) =
                                 map.get(&Value::String(field_name.to_string()))
                         {
-                            let type_mismatch = if let Some(analyzer) = analyzer {
-                                check_type_mismatch_with_enum_validation(
-                                    field_value,
-                                    &field_info.type_name,
-                                    Some(tree),
-                                    content,
-                                    field_name,
-                                    analyzer,
-                                )
-                                .await
-                            } else {
-                                check_type_mismatch_deep(
-                                    field_value,
-                                    &field_info.type_name,
-                                    Some(tree),
-                                    content,
-                                    field_name,
-                                )
-                            };
+                            let type_mismatch = check_type_mismatch_with_enum_validation(
+                                field_value,
+                                &field_info.type_name,
+                                Some(tree),
+                                content,
+                                field_name,
+                                analyzer,
+                            )
+                            .await;
                             if let Some(error_msg) = type_mismatch {
                                 let pos = value_node.start_position();
                                 let end_pos = value_node.end_position();
@@ -1247,10 +1222,8 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     }
 
     match value {
-        Value::Bool(_) => {
-            if clean_type != "bool" {
-                return Some(format!("expected {}, got bool", display_type));
-            }
+        Value::Bool(_) if clean_type != "bool" => {
+            return Some(format!("expected {}, got bool", display_type));
         }
         Value::Number(n) => {
             // Check for integer types
@@ -1327,20 +1300,15 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             }
             return Some(format!("expected {}, got map/struct", display_type));
         }
-        Value::Option(Some(_)) => {
-            if !clean_type.starts_with("Option<") {
-                return Some(format!("expected {}, got Some(...)", display_type));
-            }
+        Value::Option(Some(_)) if !clean_type.starts_with("Option<") => {
+            return Some(format!("expected {}, got Some(...)", display_type));
         }
-        Value::Option(None) => {
-            if !clean_type.starts_with("Option<") {
-                return Some(format!("expected {}, got None", display_type));
-            }
+        Value::Option(None) if !clean_type.starts_with("Option<") => {
+            return Some(format!("expected {}, got None", display_type));
         }
-        Value::Unit
-            if clean_type != "()" && clean_type != "unit" => {
-                return Some(format!("expected {}, got ()", display_type));
-            }
+        Value::Unit if clean_type != "()" && clean_type != "unit" => {
+            return Some(format!("expected {}, got ()", display_type));
+        }
         _ => {}
     }
 
@@ -1745,75 +1713,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ron_parsing_collections() {
-        // Test what RON actually parses for bad collection values
-        let content = r#"GenericTest(
-            bad_hashmap: "not a map",
-            bad_btreemap: 123,
-            bad_hashset: "not a set",
-        )"#;
-
-        let parsed = ron::from_str::<Value>(content);
-        println!("Parse result: {:?}", parsed);
-
-        if let Ok(Value::Map(map)) = parsed {
-            println!("Map has {} entries", map.len());
-            for (k, v) in map.iter() {
-                if let Value::String(key) = k {
-                    println!("  {}: {:?}", key, v);
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_invalid_enum_in_struct_field() {
-        // This test ensures that invalid enum variants in struct fields are caught
-        let analyzer = Arc::new(RustAnalyzer::new());
-        let type_info = TypeInfo {
-            name: "Post".to_string(),
-            kind: TypeKind::Struct(vec![
-                FieldInfo {
-                    name: "id".to_string(),
-                    type_name: "u32".to_string(),
-                    docs: None,
-                    line: None,
-                    column: None,
-                    has_default: false,
-                    ..Default::default()
-                },
-                FieldInfo {
-                    name: "post_type".to_string(),
-                    type_name: "PostType".to_string(),
-                    docs: None,
-                    line: None,
-                    column: None,
-                    has_default: false,
-                    ..Default::default()
-                },
-            ]),
-            docs: None,
-            source_file: None,
-            line: None,
-            column: None,
-            has_default: false,
-            ..Default::default()
-        };
-
-        // Invalid: "Longs" is not a valid PostType variant
-        // This will be caught when the LSP has access to the analyzer
-        // In the sync test version, it won't catch this (needs analyzer)
-        let content = r#"Post(
-            id: 1,
-            post_type: Longs,
-        )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
-        // Without analyzer, this won't be caught - that's expected
-        // With analyzer (in real LSP), check_type_mismatch_with_enum_validation will catch it
-        println!("Diagnostics for invalid enum variant: {:?}", diagnostics);
-    }
-
     #[tokio::test]
     async fn test_unnamed_struct_syntax() {
         let analyzer = Arc::new(RustAnalyzer::new());
@@ -1931,70 +1830,6 @@ mod tests {
             "Tuple variant with string should be valid. Got errors: {:?}",
             diagnostics
         );
-    }
-
-    #[tokio::test]
-    async fn test_enum_with_struct_variant() {
-        let analyzer = Arc::new(RustAnalyzer::new());
-        let type_info = TypeInfo {
-            name: "Message".to_string(),
-            kind: TypeKind::Enum(vec![EnumVariant {
-                name: "Text".to_string(),
-                fields: vec![
-                    FieldInfo {
-                        name: "content".to_string(),
-                        type_name: "String".to_string(),
-                        docs: None,
-                        line: None,
-                        column: None,
-                        has_default: false,
-                        ..Default::default()
-                    },
-                    FieldInfo {
-                        name: "sender".to_string(),
-                        type_name: "String".to_string(),
-                        docs: None,
-                        line: None,
-                        column: None,
-                        has_default: false,
-                        ..Default::default()
-                    },
-                ],
-                docs: None,
-                line: None,
-                column: None,
-                ..Default::default()
-            }]),
-            docs: None,
-            source_file: None,
-            line: None,
-            column: None,
-            has_default: false,
-            ..Default::default()
-        };
-
-        // Struct-like variant (this requires parentheses in RON)
-        let content = r#"Text { content: "hello", sender: "alice" }"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
-        // This might not validate correctly without proper struct-variant handling
-        // but we're testing that it parses and doesn't crash
-        println!("Struct variant diagnostics: {:?}", diagnostics);
-    }
-
-    #[test]
-    fn test_ron_parsing_enum_variant() {
-        // Test if RON can parse a standalone enum variant
-        let test_cases = vec![
-            "Detailed( length: 1 )",
-            "Detailed(length: 1)",
-            "Detailed { length: 1 }",
-        ];
-
-        for case in test_cases {
-            println!("Testing: {}", case);
-            let result = ron::from_str::<Value>(case);
-            println!("Result: {:?}", result);
-        }
     }
 
     #[test]
