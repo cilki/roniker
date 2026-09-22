@@ -157,7 +157,9 @@ fn generate_field_completions(
                 .effective_fields(analyzer)
                 .iter()
                 .filter(|(name, field)| {
-                    !used_fields.contains(name) && !used_fields.contains(&field.name)
+                    !used_fields.contains(name)
+                        && !used_fields.contains(&field.name)
+                        && !field.aliases.iter().any(|a| used_fields.contains(a))
                 })
                 .map(|(name, field)| field_completion(name, field))
                 .collect()

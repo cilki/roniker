@@ -200,10 +200,11 @@ async fn validate_enum_variant_fields_in_structs(
                     location.variant_name.clone(),
                 );
                 if let Some(Some(variant)) = variant_cache.get(&cache_key)
-                    && !variant
-                        .effective_fields()
-                        .iter()
-                        .any(|(name, f)| name == field_at_pos || f.name == *field_at_pos)
+                    && !variant.effective_fields().iter().any(|(name, f)| {
+                        name == field_at_pos
+                            || f.name == *field_at_pos
+                            || f.aliases.iter().any(|a| a == field_at_pos)
+                    })
                 {
                     let line = lines.get(location.line_idx).unwrap_or(&"");
                     if let Some(col) = line
@@ -383,7 +384,11 @@ async fn validate_struct_fields(
 
                 match effective_fields
                     .iter()
-                    .find(|(name, f)| *name == field_name || f.name == field_name)
+                    .find(|(name, f)| {
+                        *name == field_name
+                            || f.name == field_name
+                            || f.aliases.iter().any(|a| a.as_str() == field_name)
+                    })
                     .map(|(_, f)| f)
                 {
                     None => {
@@ -712,10 +717,14 @@ async fn validate_node_with_type_info<'a>(
                             continue;
                         }
 
-                        // Check if field exists in type (by serialized or Rust name)
+                        // Check if field exists in type (by serialized name, Rust name, or alias)
                         if let Some(field_info) = effective_fields
                             .iter()
-                            .find(|(name, f)| *name == field_name || f.name == field_name)
+                            .find(|(name, f)| {
+                                *name == field_name
+                                    || f.name == field_name
+                                    || f.aliases.iter().any(|a| a.as_str() == field_name)
+                            })
                             .map(|(_, f)| f)
                         {
                             // Delegate to the shared helper for all generic-wrapper and custom types
@@ -1661,6 +1670,57 @@ mod tests {
             0,
             "Should have no errors when User is registered. Got: {:?}",
             errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_alias_field_accepted() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                aliases: vec!["old_port".to_string()],
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+
+        // The alias is accepted — no "Unknown field" diagnostic
+        let content = r#"(old_port: 8080)"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field")),
+            "Aliased field name should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        // The canonical name still works
+        let content = r#"(port: 8080)"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field")),
+            "Canonical field name should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        // A genuinely unknown field is still reported
+        let content = r#"(bogus: 8080)"#;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field 'bogus'")),
+            "Unknown field should still be reported. Got: {:?}",
+            diagnostics
         );
     }
 
