@@ -775,8 +775,44 @@ async fn validate_node_with_type_info<'a>(
                 }
             }
         }
-        TypeKind::Enum(_variants) => {
-            // Enum validation - handled separately in validate_enum_variant_with_fields
+        TypeKind::Enum(variants) => {
+            // A nested enum-typed field value (e.g. `mode: Prod`). The bare
+            // variant name is either an identifier node or the leading name of
+            // a tuple/struct variant node (`Some(30)`, `Foo(a: 1)`). Validate it
+            // here; the document-root enum case is handled by
+            // validate_enum_variant_with_fields.
+            let variant_name = if node.kind() == "struct" {
+                ts_utils::struct_name(node, content)
+            } else {
+                ts_utils::node_text(node, content)
+            };
+
+            if let Some(variant_name) = variant_name.map(str::trim).filter(|n| !n.is_empty()) {
+                let rename_all = type_info.rename_all.as_deref();
+                let variant_match = variants.iter().any(|v| {
+                    v.serialized_name(rename_all) == variant_name
+                        || v.name == variant_name
+                        || v.name.to_lowercase() == variant_name.to_lowercase()
+                });
+                if !variant_match {
+                    let variant_names: Vec<String> = variants
+                        .iter()
+                        .map(|v| v.serialized_name(rename_all))
+                        .collect();
+                    let suggestion =
+                        did_you_mean(variant_name, variant_names.iter().map(|s| s.as_str()));
+                    diagnostics.push(Diagnostic {
+                        range: ts_utils::node_to_lsp_range(node),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "Unknown variant '{}' for enum '{}'{}",
+                            variant_name, type_info.name, suggestion
+                        ),
+                        code: code(codes::UNKNOWN_VARIANT),
+                        ..Default::default()
+                    });
+                }
+            }
         }
     }
 
@@ -1559,6 +1595,97 @@ mod tests {
                 .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
                     && d.message.contains("PostType")),
             "Should error on unknown type 'PostType'. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_enum_field_variant_validation() {
+        // A registered enum used as the value of a nested struct field must be
+        // validated: an invalid variant should error, a valid one should not.
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "ServerMode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Staging".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "mode".to_string(),
+                type_name: "ServerMode".to_string(),
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+
+        let config = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "server".to_string(),
+                type_name: "Server".to_string(),
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+
+        // A nested variant typo must be flagged with a "did you mean" suggestion.
+        let bad = "Config(\n    server: Server(\n        mode: Productio,\n    ),\n)";
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone()).await;
+        let variant_err = diagnostics.iter().find(|d| {
+            d.severity == Some(DiagnosticSeverity::ERROR)
+                && d.message.contains("Unknown variant 'Productio'")
+        });
+        assert!(
+            variant_err.is_some(),
+            "Invalid nested enum variant should error. Got: {:?}",
+            diagnostics
+        );
+        assert!(
+            variant_err
+                .unwrap()
+                .message
+                .contains("did you mean 'Production'"),
+            "Error should suggest the closest variant. Got: {}",
+            variant_err.unwrap().message
+        );
+
+        // A completely different word must still error, just without a suggestion.
+        let bad = "Config(\n    server: Server(\n        mode: Prod,\n    ),\n)";
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone()).await;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::ERROR)
+                    && d.message.contains("Unknown variant 'Prod'")
+            }),
+            "Invalid nested enum variant should error. Got: {:?}",
+            diagnostics
+        );
+
+        // Valid nested variant must not produce any error.
+        let good = "Config(\n    server: Server(\n        mode: Production,\n    ),\n)";
+        let diagnostics = validate_ron_with_analyzer(good, None, &config, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "Valid nested enum variant should not error. Got: {:?}",
             diagnostics
         );
     }
