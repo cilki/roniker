@@ -325,7 +325,16 @@ fn adjust_diagnostic_positions(diagnostics: Vec<Diagnostic>, line_offset: u32) -
         .collect()
 }
 
-/// Helper function for struct validation (async version with analyzer)
+/// The extra checks that only the document root can perform, because they need
+/// the RON-parsed value of the whole file (which understands typed values) in
+/// addition to the tree-sitter node.
+struct RootChecks<'a> {
+    tree: &'a Tree,
+    /// The parsed root value as a map, when it parsed and is one.
+    map: Option<&'a ron::Map>,
+}
+
+/// Validate the document root against a struct `TypeInfo`.
 async fn validate_struct_fields(
     tree: &Tree,
     content: &str,
@@ -333,179 +342,190 @@ async fn validate_struct_fields(
     parsed_value: &Result<Value, ron::error::SpannedError>,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
+    let Some(main_value) = super::ts_utils::find_main_value(tree) else {
+        return Vec::new();
+    };
+    let root = RootChecks {
+        tree,
+        map: parsed_value.as_ref().ok().and_then(|value| match value {
+            Value::Map(map) => Some(map),
+            _ => None,
+        }),
+    };
+    validate_struct_node(&main_value, content, type_info, analyzer, Some(&root)).await
+}
+
+/// Validate a `struct` node's named fields against a struct `TypeInfo`:
+/// duplicate fields, unknown fields, each field's value, and missing required
+/// fields.
+///
+/// Every struct in the document goes through here — the root via
+/// `validate_struct_fields` and nested values via `validate_node_with_type_info`
+/// — so the field-matching and missing-field rules exist in exactly one place.
+/// `root` is `Some` only for the document root and enables the checks that need
+/// the RON-parsed value; see `RootChecks`.
+async fn validate_struct_node(
+    node: &tree_sitter::Node<'_>,
+    content: &str,
+    type_info: &TypeInfo,
+    analyzer: &Arc<RustAnalyzer>,
+    root: Option<&RootChecks<'_>>,
+) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
+
+    if node.kind() != "struct" {
+        return diagnostics;
+    }
+    // Tuple/newtype structs have positional fields ("0", "1", ...) — named-field
+    // validation doesn't apply to them.
     let Some(fields) = type_info.fields() else {
         return diagnostics;
     };
-
-    // The RON-parsed map is used for primitive type checking (it understands typed values).
-    let ron_map = parsed_value.as_ref().ok().and_then(extract_map_from_value);
-
-    // Single tree-sitter parse: drives unknown-field detection, field value node access
-    // (for custom-type validation via validate_field_value_node), position reporting,
-    // and missing-field detection — no re-parsing or string extraction required.
-    // Tuple/newtype structs have positional fields ("0", "1", ...) — skip named-field validation
     if fields.iter().all(FieldInfo::is_positional) {
         return diagnostics;
     }
 
     // The names serde accepts: serialized names, `skip` excluded, `flatten`
     // expanded when the analyzer can resolve the flattened type.
-    let effective_fields: Vec<(String, FieldInfo)> = type_info.effective_fields(analyzer);
+    let effective_fields = type_info.effective_fields(analyzer);
     // A flatten target we can't resolve (e.g. HashMap) accepts arbitrary keys.
     let allow_unknown_fields = type_info.has_unresolved_flatten(analyzer);
 
-    if let Some(main_value) = ts_utils::find_main_value(tree)
-        && main_value.kind() == "struct"
-    {
+    let mut present_fields: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for field_node in ts_utils::struct_fields(node) {
+        let Some(field_name) = ts_utils::field_name(&field_node, content) else {
+            continue;
+        };
+        let name_range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+
+        // Duplicate field — report at the second occurrence
+        if !present_fields.insert(field_name) {
+            diagnostics.push(Diagnostic {
+                range: name_range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Duplicate field '{}'", field_name),
+                code: code(codes::DUPLICATE_FIELD),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        // Match the RON field against the type by serialized name, Rust name or alias
+        let Some(field_info) = effective_fields
+            .iter()
+            .find(|(name, f)| {
+                *name == field_name
+                    || f.name == field_name
+                    || f.aliases.iter().any(|a| a.as_str() == field_name)
+            })
+            .map(|(_, f)| f)
+        else {
+            if !allow_unknown_fields {
+                push_unknown_field(&mut diagnostics, field_node, field_name, &effective_fields);
+            }
+            continue;
+        };
+
+        let Some(value_node) = ts_utils::field_value(&field_node) else {
+            continue;
+        };
+
+        // Hint the field's declared type, but only when the RON doesn't name it already
+        if root.is_some()
+            && ts_utils::struct_name(&value_node, content).is_none()
+            && value_node.kind() != "identifier"
         {
-            let mut present_field_names: Vec<&str> = Vec::new();
-            let struct_field_nodes = ts_utils::struct_fields(&main_value);
+            diagnostics.push(Diagnostic {
+                range: name_range,
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                message: format!("{}: {}", field_info.name, field_info.type_name),
+                ..Default::default()
+            });
+        }
 
-            for field_node in struct_field_nodes {
-                let Some(field_name) = ts_utils::field_name(&field_node, content) else {
-                    continue;
-                };
+        // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
+        // validate_field_value_node handles all generic-wrapper cases
+        // uniformly, so there are no per-container special cases here.
+        let deep_diags = Box::pin(validate_field_value_node(
+            &value_node,
+            content,
+            &field_info.type_name,
+            analyzer,
+        ))
+        .await;
+        if !deep_diags.is_empty() {
+            diagnostics.extend(deep_diags);
+            continue; // skip the primitive check for this field
+        }
 
-                // Duplicate field — report at the second occurrence
-                if present_field_names.contains(&field_name) {
-                    let range =
-                        ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
-                    diagnostics.push(Diagnostic {
-                        range,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Duplicate field '{}'", field_name),
-                        code: code(codes::DUPLICATE_FIELD),
-                        ..Default::default()
-                    });
-                    continue;
-                }
+        // Primitive / surface-level type check (uses the RON-parsed typed values).
+        // Positions come directly from the tree-sitter node — no line adjustment.
+        if let Some(root) = root
+            && let Some(map) = root.map
+            && let Some(field_value) = map.get(&Value::String(field_name.to_string()))
+            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
+                field_value,
+                &field_info.type_name,
+                Some(root.tree),
+                content,
+                field_name,
+                analyzer,
+            )
+            .await
+        {
+            let pos = value_node.start_position();
+            let end_pos = value_node.end_position();
+            // For multi-line nodes, use end of first line to avoid inverted column ranges
+            let end_col = if end_pos.row > pos.row {
+                content.lines().nth(pos.row).unwrap_or("").len() as u32
+            } else {
+                end_pos.column as u32
+            };
+            diagnostics.push(Diagnostic {
+                range: Range::new(
+                    Position::new(pos.row as u32, pos.column as u32),
+                    Position::new(pos.row as u32, end_col),
+                ),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Type mismatch: {}", error_msg),
+                code: code(codes::TYPE_MISMATCH),
+                ..Default::default()
+            });
+        }
+    }
 
-                match effective_fields
-                    .iter()
-                    .find(|(name, f)| {
-                        *name == field_name
-                            || f.name == field_name
-                            || f.aliases.iter().any(|a| a.as_str() == field_name)
-                    })
-                    .map(|(_, f)| f)
-                {
-                    None => {
-                        if allow_unknown_fields {
-                            continue;
-                        }
-                        push_unknown_field(
-                            &mut diagnostics,
-                            field_node,
-                            field_name,
-                            &effective_fields,
-                        );
-                    }
-                    Some(field_info) => {
-                        present_field_names.push(field_name);
-
-                        let Some(value_node) = ts_utils::field_value(&field_node) else {
-                            continue;
-                        };
-
-                        // Emit an info diagnostic only if the type isn't already named in the RON
-                        let type_named_in_file = ts_utils::struct_name(&value_node, content)
-                            .is_some()
-                            || value_node.kind() == "identifier";
-                        if !type_named_in_file {
-                            let field_name_range =
-                                ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
-                            diagnostics.push(Diagnostic {
-                                range: field_name_range,
-                                severity: Some(DiagnosticSeverity::INFORMATION),
-                                message: format!("{}: {}", field_info.name, field_info.type_name),
-                                ..Default::default()
-                            });
-                        }
-
-                        // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
-                        // validate_field_value_node handles all generic-wrapper cases
-                        // uniformly, so there are no per-container special cases here.
-                        let deep_diags = Box::pin(validate_field_value_node(
-                            &value_node,
-                            content,
-                            &field_info.type_name,
-                            analyzer,
-                        ))
-                        .await;
-                        if !deep_diags.is_empty() {
-                            diagnostics.extend(deep_diags);
-                            continue; // skip primitive check for this field
-                        }
-
-                        // Primitive / surface-level type check (uses RON-parsed typed values).
-                        // Positions come directly from the tree-sitter node — no line adjustment.
-                        if let Some(map) = &ron_map
-                            && let Some(field_value) =
-                                map.get(&Value::String(field_name.to_string()))
-                        {
-                            let type_mismatch = check_type_mismatch_with_enum_validation(
-                                field_value,
-                                &field_info.type_name,
-                                Some(tree),
-                                content,
-                                field_name,
-                                analyzer,
-                            )
-                            .await;
-                            if let Some(error_msg) = type_mismatch {
-                                let pos = value_node.start_position();
-                                let end_pos = value_node.end_position();
-                                // For multi-line nodes, use end of first line
-                                // to avoid inverted column ranges
-                                let end_col = if end_pos.row > pos.row {
-                                    let line = content.lines().nth(pos.row).unwrap_or("");
-                                    line.len() as u32
-                                } else {
-                                    end_pos.column as u32
-                                };
-                                diagnostics.push(Diagnostic {
-                                    range: Range::new(
-                                        Position::new(pos.row as u32, pos.column as u32),
-                                        Position::new(pos.row as u32, end_col),
-                                    ),
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    message: format!("Type mismatch: {}", error_msg),
-                                    code: code(codes::TYPE_MISMATCH),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Missing required fields: compare expected fields against those we saw above.
-            if !type_info.has_default {
-                let missing_fields = missing_required_fields(&effective_fields, |name| {
-                    present_field_names.contains(&name)
-                });
-                if !missing_fields.is_empty() {
-                    let missing_names: Vec<String> =
-                        missing_fields.iter().map(|(name, _)| name.clone()).collect();
-                    let (line, col_start, col_end) = find_struct_name_position(tree);
-                    diagnostics.push(Diagnostic {
-                        range: Range::new(
-                            Position::new(line, col_start),
-                            Position::new(line, col_end),
-                        ),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Required fields: {}", missing_names.join(", ")),
-                        code: code(codes::MISSING_REQUIRED_FIELD),
-                        ..Default::default()
-                    });
-                }
-            }
+    // Missing required fields: compare expected fields against those we saw above.
+    if !type_info.has_default {
+        let missing =
+            missing_required_fields(&effective_fields, |name| present_fields.contains(name));
+        if !missing.is_empty() {
+            let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
+            diagnostics.push(Diagnostic {
+                range: struct_name_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Required fields: {}", missing_names.join(", ")),
+                code: code(codes::MISSING_REQUIRED_FIELD),
+                ..Default::default()
+            });
         }
     }
 
     diagnostics
+}
+
+/// The range to report a whole-struct diagnostic at: the struct's name, or a
+/// zero-width range at its start when it is written with unnamed syntax.
+fn struct_name_range(node: &tree_sitter::Node) -> Range {
+    match node.child(0) {
+        Some(name) if name.kind() == "identifier" => super::ts_utils::node_to_lsp_range(&name),
+        _ => {
+            let pos = node.start_position();
+            let pos = Position::new(pos.row as u32, pos.column as u32);
+            Range::new(pos, pos)
+        }
+    }
 }
 
 /// Validate a single field's value node against its declared Rust type.
@@ -686,94 +706,13 @@ async fn validate_node_with_type_info<'a>(
     let mut diagnostics = Vec::new();
 
     match &type_info.kind {
-        TypeKind::Struct(fields) => {
-            // Tuple/newtype structs have positional fields — skip named-field validation
-            if fields.iter().all(FieldInfo::is_positional) {
-                return diagnostics;
-            }
-
-            // Validate struct fields
-            if node.kind() == "struct" {
-                let field_nodes = ts_utils::struct_fields(node);
-                let mut present_fields = std::collections::HashSet::new();
-                let effective_fields = type_info.effective_fields(analyzer);
-                let allow_unknown_fields = type_info.has_unresolved_flatten(analyzer);
-
-                // Check each field in the RON
-                for field_node in field_nodes {
-                    if let Some(field_name) = ts_utils::field_name(&field_node, content) {
-                        // Duplicate field — report at the second occurrence
-                        if !present_fields.insert(field_name.to_string()) {
-                            let range = ts_utils::node_to_lsp_range(
-                                &field_node.child(0).unwrap_or(field_node),
-                            );
-                            diagnostics.push(Diagnostic {
-                                range,
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Duplicate field '{}'", field_name),
-                                code: code(codes::DUPLICATE_FIELD),
-                                ..Default::default()
-                            });
-                            continue;
-                        }
-
-                        // Check if field exists in type (by serialized name, Rust name, or alias)
-                        if let Some(field_info) = effective_fields
-                            .iter()
-                            .find(|(name, f)| {
-                                *name == field_name
-                                    || f.name == field_name
-                                    || f.aliases.iter().any(|a| a.as_str() == field_name)
-                            })
-                            .map(|(_, f)| f)
-                        {
-                            // Delegate to the shared helper for all generic-wrapper and custom types
-                            if let Some(value_node) = ts_utils::field_value(&field_node) {
-                                let field_diags = Box::pin(validate_field_value_node(
-                                    &value_node,
-                                    content,
-                                    &field_info.type_name,
-                                    analyzer,
-                                ))
-                                .await;
-                                diagnostics.extend(field_diags);
-                            }
-                        } else if !allow_unknown_fields {
-                            push_unknown_field(
-                                &mut diagnostics,
-                                field_node,
-                                field_name,
-                                &effective_fields,
-                            );
-                        }
-                    }
-                }
-
-                // Check for missing required fields
-                if !type_info.has_default {
-                    let missing = missing_required_fields(&effective_fields, |name| {
-                        present_fields.contains(name)
-                    });
-                    if !missing.is_empty() {
-                        let target_node = node.child(0).unwrap_or(*node);
-                        let range = ts_utils::node_to_lsp_range(&target_node);
-                        diagnostics.push(Diagnostic {
-                            range,
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!(
-                                "Required fields: {}",
-                                missing
-                                    .iter()
-                                    .map(|(name, _)| name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                            code: code(codes::MISSING_REQUIRED_FIELD),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
+        TypeKind::Struct(_) => {
+            diagnostics.extend(
+                Box::pin(validate_struct_node(
+                    node, content, type_info, analyzer, None,
+                ))
+                .await,
+            );
         }
         TypeKind::Enum(variants) => {
             // A nested enum-typed field value (e.g. `mode: Prod`). The bare
@@ -902,15 +841,7 @@ async fn validate_variant_field_data(
             // Validate fields based on whether it's named or unnamed
             if expected_fields.iter().all(|f| !f.is_positional()) {
                 // Named fields (struct-like variant)
-                if let Some(map) = extract_map_from_value(&value) {
-                    // First, check for unknown fields - extract from the parsed value, not raw data
-                    let mut ron_fields = Vec::new();
-                    for key in map.keys() {
-                        if let Value::String(field_name) = key {
-                            ron_fields.push(field_name.clone());
-                        }
-                    }
-
+                if let Value::Map(map) = &value {
                     // Validate field types
                     for field in expected_fields {
                         if let Some(field_value) = map.get(&Value::String(field.name.clone()))
@@ -1000,14 +931,6 @@ async fn validate_variant_field_data(
     diagnostics
 }
 
-/// Extract a map from a RON value (handles both raw maps and named struct syntax)
-fn extract_map_from_value(value: &Value) -> Option<&ron::Map> {
-    match value {
-        Value::Map(map) => Some(map),
-        _ => None,
-    }
-}
-
 /// Extract the variant name and data from raw RON text using tree-sitter
 /// Enums can be: Simple (Long), tuple (Long(...)), or struct-like (Long { ... })
 fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
@@ -1033,29 +956,6 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
 
     let main_value = main_value?;
     ts_utils::extract_enum_variant(&main_value, ron_content)
-}
-
-/// Find the position of the struct name in the RON content using tree-sitter
-/// Returns (line, col_start, col_end) where col_start == col_end indicates unnamed struct
-fn find_struct_name_position(tree: &Tree) -> (u32, u32, u32) {
-    use super::ts_utils;
-
-    if let Some(main_value) = ts_utils::find_main_value(tree)
-        && main_value.kind() == "struct"
-    {
-        if let Some(name_node) = main_value.child(0)
-            && name_node.kind() == "identifier"
-        {
-            let pos = name_node.start_position();
-            let end_pos = name_node.end_position();
-            return (pos.row as u32, pos.column as u32, end_pos.column as u32);
-        }
-        // Unnamed struct
-        let pos = main_value.start_position();
-        return (pos.row as u32, pos.column as u32, pos.column as u32);
-    }
-
-    (0, 0, 1)
 }
 
 /// Type checking with enum variant validation (async, uses analyzer)
@@ -1817,8 +1717,7 @@ mod tests {
 
         // The alias is accepted — no "Unknown field" diagnostic
         let content = r#"(old_port: 8080)"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -1829,8 +1728,7 @@ mod tests {
 
         // The canonical name still works
         let content = r#"(port: 8080)"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2407,8 +2305,7 @@ PostReference(Post(
 
         // The serialized (camelCase) name is what serde expects
         let content = "(maxConnections: 5)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2419,8 +2316,7 @@ PostReference(Post(
 
         // The Rust name is tolerated as a lenient fallback
         let content = "(max_connections: 5)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2431,8 +2327,7 @@ PostReference(Post(
 
         // A missing required field is reported under its serialized name
         let content = "(debugMode: true)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics
                 .iter()
@@ -2457,8 +2352,7 @@ PostReference(Post(
         };
 
         let content = r#"(kind: "full")"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2468,8 +2362,7 @@ PostReference(Post(
         );
 
         let content = r#"(totally_unknown: "full")"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics
                 .iter()
@@ -2520,8 +2413,7 @@ PostReference(Post(
         // Flattened fields are accepted at the top level; skipped fields are
         // not required and not accepted
         let content = r#"(name: "app", verbose: true)"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2532,8 +2424,7 @@ PostReference(Post(
 
         // Missing the flattened required field is an error
         let content = r#"(name: "app")"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics.iter().any(|d| d.message.contains("verbose")),
             "Missing flattened field should error. Got: {:?}",
@@ -2542,8 +2433,7 @@ PostReference(Post(
 
         // A skipped field in the file is unknown to serde
         let content = r#"(name: "app", verbose: true, runtime_state: "x")"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics
                 .iter()
@@ -2569,8 +2459,7 @@ PostReference(Post(
 
         // Flattening into a map means serde accepts arbitrary keys
         let content = r#"(anything: "goes", here: "too")"#;
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             !diagnostics
                 .iter()
@@ -2594,8 +2483,7 @@ PostReference(Post(
         };
 
         let content = "(\n    name: \"a\",\n    name: \"b\",\n)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         let duplicate: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("Duplicate field 'name'"))
@@ -2636,14 +2524,88 @@ PostReference(Post(
         };
 
         let content = "(\n    inner: (\n        value: 1,\n        value: 2,\n    ),\n)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics
                 .iter()
                 .any(|d| d.message.contains("Duplicate field 'value'")),
             "Nested duplicate should be reported. Got: {:?}",
             diagnostics
+        );
+    }
+
+    /// The document root and a nested field value share one struct validator,
+    /// so the same struct written in either position must raise the same errors.
+    #[tokio::test]
+    async fn test_root_and_nested_struct_validation_agree() {
+        let inner = TypeInfo {
+            name: "Inner".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "kept".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "other".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let outer = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "inner".to_string(),
+                type_name: "Inner".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(inner.clone());
+        analyzer.add_type(outer.clone());
+        let analyzer = Arc::new(analyzer);
+
+        // An unknown field, a duplicated field and a missing required field
+        let as_root = "(\n    bogus: 1,\n    kept: 1,\n    kept: 2,\n)";
+        let as_nested =
+            "(\n    inner: (\n        bogus: 1,\n        kept: 1,\n        kept: 2,\n    ),\n)";
+
+        let error_codes = |diagnostics: Vec<Diagnostic>| {
+            let mut codes: Vec<String> = diagnostics
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .filter_map(|d| match d.code {
+                    Some(NumberOrString::String(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            codes.sort();
+            codes.dedup();
+            codes
+        };
+
+        let root_codes = error_codes(
+            validate_ron_with_analyzer(as_root, None, &inner, analyzer.clone()).await,
+        );
+        let nested_codes = error_codes(
+            validate_ron_with_analyzer(as_nested, None, &outer, analyzer.clone()).await,
+        );
+
+        assert_eq!(
+            root_codes,
+            vec![
+                codes::DUPLICATE_FIELD,
+                codes::MISSING_REQUIRED_FIELD,
+                codes::UNKNOWN_FIELD
+            ]
+        );
+        assert_eq!(
+            nested_codes, root_codes,
+            "nested struct validation diverged from the root"
         );
     }
 
@@ -2714,8 +2676,7 @@ PostReference(Post(
 
         // A typo in a known field should be reported with a suggestion.
         let content = "(\n    ephemerl: true,\n)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics.iter().any(|d| d
                 .message
@@ -2726,8 +2687,7 @@ PostReference(Post(
 
         // A field bearing no resemblance to any known field gets no suggestion.
         let content = "(\n    hostname: true,\n)";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
             diagnostics
                 .iter()
