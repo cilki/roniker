@@ -13,10 +13,18 @@ impl RustAnalyzer {
     /// Add a Rust source file to the analyzer.
     ///
     /// Parses the file and extracts all type definitions (structs, enums, type aliases).
-    /// The module path is inferred from the file path (e.g., `src/models/user.rs` -> `crate::models::user`).
+    /// The module path is inferred from the file path by treating the first
+    /// `src` component as the crate root (e.g., `src/models/user.rs` ->
+    /// `crate::models::user`). A path with no `src` component gets no prefix at
+    /// all, and its types are registered under their bare names.
+    ///
+    /// `file_path` is also recorded on every type extracted from it and is what
+    /// go-to-definition resolves to, so pass an absolute path: a relative one
+    /// cannot be turned into the `file://` URL the LSP has to answer with, and
+    /// definition requests then come back empty.
     ///
     /// # Arguments
-    /// * `file_path` - Path to the Rust source file
+    /// * `file_path` - Absolute path to the Rust source file
     ///
     /// # Returns
     /// * `Ok(usize)` - Number of types extracted from the file
@@ -29,11 +37,13 @@ impl RustAnalyzer {
 
     /// Add Rust source code to the analyzer with an associated file path.
     ///
-    /// Parses the source and extracts all type definitions.
-    /// The module path is inferred from the file path.
+    /// Parses the source and extracts all type definitions. The file need not
+    /// exist; `file_path` is used exactly as [`RustAnalyzer::add_file`] uses it,
+    /// both to infer the module path and as the go-to-definition target, so the
+    /// same absolute-path and `src`-component rules apply.
     ///
     /// # Arguments
-    /// * `file_path` - Path to associate with this source (used for module path inference)
+    /// * `file_path` - Path to associate with this source (module path inference and go-to-definition)
     /// * `source` - Rust source code to parse
     ///
     /// # Returns

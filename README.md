@@ -33,10 +33,16 @@ appears twice:
 ```toml
 [dependencies]
 roniker = { version = "0.4", features = ["lsp"] }
+serde_json = "1"
 
 [build-dependencies]
 roniker = { version = "0.4", features = ["analyze"] }
+serde_json = "1"
 ```
+
+`RustAnalyzer` is carried from the build script to the application as JSON, so
+both halves need a serializer. Any `serde` format works; the steps below use
+`serde_json`.
 
 ### Step 2: build script
 
@@ -44,8 +50,10 @@ The build script reads your config structs and turns them into LSP state that
 can be serialized and embedded into your application:
 
 ```rs
+let config = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("src/config.rs");
+
 let mut analyzer = roniker::RustAnalyzer::with_root_type("crate::config::Configuration");
-analyzer.add_file(Path::new("src/config.rs"))?;
+analyzer.add_file(&config)?;
 
 let json = serde_json::to_string(&analyzer)?;
 let dest = PathBuf::from(std::env::var("OUT_DIR")?).join("rust_analyzer.json");
@@ -53,6 +61,21 @@ std::fs::write(&dest, json)?;
 
 println!("cargo:rerun-if-changed=src/config.rs");
 ```
+
+Give `add_file` an **absolute** path. Each path is recorded on the types it
+yielded and is what go-to-definition jumps to later; a relative path can't be
+turned into a `file://` URL, so `Path::new("src/config.rs")` analyzes your types
+perfectly well and then leaves every go-to-definition request unanswered.
+
+The type paths come from the file path as well: `add_file` treats the first
+`src` component as the crate root and builds the module path from what follows
+it, so types in `src/config.rs` are registered under `crate::config::`
+regardless of where the crate sits on disk — which is why
+`with_root_type("crate::config::Configuration")` matches above. A file with no
+`src` component in its path gets no prefix at all and its types are registered
+under their bare names (`Configuration`), in which case a root type of
+`crate::config::Configuration` resolves to nothing and the server starts up but
+answers nothing.
 
 ### Step 3: serve LSP
 
