@@ -79,8 +79,9 @@ pub async fn run_lsp() -> Result<()> {
 
 The second argument to `serve` decides whether informational diagnostics are
 published alongside the warnings and errors. These are inline type annotations
-(`ephemeral: bool`) attached to every field whose value doesn't already name its
-type; pass `false` to publish only real problems.
+(`ephemeral: bool`) attached to the fields of the root value — only those whose
+value doesn't already name its type, and only at the top level, so fields of
+nested structs don't get one. Pass `false` to publish only real problems.
 
 Now you should be able to run `<app> lsp` and it will start reading stdin and
 writing LSP messages to stdout.
@@ -160,15 +161,20 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
 
 ### Runnable examples
 
-Two examples in this repository do the same thing end to end, if you'd rather
-read working code:
+Two examples in this repository cover the two ways of getting types into the
+analyzer, if you'd rather read working code. Each is a complete language server
+speaking LSP over stdin/stdout, so point an editor at it rather than expecting
+it to print anything:
 
 ```sh
-# Builds its types by parsing examples/data/config_types.rs
+# Root type AppConfig, parsed out of examples/data/config_types.rs
 cargo run --example analyze_lsp --features "analyze,lsp"
 
-# Builds the same kind of types by hand, without the analyze feature
+# Root type Config, registered by hand without the analyze feature
 cargo run --example simple_lsp --features "lsp"
 ```
 
-`examples/data/example.ron` is a configuration file for the first one to open.
+They register different types, so each comes with its own file to open:
+`examples/data/example.ron` for `analyze_lsp`, `examples/data/simple.ron` for
+`simple_lsp`. Opening one of them against the other server reports its fields as
+unknown.

@@ -1045,6 +1045,11 @@ impl Backend {
 }
 
 /// Run the LSP server on stdin/stdout for the given analyzer.
+///
+/// `info_diagnostics` turns on the informational diagnostics that annotate a
+/// field with the type it is declared as (`port: u16`). They are only emitted
+/// for the root value's own fields, and only where the value doesn't already
+/// name its type; pass `false` to publish warnings and errors alone.
 pub async fn serve(analyzer: RustAnalyzer, info_diagnostics: bool) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
