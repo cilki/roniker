@@ -116,10 +116,47 @@ Opening a RON file matched by the pattern above gets you:
 
 - completions for field names, enum variants, and nested struct types
 - hover documentation pulled from the doc comments on your structs
-- diagnostics for unknown fields, missing required fields, and invalid enum
-  variants, with code actions to insert the fields that are missing
 - go-to-definition back to the Rust source, document symbols, rename, and
-  formatting
+  formatting (whole document and range)
+- diagnostics, each tagged with a stable code so your editor can filter them:
+  - `syntax-error` - the file doesn't parse as RON
+  - `unknown-field` - the struct has no such field
+  - `duplicate-field` - the same field is given twice
+  - `missing-required-field` - a field with no default was left out
+  - `unknown-variant` - no such variant on the enum the field expects
+  - `type-mismatch` - a primitive of the wrong shape, e.g. a string where a
+    `u16` is expected
+  - `unknown-type` - a field's declared type was never registered with the
+    analyzer, which usually means the build script is missing a source file
+- code actions:
+  - *Add N required fields* and *Add all N missing fields*, for structs and for
+    enum variants
+  - *Remove field '...'*, offered as a quick-fix on `unknown-field` and
+    `duplicate-field`
+  - *Make struct name explicit* and *Make field type explicit*, which turn
+    `server: (host: "localhost")` into `server: ServerConfig(host: "localhost")`
+
+### Serde attributes
+
+Names come from serde's view of your types rather than from the Rust
+identifiers, so the LSP accepts exactly what your application will deserialize:
+
+- `#[serde(rename = "...")]` and `#[serde(rename_all = "...")]` decide the name
+  completions insert and diagnostics expect. All of serde's cases are
+  understood: `lowercase`, `UPPERCASE`, `PascalCase`, `camelCase`, `snake_case`,
+  `SCREAMING_SNAKE_CASE`, `kebab-case`, and `SCREAMING-KEBAB-CASE`. The
+  `rename(deserialize = "...")` form is read too, since that's the direction a
+  config file travels.
+- `#[serde(alias = "...")]` names are accepted alongside the primary one.
+- `#[serde(skip)]` and `#[serde(skip_deserializing)]` fields are left out of
+  completions and reported as unknown if written.
+- `#[serde(flatten)]` expands the inner struct's fields into the outer one. When
+  the flattened type can't be resolved - a `HashMap`, say - unknown-field
+  reporting is switched off for that struct, because serde would accept any
+  extra key there.
+- A field stops counting as required if it is an `Option<T>`, carries
+  `#[serde(default)]` or `#[serde(default = "path")]`, or its container derives
+  `Default` or carries a container-level `#[serde(default)]`.
 
 ### Runnable examples
 

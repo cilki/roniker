@@ -138,15 +138,23 @@ pub fn closest_name<'a>(
 
 /// Fields that must be present in the RON: not `Option<T>`, no default.
 /// Takes `(serialized_name, field)` pairs (see `TypeInfo::effective_fields` /
-/// `EnumVariant::effective_fields`); a field counts as present under either
-/// its serialized or Rust name.
+/// `EnumVariant::effective_fields`); a field counts as present under any name
+/// serde would accept for it — its serialized name, its Rust name, or any
+/// `#[serde(alias = "...")]`. Missing the aliases here would report a field as
+/// absent even though the unknown-field check just accepted the alias that
+/// supplies it.
 pub fn missing_required_fields(
     fields: &[(String, FieldInfo)],
     is_present: impl Fn(&str) -> bool,
 ) -> Vec<(String, FieldInfo)> {
     fields
         .iter()
-        .filter(|(name, f)| !is_present(name) && !is_present(&f.name) && !f.is_optional())
+        .filter(|(name, f)| {
+            !is_present(name)
+                && !is_present(&f.name)
+                && !f.aliases.iter().any(|a| is_present(a))
+                && !f.is_optional()
+        })
         .cloned()
         .collect()
 }
@@ -240,6 +248,37 @@ mod tests {
         // Three edits on a long name: within the old length/3 bound but past
         // the absolute cap, so it is no longer treated as a plausible typo.
         assert_eq!(closest_name("abcdefXYZj", ["abcdefghij"]), None);
+    }
+
+    #[test]
+    fn test_missing_required_fields_accepts_alias() {
+        let field = FieldInfo {
+            name: "debug_mode".to_string(),
+            type_name: "bool".to_string(),
+            aliases: vec!["verbose".to_string()],
+            ..Default::default()
+        };
+        // The container renames to camelCase, so the serialized name is
+        // "debugMode" — but serde also accepts the alias.
+        let fields = [("debugMode".to_string(), field)];
+
+        assert!(
+            missing_required_fields(&fields, |n| n == "verbose").is_empty(),
+            "a field supplied under its alias is present"
+        );
+        assert!(
+            missing_required_fields(&fields, |n| n == "debugMode").is_empty(),
+            "a field supplied under its serialized name is present"
+        );
+        assert!(
+            missing_required_fields(&fields, |n| n == "debug_mode").is_empty(),
+            "a field supplied under its Rust name is present"
+        );
+        assert_eq!(
+            missing_required_fields(&fields, |_| false).len(),
+            1,
+            "a field supplied under no name at all is missing"
+        );
     }
 
     #[test]
