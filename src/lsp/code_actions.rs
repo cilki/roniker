@@ -192,7 +192,7 @@ fn generate_missing_variant_field_actions(
         };
 
         if !required_missing.is_empty()
-            && let Some(edit) = generate_field_insertions(tree, &required_missing)
+            && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
         {
             actions.push(single_file_action(
                 url,
@@ -204,7 +204,7 @@ fn generate_missing_variant_field_actions(
                     location.variant_name
                 ),
                 CodeActionKind::QUICKFIX,
-                vec![edit],
+                edits,
                 None,
             ));
         }
@@ -279,7 +279,7 @@ fn generate_missing_field_actions(
 
             // Code action: Add all required fields for variant
             if !required_missing.is_empty()
-                && let Some(edit) = generate_field_insertions(tree, &required_missing)
+                && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
             {
                 actions.push(single_file_action(
                     url,
@@ -290,14 +290,14 @@ fn generate_missing_field_actions(
                         variant_name
                     ),
                     CodeActionKind::QUICKFIX,
-                    vec![edit],
+                    edits,
                     None,
                 ));
             }
 
             // Code action: Add all fields for variant
             if !all_missing.is_empty()
-                && let Some(edit) = generate_field_insertions(tree, &all_missing)
+                && let Some(edits) = generate_field_insertions(tree, content, &all_missing)
             {
                 actions.push(single_file_action(
                     url,
@@ -308,7 +308,7 @@ fn generate_missing_field_actions(
                         variant_name
                     ),
                     CodeActionKind::QUICKFIX,
-                    vec![edit],
+                    edits,
                     None,
                 ));
             }
@@ -339,7 +339,7 @@ fn generate_missing_field_actions(
 
     // Code action: Add all required fields
     if !required_missing.is_empty()
-        && let Some(edit) = generate_field_insertions(tree, &required_missing)
+        && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
     {
         actions.push(single_file_action(
             url,
@@ -349,14 +349,14 @@ fn generate_missing_field_actions(
                 plural(required_missing.len())
             ),
             CodeActionKind::QUICKFIX,
-            vec![edit],
+            edits,
             None,
         ));
     }
 
     // Code action: Add all fields
     if !all_missing.is_empty()
-        && let Some(edit) = generate_field_insertions(tree, &all_missing)
+        && let Some(edits) = generate_field_insertions(tree, content, &all_missing)
     {
         actions.push(single_file_action(
             url,
@@ -366,7 +366,7 @@ fn generate_missing_field_actions(
                 plural(all_missing.len())
             ),
             CodeActionKind::QUICKFIX,
-            vec![edit],
+            edits,
             None,
         ));
     }
@@ -460,10 +460,18 @@ fn create_explicit_field_type_action(
 
 /// Generate text edits to insert missing fields using tree-sitter.
 /// Takes `(serialized_name, field)` pairs so inserted names match what serde expects.
+///
+/// The edits are anchored on the last thing inside the struct's parens rather
+/// than on the closing paren itself, so a separator is only emitted when the
+/// previous field doesn't already end in one. Anchoring on the closing paren
+/// instead produced `a: 1,\n,\n    b: 0` for any document whose last field
+/// carries a trailing comma — which is every document this server's own
+/// formatter emits.
 fn generate_field_insertions(
     tree: &Tree,
+    content: &str,
     missing_fields: &[(String, FieldInfo)],
-) -> Option<TextEdit> {
+) -> Option<Vec<TextEdit>> {
     use super::ts_utils;
 
     let root = tree.root_node();
@@ -485,44 +493,119 @@ fn generate_field_insertions(
         main_value
     };
 
-    // Find the closing paren position
-    let end_pos = struct_node.end_position();
-    let insert_line = end_pos.row as u32;
-    let insert_col = end_pos.column.saturating_sub(1) as u32; // Before the closing paren
+    let open = ts_utils::child_by_kind(&struct_node, "(")?;
+    // Tree-sitter supplies a zero-width `MISSING ")"` node while the struct is
+    // still unterminated, so this also resolves for a half-typed document.
+    let close = ts_utils::child_by_kind(&struct_node, ")")?;
 
-    // Check if we have existing fields to determine if we need a comma
-    let existing_fields = ts_utils::struct_fields(&struct_node);
-    let needs_comma = !existing_fields.is_empty();
+    // Anchor on the last node inside the parens, ignoring comments, so the edit
+    // lands after the final field instead of on the closing paren's line.
+    let mut cursor = struct_node.walk();
+    let anchor = struct_node
+        .children(&mut cursor)
+        .take_while(|child| child.id() != close.id())
+        .filter(|child| !ts_utils::is_comment(child))
+        .last()
+        .unwrap_or(open);
 
-    // Generate the field text
-    let mut field_text = String::new();
-    if needs_comma {
-        field_text.push_str(",\n");
-    } else if insert_line > 0 {
-        field_text.push('\n');
-    }
+    // A separator is needed unless the struct is empty or already ends in one.
+    let needs_separator = !matches!(anchor.kind(), "(" | ",");
 
-    // Use default 4-space indentation
-    let indent = "    ";
+    // Keep a struct that already fits on one line on one line.
+    let on_one_line = !content
+        .get(open.end_byte()..close.start_byte())
+        .unwrap_or_default()
+        .contains('\n');
 
-    for (i, (name, field)) in missing_fields.iter().enumerate() {
-        field_text.push_str(indent);
-        field_text.push_str(name);
-        field_text.push_str(": ");
-        field_text.push_str(&generate_default_value(&field.type_name));
-        if i < missing_fields.len() - 1 {
-            field_text.push(',');
+    let anchor_pos = anchor.end_position();
+    let separator_pos = Position::new(anchor_pos.row as u32, anchor_pos.column as u32);
+
+    let mut body = String::new();
+    if on_one_line {
+        if needs_separator {
+            body.push(' ');
         }
-        field_text.push('\n');
+        let rendered: Vec<String> = missing_fields
+            .iter()
+            .map(|(name, field)| format!("{}: {}", name, generate_default_value(&field.type_name)))
+            .collect();
+        body.push_str(&rendered.join(", "));
+    } else {
+        let indent = field_indent(content, &struct_node);
+        for (name, field) in missing_fields {
+            body.push('\n');
+            body.push_str(&indent);
+            body.push_str(name);
+            body.push_str(": ");
+            body.push_str(&generate_default_value(&field.type_name));
+            body.push(',');
+        }
     }
 
-    Some(TextEdit {
-        range: Range::new(
-            Position::new(insert_line, insert_col),
-            Position::new(insert_line, insert_col),
-        ),
-        new_text: field_text,
-    })
+    // Step over whatever is left on the anchor's line — a trailing comment, say
+    // — so the new fields start on a line of their own instead of landing
+    // inside it. The separator still has to go right after the anchor, which is
+    // why this can need two edits.
+    let bytes = content.as_bytes();
+    let anchor_end = anchor.end_byte();
+    let mut body_byte = anchor_end;
+    if !on_one_line {
+        let limit = close.start_byte().max(anchor_end);
+        while body_byte < limit && bytes[body_byte] != b'\n' {
+            body_byte += 1;
+        }
+    }
+    let body_pos = Position::new(
+        anchor_pos.row as u32,
+        (anchor_pos.column + (body_byte - anchor_end)) as u32,
+    );
+
+    let separator = if needs_separator { "," } else { "" };
+    if body_pos == separator_pos {
+        return Some(vec![TextEdit {
+            range: Range::new(body_pos, body_pos),
+            new_text: format!("{separator}{body}"),
+        }]);
+    }
+
+    let mut edits = Vec::new();
+    if needs_separator {
+        edits.push(TextEdit {
+            range: Range::new(separator_pos, separator_pos),
+            new_text: separator.to_string(),
+        });
+    }
+    edits.push(TextEdit {
+        range: Range::new(body_pos, body_pos),
+        new_text: body,
+    });
+    Some(edits)
+}
+
+/// The indentation to put in front of a field inserted into `struct_node`:
+/// copied from the struct's own fields when it has any on a line of their own,
+/// and otherwise one level deeper than the line the struct starts on.
+fn field_indent(content: &str, struct_node: &tree_sitter::Node) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let leading = |row: usize| -> String {
+        lines
+            .get(row)
+            .map(|line| {
+                line.chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let own_row = struct_node.start_position().row;
+    match super::ts_utils::struct_fields(struct_node)
+        .iter()
+        .find(|field| field.start_position().row != own_row)
+    {
+        Some(field) => leading(field.start_position().row),
+        None => leading(own_row) + "    ",
+    }
 }
 
 /// Detect which enum variant we're currently inside based on the content
@@ -1045,5 +1128,159 @@ mod tests {
 
         let actions = generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
         assert!(actions.is_empty());
+    }
+
+    /// Apply single-document `TextEdit`s so tests can assert on the document a
+    /// user would actually end up with. Edits are applied back to front, the
+    /// way a client does it.
+    fn apply(content: &str, edits: &[TextEdit]) -> String {
+        let offset = |pos| super::super::ts_utils::position_to_byte_offset(content, pos);
+        let mut ordered: Vec<&TextEdit> = edits.iter().collect();
+        ordered.sort_by_key(|e| std::cmp::Reverse(offset(e.range.start)));
+
+        let mut result = content.to_string();
+        for edit in ordered {
+            result.replace_range(
+                offset(edit.range.start)..offset(edit.range.end),
+                &edit.new_text,
+            );
+        }
+        result
+    }
+
+    fn missing(names: &[(&str, &str)]) -> Vec<(String, FieldInfo)> {
+        names
+            .iter()
+            .map(|(name, type_name)| {
+                (
+                    name.to_string(),
+                    FieldInfo {
+                        name: name.to_string(),
+                        type_name: type_name.to_string(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Insert `fields` into `content` and return the resulting document,
+    /// asserting it still parses as RON.
+    fn insert(content: &str, fields: &[(&str, &str)]) -> String {
+        let edits = generate_field_insertions(&parse(content), content, &missing(fields))
+            .expect("expected an insertion edit");
+        let result = apply(content, &edits);
+        ron::from_str::<ron::Value>(&result)
+            .unwrap_or_else(|e| panic!("insertion produced invalid RON ({e}):\n{result}"));
+        result
+    }
+
+    #[test]
+    fn test_insert_after_existing_trailing_comma() {
+        // The formatter this server ships emits a trailing comma after the last
+        // field, so this is the shape nearly every real document has.
+        assert_eq!(
+            insert("Cfg(\n    a: 1,\n)", &[("b", "u32")]),
+            "Cfg(\n    a: 1,\n    b: 0,\n)"
+        );
+    }
+
+    #[test]
+    fn test_insert_adds_missing_separator() {
+        assert_eq!(
+            insert("Cfg(\n    a: 1\n)", &[("b", "u32")]),
+            "Cfg(\n    a: 1,\n    b: 0,\n)"
+        );
+    }
+
+    #[test]
+    fn test_insert_multiple_fields() {
+        assert_eq!(
+            insert("Cfg(\n    a: 1,\n)", &[("b", "String"), ("c", "bool")]),
+            "Cfg(\n    a: 1,\n    b: \"\",\n    c: false,\n)"
+        );
+    }
+
+    #[test]
+    fn test_insert_into_empty_struct() {
+        assert_eq!(insert("Cfg(\n)", &[("b", "u32")]), "Cfg(\n    b: 0,\n)");
+        assert_eq!(insert("Cfg()", &[("b", "u32")]), "Cfg(b: 0)");
+    }
+
+    #[test]
+    fn test_insert_keeps_single_line_struct_on_one_line() {
+        assert_eq!(insert("Cfg(a: 1)", &[("b", "u32")]), "Cfg(a: 1, b: 0)");
+    }
+
+    #[test]
+    fn test_insert_after_trailing_comment() {
+        // The comma must not land inside the comment.
+        assert_eq!(
+            insert("Cfg(\n    a: 1 // about a\n)", &[("b", "u32")]),
+            "Cfg(\n    a: 1, // about a\n    b: 0,\n)"
+        );
+    }
+
+    #[test]
+    fn test_insert_matches_existing_indentation() {
+        assert_eq!(
+            insert("Cfg(\n\ta: 1,\n)", &[("b", "u32")]),
+            "Cfg(\n\ta: 1,\n\tb: 0,\n)"
+        );
+        assert_eq!(
+            insert("Cfg(\n        a: 1,\n)", &[("b", "u32")]),
+            "Cfg(\n        a: 1,\n        b: 0,\n)"
+        );
+    }
+
+    #[test]
+    fn test_insert_into_unterminated_struct() {
+        // Mid-edit documents have a zero-width MISSING ")" instead of a real
+        // one; the insertion still belongs after the last field.
+        let content = "Cfg(\n    a: 1,\n";
+        let edits = generate_field_insertions(&parse(content), content, &missing(&[("b", "u32")]))
+            .expect("expected an insertion edit");
+        assert_eq!(apply(content, &edits), "Cfg(\n    a: 1,\n    b: 0,\n");
+    }
+
+    #[test]
+    fn test_add_missing_fields_action_yields_valid_ron() {
+        // End to end through the public entry point, on the document shape the
+        // formatter produces.
+        let content = "Cfg(\n    a: 1,\n)";
+        let type_info = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "a".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "b".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let url = Url::parse("file:///test.ron").unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+
+        let actions =
+            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let edit_sets: Vec<&Vec<TextEdit>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) if a.title.contains("field") => {
+                    a.edit.as_ref()?.changes.as_ref()?.get(&url)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!edit_sets.is_empty(), "expected a missing-field action");
+        for edits in edit_sets {
+            assert_eq!(apply(content, edits), "Cfg(\n    a: 1,\n    b: \"\",\n)");
+        }
     }
 }
