@@ -1,0 +1,18 @@
+// Example RON configuration file
+// Open this file with the LSP running to see completions and diagnostics.
+//
+// This is a value of `Config`, the root type the simple_lsp example registers
+// by hand. The analyze_lsp example uses a different root type, so open
+// `example.ron` with that one instead.
+
+Config(
+    debug: true,
+    port: 8080,
+    database: DatabaseConfig(
+        host: "localhost",
+        port: 5432,
+        username: "app",
+        max_connections: Some(16),
+    ),
+    log_level: Info,
+)
