@@ -65,6 +65,30 @@ pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> 
 /// treat it as the field being edited. The cursor check keeps a well-formed
 /// earlier field on the same struct from being misattributed to the dangling one.
 fn field_of_unterminated_value(node: Node, content: &str, position: Position) -> Option<String> {
+    let (name, _) = unterminated_field_pair(node, content, position)?;
+    node_text(&name, content).map(str::to_string)
+}
+
+/// The field whose value the cursor is positioned to type, when that value is
+/// unterminated and so has no `field` node of its own: the cursor must be at or
+/// past the dangling `:`. Callers choosing between completing a field name and
+/// completing a value have no `field` node to go on in that case.
+pub fn unterminated_value_field(tree: &Tree, content: &str, position: Position) -> Option<String> {
+    let node = node_at_position(tree, content, position)?;
+    let (name, colon) = unterminated_field_pair(node, content, position)?;
+    if position_to_byte_offset(content, position) < colon.end_byte() {
+        return None;
+    }
+    node_text(&name, content).map(str::to_string)
+}
+
+/// Locate the `identifier` / `ERROR(":")` child pair that an unterminated field
+/// leaves behind in the struct containing `node`, if the cursor is at or past it.
+fn unterminated_field_pair<'a>(
+    node: Node<'a>,
+    content: &str,
+    position: Position,
+) -> Option<(Node<'a>, Node<'a>)> {
     let cursor_byte = position_to_byte_offset(content, position);
     let struct_node = ancestors(node).find(|n| n.kind() == "struct")?;
 
@@ -75,7 +99,7 @@ fn field_of_unterminated_value(node: Node, content: &str, position: Position) ->
         .filter(|pair| pair[0].kind() == "identifier" && pair[1].kind() == "ERROR")
         .filter(|pair| node_text(&pair[1], content).map(str::trim) == Some(":"))
         .rfind(|pair| cursor_byte >= pair[0].start_byte())
-        .and_then(|pair| node_text(&pair[0], content).map(str::to_string))
+        .map(|pair| (pair[0], pair[1]))
 }
 
 /// Find the current variant context (enum variant name) at a position

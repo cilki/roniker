@@ -8,11 +8,18 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::Tree;
 
+/// What the cursor is positioned to complete. The value contexts carry the field
+/// being given a value, which the tree node under the cursor cannot always be
+/// used to recover: at the end of a value being typed it resolves to the
+/// enclosing struct rather than to the field.
 #[derive(Debug, PartialEq)]
 enum CompletionContext {
-    FieldName,  // Completing field names (e.g., after comma or opening paren)
-    FieldValue, // Completing values after colon
-    StructType, // Completing struct type name for nested types
+    /// Completing field names (e.g., after comma or opening paren)
+    FieldName,
+    /// Completing a value after a colon
+    FieldValue(Option<String>),
+    /// Completing the struct type name of a nested value
+    StructType(Option<String>),
 }
 
 /// Determine what we're completing based on cursor position using tree-sitter
@@ -24,34 +31,110 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
         None => return CompletionContext::FieldName,
     };
 
-    // Check if we're inside a field node
-    if let Some(field_node) = ts_utils::find_ancestor_by_kind(node, "field") {
-        // Check if we're after the colon (in the value position)
-        let field_name_node = field_node.child(0);
-        if let (Some(field_name), Some(value_node)) =
-            (field_name_node, ts_utils::field_value(&field_node))
-        {
-            // If cursor is after the field name, we're completing a value
-            let name_end = field_name.end_position();
-            if position.line > name_end.row as u32
-                || (position.line == name_end.row as u32
-                    && position.character > name_end.column as u32)
-            {
-                // Check if there's already some text (might be completing a type)
-                if let Some(val_text) = ts_utils::node_text(&value_node, content)
-                    && val_text
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
-                {
-                    return CompletionContext::StructType;
-                }
-
-                return CompletionContext::FieldValue;
+    // Walk outward from the cursor and stop at whichever comes first: the body
+    // of a struct, or a field. Looking only for a `field` ancestor is not
+    // enough, because a nested struct is itself the value of an enclosing
+    // field — a cursor anywhere inside `server: ServerConfig(...)` would be
+    // read as the `server` field's value position, so field names of the
+    // nested struct were never offered.
+    for ancestor in ts_utils::ancestors(node) {
+        match ancestor.kind() {
+            // Inside this struct's parentheses. A cursor still on the struct's
+            // own name is not in the body yet, so it falls through to the
+            // enclosing field instead.
+            "struct" if inside_struct_body(&ancestor, position) => {
+                return struct_body_context(&ancestor, tree, content, position);
             }
+            "field" => return field_completion_context(&ancestor, content, position),
+            _ => {}
         }
     }
 
     // Default to field name completion
+    CompletionContext::FieldName
+}
+
+/// Whether `position` is inside `struct_node`'s parentheses rather than on the
+/// struct name that precedes them.
+fn inside_struct_body(struct_node: &tree_sitter::Node, position: Position) -> bool {
+    use super::ts_utils;
+
+    let Some(open_paren) = ts_utils::child_by_kind(struct_node, "(") else {
+        // No parentheses parsed yet (an incomplete struct); treat the whole
+        // node as its body, which is what the cursor is editing.
+        return true;
+    };
+    let open_end = open_paren.end_position();
+    position.line > open_end.row as u32
+        || (position.line == open_end.row as u32 && position.character >= open_end.column as u32)
+}
+
+/// The context for a cursor inside a struct's parentheses: the value position of
+/// the field it is in the middle of, or a field name when it sits in the space
+/// between fields.
+///
+/// The cursor's deepest node is unreliable here — at the end of a value being
+/// typed it resolves to the enclosing struct rather than the value — so the
+/// struct's own children are what decide.
+fn struct_body_context(
+    struct_node: &tree_sitter::Node,
+    tree: &Tree,
+    content: &str,
+    position: Position,
+) -> CompletionContext {
+    use super::ts_utils;
+
+    let cursor = ts_utils::position_to_byte_offset(content, position);
+    let mut walk = struct_node.walk();
+    let field = struct_node.children(&mut walk).find(|child| {
+        child.kind() == "field" && cursor >= child.start_byte() && cursor <= child.end_byte()
+    });
+    if let Some(field) = field {
+        return field_completion_context(&field, content, position);
+    }
+
+    // A value with no terminator yet (`mode: `) defeats tree-sitter's `field`
+    // production entirely, so there is no field child to find above.
+    match tree_sitter_parser::unterminated_value_field(tree, content, position) {
+        Some(field) => CompletionContext::FieldValue(Some(field)),
+        None => CompletionContext::FieldName,
+    }
+}
+
+/// The context for a cursor somewhere within `field_node`: a value (or the name
+/// of the type that value is about to be given) once the cursor is past the
+/// field's name, and otherwise the field name itself.
+fn field_completion_context(
+    field_node: &tree_sitter::Node,
+    content: &str,
+    position: Position,
+) -> CompletionContext {
+    use super::ts_utils;
+
+    let field_name_node = field_node.child(0);
+    if let (Some(field_name), Some(value_node)) =
+        (field_name_node, ts_utils::field_value(field_node))
+    {
+        // If cursor is after the field name, we're completing a value
+        let name_end = field_name.end_position();
+        if position.line > name_end.row as u32
+            || (position.line == name_end.row as u32 && position.character > name_end.column as u32)
+        {
+            let field = ts_utils::field_name(field_node, content).map(str::to_string);
+
+            // Check if there's already some text (might be completing a type)
+            if let Some(val_text) = ts_utils::node_text(&value_node, content)
+                && val_text
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+            {
+                return CompletionContext::StructType(field);
+            }
+
+            return CompletionContext::FieldValue(field);
+        }
+    }
+
     CompletionContext::FieldName
 }
 
@@ -73,9 +156,10 @@ pub fn generate_completions_for_type(
         CompletionContext::FieldName => {
             generate_field_completions(tree, content, position, type_info, &analyzer)
         }
-        CompletionContext::FieldValue => {
+        CompletionContext::FieldValue(field) => {
             // Find the field we're completing the value for
-            if let Some(field_name) = find_current_field(tree, content, position) {
+            if let Some(field_name) = field.or_else(|| find_current_field(tree, content, position))
+            {
                 let completions =
                     generate_value_completions_for_field(field_name, type_info, analyzer.clone());
 
@@ -93,9 +177,10 @@ pub fn generate_completions_for_type(
                 get_all_workspace_types(analyzer)
             }
         }
-        CompletionContext::StructType => {
+        CompletionContext::StructType(field) => {
             // Find the field type and provide struct completions
-            if let Some(field_name) = find_current_field(tree, content, position) {
+            if let Some(field_name) = field.or_else(|| find_current_field(tree, content, position))
+            {
                 generate_type_completions_for_field(field_name, type_info, analyzer)
             } else {
                 Vec::new()
@@ -777,5 +862,167 @@ mod tests {
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"fast-mode"), "got: {:?}", labels);
         assert!(labels.contains(&"legacy"), "got: {:?}", labels);
+    }
+
+    /// `AppConfig { server: ServerConfig { host, mode: ServerMode } }`, which is
+    /// enough nesting to exercise a cursor inside a struct that is itself a
+    /// field value.
+    fn nested_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+        let server = TypeInfo {
+            name: "ServerConfig".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "mode".to_string(),
+                    type_name: "ServerMode".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let mode = TypeInfo {
+            name: "ServerMode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "AppConfig".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "debug".to_string(),
+                    type_name: "bool".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "server".to_string(),
+                    type_name: "ServerConfig".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(root);
+        analyzer.add_type(server.clone());
+        analyzer.add_type(mode);
+        (server, Arc::new(analyzer))
+    }
+
+    fn labels_at(
+        content: &str,
+        position: Position,
+        type_info: &TypeInfo,
+        analyzer: Arc<RustAnalyzer>,
+    ) -> Vec<String> {
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        generate_completions_for_type(&tree, content, position, type_info, analyzer)
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    #[test]
+    fn test_field_names_completed_inside_nested_struct() {
+        // Regression test: a nested struct is the value of the field that holds
+        // it, so a cursor inside its parentheses used to be read as that outer
+        // field's value position. Field name completion then fell through to
+        // offering every type in the workspace instead of the nested struct's
+        // own fields.
+        let (server, analyzer) = nested_fixture();
+        let content =
+            "AppConfig(\n    server: ServerConfig(\n        host: \"x\",\n        \n    ),\n)\n";
+
+        let labels = labels_at(content, Position::new(3, 8), &server, analyzer);
+
+        assert!(
+            labels.contains(&"mode".to_string()),
+            "the nested struct's own fields should be offered: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"ServerConfig".to_string())
+                && !labels.contains(&"AppConfig".to_string()),
+            "workspace types are not field names: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_value_still_completed_inside_nested_struct() {
+        // The flip side of the test above: inside the same nested struct, a
+        // cursor past a field's colon is a value position, and the enum field's
+        // variants are what belongs there.
+        let (server, analyzer) = nested_fixture();
+        let content = "AppConfig(\n    server: ServerConfig(\n        host: \"x\",\n        mode: \n    ),\n)\n";
+
+        let labels = labels_at(content, Position::new(3, 14), &server, analyzer);
+
+        assert!(
+            labels.contains(&"Production".to_string()),
+            "the enum field's variants should be offered: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"host".to_string()),
+            "a value position is not a field name position: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_struct_type_completed_at_end_of_line() {
+        // The cursor an editor sends sits at the end of what has been typed,
+        // where the deepest tree node is the enclosing struct rather than the
+        // value. The field being given a value has to come from the struct's
+        // children, or the nested type never gets offered.
+        let (_, analyzer) = nested_fixture();
+        let root = analyzer.get_type_info("AppConfig").unwrap().clone();
+
+        for content in [
+            "AppConfig(\n    debug: true,\n    server: Serv\n)\n",
+            "AppConfig(\n    debug: true,\n    server: Serv,\n)\n",
+        ] {
+            let labels = labels_at(content, Position::new(2, 16), &root, analyzer.clone());
+            assert!(
+                labels.contains(&"ServerConfig".to_string()),
+                "the field's declared type should be offered for {:?}: {:?}",
+                content,
+                labels
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_names_still_completed_at_top_level() {
+        let (_, analyzer) = nested_fixture();
+        let root = analyzer.get_type_info("AppConfig").unwrap().clone();
+        let content = "AppConfig(\n    debug: true,\n    \n)\n";
+
+        let labels = labels_at(content, Position::new(2, 4), &root, analyzer);
+
+        assert!(
+            labels.contains(&"server".to_string()),
+            "unused top-level fields should be offered: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"debug".to_string()),
+            "fields already present should not be offered: {:?}",
+            labels
+        );
     }
 }
