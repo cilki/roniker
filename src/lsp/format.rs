@@ -197,6 +197,62 @@ fn emit_remaining_comments(
     }
 }
 
+/// The named children of a node that carry data, with comments filtered out.
+fn value_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    ts_utils::named_children(node)
+        .into_iter()
+        .filter(|n| !ts_utils::is_comment(n))
+        .collect()
+}
+
+/// Lay out the items of a container one per line, with their comments: leading
+/// comments above the item, the item itself at one extra level of indentation,
+/// a terminating comma, and any trailing comment after it. Comments that follow
+/// the last item are emitted before the caller's closing delimiter.
+///
+/// This is the one layout rule shared by structs, arrays, maps and tuples —
+/// they differ only in the delimiters, which the caller writes, and in what
+/// their items are. Nothing at all is written for an empty container, so the
+/// caller's delimiters stay adjacent.
+fn format_items(
+    node: &Node,
+    content: &str,
+    output: &mut String,
+    indent_level: usize,
+    indent_str: &str,
+    emitted: &mut HashSet<usize>,
+    items: &[Node<'_>],
+) {
+    if items.is_empty() {
+        return;
+    }
+
+    let comments = collect_inner_comments(node, content);
+
+    output.push('\n');
+    for (i, item) in items.iter().enumerate() {
+        emit_leading_comments(
+            output,
+            &comments,
+            emitted,
+            items,
+            i,
+            indent_str,
+            indent_level,
+        );
+
+        output.push_str(&indent_str.repeat(indent_level + 1));
+        format_node(item, content, output, indent_level + 1, indent_str, emitted);
+        output.push(',');
+
+        emit_trailing_comment(output, &comments, emitted, items, i);
+        output.push('\n');
+    }
+
+    emit_remaining_comments(output, &comments, emitted, items, indent_str, indent_level);
+    output.push_str(&indent_str.repeat(indent_level));
+}
+
 /// Format RON content using tree-sitter AST, preserving comments
 pub fn format_ron(content: &str) -> String {
     let indent_str = "    "; // 4 spaces
@@ -233,7 +289,6 @@ pub fn format_ron(content: &str) -> String {
             &mut result,
             0,
             indent_str,
-            false,
             &mut emitted_comments,
         );
     }
@@ -248,57 +303,18 @@ fn format_node(
     output: &mut String,
     indent_level: usize,
     indent_str: &str,
-    inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
-    let kind = node.kind();
-
-    match kind {
-        "struct" => format_struct(
-            node,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            inline,
-            emitted,
-        ),
-        "array" => format_array(
-            node,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            inline,
-            emitted,
-        ),
-        "map" => format_map(
-            node,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            inline,
-            emitted,
-        ),
-        "tuple" => format_tuple(
-            node,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            inline,
-            emitted,
-        ),
+    match node.kind() {
+        "struct" => format_struct(node, content, output, indent_level, indent_str, emitted),
+        "array" => format_array(node, content, output, indent_level, indent_str, emitted),
+        "map" => format_map(node, content, output, indent_level, indent_str, emitted),
+        "tuple" => format_tuple(node, content, output, indent_level, indent_str, emitted),
         "field" => format_field(node, content, output, indent_level, indent_str, emitted),
-        "string" | "integer" | "float" | "boolean" | "char" | "identifier" | "unit" => {
-            // Leaf nodes - just output their text
-            if let Some(text) = ts_utils::node_text(node, content) {
-                output.push_str(text);
-            }
-        }
+        "map_entry" => format_map_entry(node, content, output, indent_level, indent_str, emitted),
+        // Leaf nodes, and anything the grammar hands us that we don't lay out
+        // ourselves, are reproduced verbatim
         _ => {
-            // For other nodes, just output their text as-is
             if let Some(text) = ts_utils::node_text(node, content) {
                 output.push_str(text);
             }
@@ -313,7 +329,6 @@ fn format_struct(
     output: &mut String,
     indent_level: usize,
     indent_str: &str,
-    _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
     // Get struct name if it exists
@@ -321,114 +336,90 @@ fn format_struct(
         output.push_str(name);
     }
 
-    // Check if empty
-    let is_empty = ts_utils::is_empty_structure(node);
-
-    if is_empty {
+    if ts_utils::is_empty_structure(node) {
         output.push_str("()");
         return;
     }
 
     output.push('(');
 
-    // Get all fields and values to determine if this is a tuple-style or field-style struct
+    // A struct is either field-style — `User(id: 1)`, laid out like every other
+    // container — or tuple-style, which has its own rules
     let fields = ts_utils::struct_fields(node);
+    if fields.is_empty() {
+        format_struct_values(node, content, output, indent_level, indent_str, emitted);
+    } else {
+        format_items(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            emitted,
+            &fields,
+        );
+    }
+
+    output.push(')');
+}
+
+/// Format the values of a tuple-style struct (`Some("value")`, `Point(1, 2)`).
+/// These are the one container whose items are *separated* rather than
+/// terminated by commas, and a lone value stays on the struct's own line, so
+/// they don't go through `format_items`.
+fn format_struct_values(
+    node: &Node,
+    content: &str,
+    output: &mut String,
+    indent_level: usize,
+    indent_str: &str,
+    emitted: &mut HashSet<usize>,
+) {
     let values = ts_utils::struct_values(node, content);
+    if values.is_empty() {
+        return;
+    }
 
-    // Collect comments that are direct children of this struct
-    let inner_comments = collect_inner_comments(node, content);
+    let comments = collect_inner_comments(node, content);
+    let inline = values.len() == 1;
 
-    // If we have fields, use field formatting
-    if !fields.is_empty() {
+    if !inline {
         output.push('\n');
+    }
 
-        for (i, field) in fields.iter().enumerate() {
+    for (i, value) in values.iter().enumerate() {
+        if !inline {
             emit_leading_comments(
                 output,
-                &inner_comments,
+                &comments,
                 emitted,
-                &fields,
+                &values,
                 i,
                 indent_str,
                 indent_level,
             );
-
             output.push_str(&indent_str.repeat(indent_level + 1));
-            format_field(
-                field,
-                content,
-                output,
-                indent_level + 1,
-                indent_str,
-                emitted,
-            );
-
-            // Add comma after each field
-            output.push(',');
-
-            emit_trailing_comment(output, &inner_comments, emitted, &fields, i);
-
-            output.push('\n');
         }
 
-        emit_remaining_comments(
+        format_node(
+            value,
+            content,
             output,
-            &inner_comments,
-            emitted,
-            &fields,
+            indent_level + 1,
             indent_str,
-            indent_level,
+            emitted,
         );
 
-        output.push_str(&indent_str.repeat(indent_level));
-    } else if !values.is_empty() {
-        // Tuple-style struct like Some("value") - these should stay inline if single element
-        let should_inline = values.len() == 1;
-
-        if !should_inline {
-            output.push('\n');
-        }
-
-        for (i, child) in values.iter().enumerate() {
-            if !should_inline {
-                emit_leading_comments(
-                    output,
-                    &inner_comments,
-                    emitted,
-                    &values,
-                    i,
-                    indent_str,
-                    indent_level,
-                );
-                output.push_str(&indent_str.repeat(indent_level + 1));
-            }
-            format_node(
-                child,
-                content,
-                output,
-                indent_level + 1,
-                indent_str,
-                should_inline,
-                emitted,
-            );
-
-            if i < values.len() - 1 {
-                output.push(',');
-                if !should_inline {
-                    output.push('\n');
-                } else {
-                    output.push(' ');
-                }
-            }
-        }
-
-        if !should_inline {
-            output.push('\n');
-            output.push_str(&indent_str.repeat(indent_level));
+        if i + 1 < values.len() {
+            output.push(',');
+            output.push(if inline { ' ' } else { '\n' });
         }
     }
 
-    output.push(')');
+    if !inline {
+        output.push('\n');
+        output.push_str(&indent_str.repeat(indent_level));
+    }
 }
 
 /// Format a field node
@@ -448,16 +439,41 @@ fn format_field(
 
     // Get field value
     if let Some(value) = ts_utils::field_value(node) {
-        format_node(
-            &value,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            false,
-            emitted,
-        );
+        format_node(&value, content, output, indent_level, indent_str, emitted);
     }
+}
+
+/// Format a map entry node (`key: value`)
+fn format_map_entry(
+    node: &Node,
+    content: &str,
+    output: &mut String,
+    indent_level: usize,
+    indent_str: &str,
+    emitted: &mut HashSet<usize>,
+) {
+    let children = value_children(node);
+    if children.len() < 2 {
+        return;
+    }
+
+    format_node(
+        &children[0],
+        content,
+        output,
+        indent_level,
+        indent_str,
+        emitted,
+    );
+    output.push_str(": ");
+    format_node(
+        &children[1],
+        content,
+        output,
+        indent_level,
+        indent_str,
+        emitted,
+    );
 }
 
 /// Format an array node
@@ -467,70 +483,23 @@ fn format_array(
     output: &mut String,
     indent_level: usize,
     indent_str: &str,
-    _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
-    let is_empty = ts_utils::is_empty_structure(node);
-
-    if is_empty {
+    if ts_utils::is_empty_structure(node) {
         output.push_str("[]");
         return;
     }
 
     output.push('[');
-
-    // Get all array elements (named children that aren't comments)
-    let elements: Vec<_> = ts_utils::named_children(node)
-        .into_iter()
-        .filter(|n| !ts_utils::is_comment(n))
-        .collect();
-
-    let inner_comments = collect_inner_comments(node, content);
-
-    if !elements.is_empty() {
-        output.push('\n');
-
-        for (i, element) in elements.iter().enumerate() {
-            emit_leading_comments(
-                output,
-                &inner_comments,
-                emitted,
-                &elements,
-                i,
-                indent_str,
-                indent_level,
-            );
-
-            output.push_str(&indent_str.repeat(indent_level + 1));
-            format_node(
-                element,
-                content,
-                output,
-                indent_level + 1,
-                indent_str,
-                false,
-                emitted,
-            );
-
-            output.push(',');
-
-            emit_trailing_comment(output, &inner_comments, emitted, &elements, i);
-
-            output.push('\n');
-        }
-
-        emit_remaining_comments(
-            output,
-            &inner_comments,
-            emitted,
-            &elements,
-            indent_str,
-            indent_level,
-        );
-
-        output.push_str(&indent_str.repeat(indent_level));
-    }
-
+    format_items(
+        node,
+        content,
+        output,
+        indent_level,
+        indent_str,
+        emitted,
+        &value_children(node),
+    );
     output.push(']');
 }
 
@@ -541,87 +510,23 @@ fn format_map(
     output: &mut String,
     indent_level: usize,
     indent_str: &str,
-    _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
-    let is_empty = ts_utils::is_empty_structure(node);
-
-    if is_empty {
+    if ts_utils::is_empty_structure(node) {
         output.push_str("{}");
         return;
     }
 
     output.push('{');
-
-    // Get all map entries
-    let entries = ts_utils::children_by_kind(node, "map_entry");
-    let inner_comments = collect_inner_comments(node, content);
-
-    if !entries.is_empty() {
-        output.push('\n');
-
-        for (i, entry) in entries.iter().enumerate() {
-            emit_leading_comments(
-                output,
-                &inner_comments,
-                emitted,
-                &entries,
-                i,
-                indent_str,
-                indent_level,
-            );
-
-            output.push_str(&indent_str.repeat(indent_level + 1));
-
-            // Format map entry (key: value)
-            let children: Vec<_> = ts_utils::named_children(entry)
-                .into_iter()
-                .filter(|n| !ts_utils::is_comment(n))
-                .collect();
-
-            if children.len() >= 2 {
-                // Key
-                format_node(
-                    &children[0],
-                    content,
-                    output,
-                    indent_level + 1,
-                    indent_str,
-                    false,
-                    emitted,
-                );
-                output.push_str(": ");
-                // Value
-                format_node(
-                    &children[1],
-                    content,
-                    output,
-                    indent_level + 1,
-                    indent_str,
-                    false,
-                    emitted,
-                );
-            }
-
-            output.push(',');
-
-            emit_trailing_comment(output, &inner_comments, emitted, &entries, i);
-
-            output.push('\n');
-        }
-
-        emit_remaining_comments(
-            output,
-            &inner_comments,
-            emitted,
-            &entries,
-            indent_str,
-            indent_level,
-        );
-
-        output.push_str(&indent_str.repeat(indent_level));
-    }
-
+    format_items(
+        node,
+        content,
+        output,
+        indent_level,
+        indent_str,
+        emitted,
+        &ts_utils::children_by_kind(node, "map_entry"),
+    );
     output.push('}');
 }
 
@@ -632,62 +537,18 @@ fn format_tuple(
     output: &mut String,
     indent_level: usize,
     indent_str: &str,
-    _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
     output.push('(');
-
-    let elements: Vec<_> = ts_utils::named_children(node)
-        .into_iter()
-        .filter(|n| !ts_utils::is_comment(n))
-        .collect();
-
-    let inner_comments = collect_inner_comments(node, content);
-
-    if !elements.is_empty() {
-        output.push('\n');
-
-        for (i, element) in elements.iter().enumerate() {
-            emit_leading_comments(
-                output,
-                &inner_comments,
-                emitted,
-                &elements,
-                i,
-                indent_str,
-                indent_level,
-            );
-
-            output.push_str(&indent_str.repeat(indent_level + 1));
-            format_node(
-                element,
-                content,
-                output,
-                indent_level + 1,
-                indent_str,
-                false,
-                emitted,
-            );
-
-            output.push(',');
-
-            emit_trailing_comment(output, &inner_comments, emitted, &elements, i);
-
-            output.push('\n');
-        }
-
-        emit_remaining_comments(
-            output,
-            &inner_comments,
-            emitted,
-            &elements,
-            indent_str,
-            indent_level,
-        );
-
-        output.push_str(&indent_str.repeat(indent_level));
-    }
-
+    format_items(
+        node,
+        content,
+        output,
+        indent_level,
+        indent_str,
+        emitted,
+        &value_children(node),
+    );
     output.push(')');
 }
 
@@ -818,6 +679,71 @@ User(
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("/* user id */"));
         assert!(formatted.contains("id: 1,"));
+    }
+
+    #[test]
+    fn test_map_entries_and_nested_containers() {
+        let input = r#"Config(
+    m: {
+        // key a
+        "a": 1, // one
+        "b": [1, 2, { "deep": (3, 4) }],
+        // tail
+    },
+)"#;
+        let expected = r#"Config(
+    m: {
+        // key a
+        "a": 1, // one
+        "b": [
+            1,
+            2,
+            {
+                "deep": (
+                    3,
+                    4,
+                ),
+            },
+        ],
+        // tail
+    },
+)"#;
+        assert_eq!(format_ron(input), expected);
+        // Formatting an already-formatted document is a no-op
+        assert_eq!(format_ron(expected), expected);
+    }
+
+    #[test]
+    fn test_tuple_elements_with_comments() {
+        let input = r#"Config(
+    t: (
+        // first
+        1, // one
+        (2, 3),
+        // tail
+    ),
+)"#;
+        let expected = r#"Config(
+    t: (
+        // first
+        1, // one
+        (
+            2,
+            3,
+        ),
+        // tail
+    ),
+)"#;
+        assert_eq!(format_ron(input), expected);
+        assert_eq!(format_ron(expected), expected);
+    }
+
+    #[test]
+    fn test_empty_containers() {
+        assert_eq!(
+            format_ron("Config(a: [], b: {}, c: Unit())"),
+            "Config(\n    a: [],\n    b: {},\n    c: Unit(),\n)"
+        );
     }
 
     #[test]
