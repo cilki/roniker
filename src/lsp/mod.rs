@@ -1521,6 +1521,134 @@ Document::new(content.to_string()),
         }
     }
 
+    /// RON lets a struct value omit its name, both at the root (`(...)`) and
+    /// for a nested value (`server: (...)`). Hover, go-to-definition and
+    /// completion inside a nested value must resolve the nested type in all
+    /// four spellings; they used to resolve one level too shallow — against
+    /// the outer type — whenever a name was left out.
+    #[tokio::test]
+    async fn test_nested_resolution_with_omitted_struct_names() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "server".to_string(),
+                type_name: "crate::Server".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                docs: Some("Port to bind".to_string()),
+                line: Some(7),
+                column: Some(4),
+                ..Default::default()
+            }]),
+            source_file: Some(std::path::PathBuf::from("/test/src/config.rs")),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+
+        for (root, nested) in [
+            ("Config", "Server"),
+            ("Config", ""),
+            ("", "Server"),
+            ("", ""),
+        ] {
+            let content = format!("{root}(\n    server: {nested}(\n        port: 80,\n    ),\n)");
+            let label = format!("root {:?}, nested {:?}", root, nested);
+            let uri: Url = "file:///test/config.ron".parse().unwrap();
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content.clone()));
+
+            // Hover on the nested `port` must describe Server::port.
+            let hover = backend
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(2, 9),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            let Some(Hover {
+                contents: HoverContents::Markup(markup),
+                ..
+            }) = hover
+            else {
+                panic!("hover on nested 'port' returned nothing ({label})");
+            };
+            assert!(
+                markup.value.contains("Port to bind"),
+                "hover should document Server::port ({label}). Got: {}",
+                markup.value
+            );
+
+            // Go-to-definition must point at Server::port's source location.
+            let definition = backend
+                .goto_definition(GotoDefinitionParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(2, 9),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .unwrap();
+            let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+                panic!("goto_definition on nested 'port' returned nothing ({label})");
+            };
+            assert_eq!(
+                location.range.start,
+                Position::new(6, 4),
+                "definition should land on Server::port ({label})"
+            );
+
+            // Completion on a fresh line inside the nested value must offer
+            // Server's fields, not Config's.
+            let with_blank_line =
+                format!("{root}(\n    server: {nested}(\n        port: 80,\n        \n    ),\n)");
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(with_blank_line));
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(3, 8),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion inside the nested value returned nothing ({label})");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"port"),
+                "completion should offer Server's own fields ({label}). Got: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"server"),
+                "completion should not offer Config's fields ({label}). Got: {labels:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_format_ron_named_struct() {
         let input = r#"User(
