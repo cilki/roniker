@@ -104,10 +104,7 @@ pub async fn validate_ron_with_analyzer(
 
     match &type_info.kind {
         TypeKind::Struct(_) => {
-            diagnostics.extend(
-                validate_struct_fields(tree, content, type_info, &parsed_value, &analyzer)
-                    .await,
-            );
+            diagnostics.extend(validate_struct_fields(tree, content, type_info, &analyzer).await);
         }
         TypeKind::Enum(variants) => {
             diagnostics.extend(
@@ -325,34 +322,17 @@ fn adjust_diagnostic_positions(diagnostics: Vec<Diagnostic>, line_offset: u32) -
         .collect()
 }
 
-/// The extra checks that only the document root can perform, because they need
-/// the RON-parsed value of the whole file (which understands typed values) in
-/// addition to the tree-sitter node.
-struct RootChecks<'a> {
-    tree: &'a Tree,
-    /// The parsed root value as a map, when it parsed and is one.
-    map: Option<&'a ron::Map>,
-}
-
 /// Validate the document root against a struct `TypeInfo`.
 async fn validate_struct_fields(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    parsed_value: &Result<Value, ron::error::SpannedError>,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
     let Some(main_value) = super::ts_utils::find_main_value(tree) else {
         return Vec::new();
     };
-    let root = RootChecks {
-        tree,
-        map: parsed_value.as_ref().ok().and_then(|value| match value {
-            Value::Map(map) => Some(map),
-            _ => None,
-        }),
-    };
-    validate_struct_node(&main_value, content, type_info, analyzer, Some(&root)).await
+    validate_struct_node(&main_value, content, type_info, analyzer, true).await
 }
 
 /// Validate a `struct` node's named fields against a struct `TypeInfo`:
@@ -361,15 +341,15 @@ async fn validate_struct_fields(
 ///
 /// Every struct in the document goes through here — the root via
 /// `validate_struct_fields` and nested values via `validate_node_with_type_info`
-/// — so the field-matching and missing-field rules exist in exactly one place.
-/// `root` is `Some` only for the document root and enables the checks that need
-/// the RON-parsed value; see `RootChecks`.
+/// — so the field-matching, type-checking and missing-field rules exist in
+/// exactly one place. `at_root` is true only for the document root, and gates
+/// the informational type hints, which are deliberately top-level only.
 async fn validate_struct_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
-    root: Option<&RootChecks<'_>>,
+    at_root: bool,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
@@ -433,7 +413,7 @@ async fn validate_struct_node(
         };
 
         // Hint the field's declared type, but only when the RON doesn't name it already
-        if root.is_some()
+        if at_root
             && ts_utils::struct_name(&value_node, content).is_none()
             && value_node.kind() != "identifier"
         {
@@ -460,20 +440,28 @@ async fn validate_struct_node(
             continue; // skip the primitive check for this field
         }
 
-        // Primitive / surface-level type check (uses the RON-parsed typed values).
+        // Primitive / surface-level type check. The value's own source text
+        // carries everything the check needs, so it runs at every nesting depth
+        // rather than only on fields of the document root.
+        //
+        // Only non-custom types (primitives and std generic wrappers) are
+        // checked against the typed RON value; custom structs and enums are
+        // judged from the source text alone. Parsing lazily keeps a nested
+        // struct's whole subtree from being re-parsed once per level.
+        let value_text = ts_utils::node_text(&value_node, content);
+        let parsed_field_value = match is_custom_type(&field_info.type_name) {
+            true => None,
+            false => value_text.and_then(|text| ron::from_str::<Value>(text).ok()),
+        };
+
         // Positions come directly from the tree-sitter node — no line adjustment.
-        if let Some(root) = root
-            && let Some(map) = root.map
-            && let Some(field_value) = map.get(&Value::String(field_name.to_string()))
-            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                field_value,
-                &field_info.type_name,
-                Some(root.tree),
-                content,
-                field_name,
-                analyzer,
-            )
-            .await
+        if let Some(error_msg) = check_type_mismatch_with_enum_validation(
+            parsed_field_value.as_ref(),
+            &field_info.type_name,
+            value_text,
+            analyzer,
+        )
+        .await
         {
             let pos = value_node.start_position();
             let end_pos = value_node.end_position();
@@ -525,6 +513,21 @@ fn struct_name_range(node: &tree_sitter::Node) -> Range {
             let pos = Position::new(pos.row as u32, pos.column as u32);
             Range::new(pos, pos)
         }
+    }
+}
+
+/// The single value inside an explicit `Some(...)`, which is how RON spells an
+/// inhabited `Option`. `None` for every other shape, including the bare `value`
+/// form that RON also accepts and a struct that happens to be named `Some`.
+fn unwrap_some<'a>(node: &tree_sitter::Node<'a>, content: &str) -> Option<tree_sitter::Node<'a>> {
+    use super::ts_utils;
+
+    if ts_utils::struct_name(node, content) != Some("Some") {
+        return None;
+    }
+    match ts_utils::struct_values(node, content).as_slice() {
+        [only] => Some(*only),
+        _ => None,
     }
 }
 
@@ -584,8 +587,12 @@ async fn validate_field_value_node<'a>(
         // Single-element wrapper — check the inner type is known
         if is_custom_type(inner_type) {
             if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
+                // An `Option` field is usually written `Some(value)`. Validate
+                // the wrapped value rather than the `Some` wrapper, or the
+                // inner type's own fields go unchecked.
+                let inner_node = unwrap_some(value_node, content).unwrap_or(*value_node);
                 let nested_diags = Box::pin(validate_node_with_type_info(
-                    value_node,
+                    &inner_node,
                     content,
                     &inner_type_info,
                     analyzer,
@@ -709,7 +716,7 @@ async fn validate_node_with_type_info<'a>(
         TypeKind::Struct(_) => {
             diagnostics.extend(
                 Box::pin(validate_struct_node(
-                    node, content, type_info, analyzer, None,
+                    node, content, type_info, analyzer, false,
                 ))
                 .await,
             );
@@ -846,11 +853,9 @@ async fn validate_variant_field_data(
                     for field in expected_fields {
                         if let Some(field_value) = map.get(&Value::String(field.name.clone()))
                             && let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                                field_value,
+                                Some(field_value),
                                 &field.type_name,
-                                None,
-                                data,
-                                &field.name,
+                                extract_field_value_text(data, &field.name).as_deref(),
                                 analyzer,
                             )
                             .await
@@ -872,11 +877,9 @@ async fn validate_variant_field_data(
                     for (i, field) in expected_fields.iter().enumerate() {
                         if let Some(field_value) = values.get(i)
                             && let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                                field_value,
+                                Some(field_value),
                                 &field.type_name,
-                                None,
-                                data,
-                                &field.name,
+                                extract_field_value_text(data, &field.name).as_deref(),
                                 analyzer,
                             )
                             .await
@@ -896,11 +899,9 @@ async fn validate_variant_field_data(
                 } else if expected_fields.len() == 1 {
                     // Single field tuple variant
                     if let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                        &value,
+                        Some(&value),
                         &expected_fields[0].type_name,
-                        None,
-                        data,
-                        &expected_fields[0].name,
+                        extract_field_value_text(data, &expected_fields[0].name).as_deref(),
                         analyzer,
                     )
                     .await
@@ -960,16 +961,14 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
 
 /// Type checking with enum variant validation (async, uses analyzer)
 async fn check_type_mismatch_with_enum_validation(
-    value: &Value,
+    value: Option<&Value>,
     expected_type: &str,
-    tree: Option<&Tree>,
-    content: &str,
-    field_name: &str,
+    value_text: Option<&str>,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Option<String> {
     // If the expected type is custom (not primitive), we need special handling
     if is_custom_type(expected_type)
-        && let Some(field_value_text) = extract_field_value_text(tree, content, field_name)
+        && let Some(field_value_text) = value_text
     {
         let trimmed = field_value_text.trim();
 
@@ -1033,30 +1032,29 @@ async fn check_type_mismatch_with_enum_validation(
     }
 
     // Do basic type checking for remaining cases
-    check_type_mismatch_deep(value, expected_type, tree, content, field_name)
+    check_type_mismatch_deep(value, expected_type, value_text)
 }
 
-/// Deep type checking that also validates custom types by looking at raw text
+/// Deep type checking that also validates custom types by looking at raw text.
+///
+/// `value` is the field's value parsed as RON, needed only to check primitives
+/// and standard library generic types; callers may leave it out for custom
+/// types, which are judged from `value_text` alone.
 fn check_type_mismatch_deep(
-    value: &Value,
+    value: Option<&Value>,
     expected_type: &str,
-    tree: Option<&Tree>,
-    content: &str,
-    field_name: &str,
+    value_text: Option<&str>,
 ) -> Option<String> {
     let clean_type = normalize_type(expected_type);
 
     // First check if it's a primitive type or standard library generic type
     if !is_custom_type(expected_type) {
-        return check_type_mismatch(value, expected_type);
+        return check_type_mismatch(value?, expected_type);
     }
 
     // For custom types (structs/enums), we need to check the raw text
     // because Value loses the type information
-
-    // Find the field's value in the raw text
-    let field_value_text = extract_field_value_text(tree, content, field_name)?;
-    let trimmed = field_value_text.trim();
+    let trimmed = value_text?.trim();
 
     // Check if expected type is a custom struct/enum (starts with uppercase)
     if clean_type
@@ -1100,19 +1098,12 @@ fn check_type_mismatch_deep(
     None
 }
 
-/// Extract the raw text value for a field, handling nested structures
-fn extract_field_value_text(tree: Option<&Tree>, content: &str, field_name: &str) -> Option<String> {
+/// Extract the raw text value for a field of the struct at the top of `content`.
+fn extract_field_value_text(content: &str, field_name: &str) -> Option<String> {
     use super::ts_utils;
 
-    let local_tree;
-    let tree = match tree {
-        Some(t) => t,
-        None => {
-            local_tree = ts_utils::parse(content)?;
-            &local_tree
-        }
-    };
-    let main_value = ts_utils::find_main_value(tree)?;
+    let tree = ts_utils::parse(content)?;
+    let main_value = ts_utils::find_main_value(&tree)?;
 
     if main_value.kind() == "struct" || main_value.kind() == "ERROR" {
         // For ERROR nodes, find the struct sibling
@@ -1923,7 +1914,7 @@ mod tests {
     id: 42,
     post_type: Detailed( length: 1 ),
 )"#;
-        let extracted = extract_field_value_text(None, content, "post_type");
+        let extracted = extract_field_value_text(content, "post_type");
         println!("Extracted post_type value: {:?}", extracted);
         assert!(extracted.is_some());
         let value = extracted.unwrap();
@@ -2569,10 +2560,11 @@ PostReference(Post(
         analyzer.add_type(outer.clone());
         let analyzer = Arc::new(analyzer);
 
-        // An unknown field, a duplicated field and a missing required field
-        let as_root = "(\n    bogus: 1,\n    kept: 1,\n    kept: 2,\n)";
+        // An unknown field, a field whose value has the wrong primitive type, a
+        // duplicated field, and a missing required field ('other')
+        let as_root = "(\n    bogus: 1,\n    kept: \"x\",\n    kept: 2,\n)";
         let as_nested =
-            "(\n    inner: (\n        bogus: 1,\n        kept: 1,\n        kept: 2,\n    ),\n)";
+            "(\n    inner: (\n        bogus: 1,\n        kept: \"x\",\n        kept: 2,\n    ),\n)";
 
         let error_codes = |diagnostics: Vec<Diagnostic>| {
             let mut codes: Vec<String> = diagnostics
@@ -2600,6 +2592,7 @@ PostReference(Post(
             vec![
                 codes::DUPLICATE_FIELD,
                 codes::MISSING_REQUIRED_FIELD,
+                codes::TYPE_MISMATCH,
                 codes::UNKNOWN_FIELD
             ]
         );
@@ -2607,6 +2600,105 @@ PostReference(Post(
             nested_codes, root_codes,
             "nested struct validation diverged from the root"
         );
+    }
+
+    /// A value of the wrong primitive type is an error wherever it appears, not
+    /// just directly under the document root.
+    #[tokio::test]
+    async fn test_type_mismatch_reported_at_every_depth() {
+        let leaf = TypeInfo {
+            name: "Leaf".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                has_default: true,
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+        let middle = TypeInfo {
+            name: "Middle".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "leaf".to_string(),
+                    type_name: "Leaf".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "leaves".to_string(),
+                    type_name: "Vec<Leaf>".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "maybe_leaf".to_string(),
+                    type_name: "Option<Leaf>".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+            ]),
+            has_default: true,
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "middle".to_string(),
+                type_name: "Middle".to_string(),
+                has_default: true,
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(leaf);
+        analyzer.add_type(middle);
+        let analyzer = Arc::new(analyzer);
+
+        // `port` is a u16, so a string is wrong at every one of these depths
+        let bad = [
+            "(middle: (leaf: (port: \"80\")))",
+            "(middle: (leaves: [(port: \"80\")]))",
+            "(middle: (maybe_leaf: Some((port: \"80\"))))",
+        ];
+        for content in bad {
+            let diagnostics =
+                validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+            assert!(
+                diagnostics.iter().any(|d| {
+                    d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
+                        && d.message.contains("expected u16, got string")
+                }),
+                "'{}' should report a type mismatch. Got: {:?}",
+                content,
+                diagnostics
+            );
+        }
+
+        // ...and the matching well-typed documents must stay quiet
+        let good = [
+            "(middle: (leaf: (port: 80)))",
+            "(middle: (leaves: [(port: 80), Leaf(port: 81)]))",
+            "(middle: (maybe_leaf: Some((port: 80))))",
+            "(middle: (maybe_leaf: None))",
+            "(middle: Middle(leaf: Leaf(port: 80), leaves: [], maybe_leaf: None))",
+        ];
+        for content in good {
+            let diagnostics =
+                validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+                "'{}' is valid and should raise nothing. Got: {:?}",
+                content,
+                diagnostics
+            );
+        }
     }
 
     #[tokio::test]
