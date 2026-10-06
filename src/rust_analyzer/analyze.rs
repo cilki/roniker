@@ -430,6 +430,26 @@ fn normalize_type_tokens(s: &str) -> String {
     out
 }
 
+/// Serde attributes that are understood, and those that are not.
+///
+/// `extract_serde_attributes` reads `default`, `rename`, `alias`, `rename_all`,
+/// `skip`/`skip_deserializing` and `flatten`. Every other serde attribute is
+/// silently ignored, which is harmless for the ones that only affect
+/// serialization but not for these four, each of which changes the names or the
+/// shape a config file must use:
+///
+/// - `rename_all_fields` - the fields of an enum's struct variants keep their
+///   Rust names here, so a file spelling them the way serde requires is
+///   reported as unknown/missing.
+/// - `untagged` - the value carries no variant name, but the enum check still
+///   demands one.
+/// - `transparent` - the value is the single field's value, but the struct
+///   check still demands a struct.
+/// - `tag`/`content` - the variant name travels as a map key, so the tagged map
+///   serde accepts goes unchecked while completion offers the bare variant name
+///   serde rejects.
+///
+/// See <https://git.cilki.net/cilki/roniker/issues/72>.
 mod serde_attributes {
     use syn::{Attribute, LitStr, Token};
 

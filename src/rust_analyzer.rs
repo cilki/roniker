@@ -146,6 +146,12 @@ pub struct EnumVariant {
 impl EnumVariant {
     /// The fields serde accepts for this variant as `(serialized_name, field)`
     /// pairs, with `skip` fields excluded.
+    ///
+    /// No container convention is applied: a field-level `#[serde(rename)]` is
+    /// honored, but the enum's `#[serde(rename_all_fields = "...")]` is not
+    /// extracted, so variants of such an enum are validated against the Rust
+    /// field names rather than the names serde expects. See
+    /// <https://git.cilki.net/cilki/roniker/issues/72>.
     pub fn effective_fields(&self) -> Vec<(String, FieldInfo)> {
         self.fields
             .iter()

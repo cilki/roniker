@@ -182,6 +182,34 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
   `#[serde(default)]` or `#[serde(default = "path")]`, or its container derives
   `Default` or carries a container-level `#[serde(default)]`.
 
+That list is the whole of what the analyzer reads, which makes the promise above
+narrower than it sounds. Four serde attributes change the names or the shape a
+config file has to use, and none of them reach the LSP — on three of them a file
+your application deserializes without complaint is reported as broken. Avoid
+them in config types until [#72](https://git.cilki.net/cilki/roniker/issues/72)
+is fixed:
+
+- `#[serde(rename_all_fields = "...")]` on an enum is ignored, so the fields of
+  its struct variants are expected under their Rust names. With
+  `rename_all_fields = "camelCase"` and a variant `Fast { max_retries: u32 }`,
+  the `maxRetries: 3` that serde requires is reported as `unknown-field` plus
+  `missing-required-field`, and the "did you mean" suggests `max_retries` —
+  the one spelling serde rejects.
+- `#[serde(untagged)]` enums are written as the variant's content alone, with no
+  variant name. The LSP still expects a variant name, so the `port: 8080` serde
+  wants gets `unknown-variant`, while the `port: Number(8080)` serde rejects
+  passes.
+- `#[serde(transparent)]` structs are written as their single field's value. The
+  LSP still expects a struct, so the `limit: 10` serde wants gets
+  `type-mismatch`, while the `limit: (value: 10)` serde rejects passes.
+- `#[serde(tag = "...")]` and `#[serde(tag = "...", content = "...")]` enums
+  carry their variant name as a map key rather than in front of the value, so
+  `tag = "kind"` makes `backend: (kind: "Postgres", host: "h")` the correct
+  spelling and `backend: Postgres(host: "h")` an error. Nothing is reported as
+  broken here, but completion offers the bare variant name serde rejects, and
+  the tagged map that serde accepts is not checked at all — neither its tag key
+  nor any extra key inside it.
+
 ### Runnable examples
 
 Two examples in this repository cover the two ways of getting types into the
