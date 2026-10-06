@@ -68,6 +68,10 @@ impl FieldInfo {
 
 /// Apply a serde `rename_all` convention to a field name.
 /// Mirrors serde's conversions, which assume snake_case Rust field names.
+///
+/// The hyphenated conventions are converted faithfully, but the resulting name
+/// is not a bare RON identifier and the LSP cannot currently round-trip it —
+/// see the README's "Serde attributes" section.
 pub fn rename_all_field(name: &str, convention: &str) -> String {
     match convention {
         "lowercase" | "snake_case" => name.to_string(),
@@ -88,6 +92,10 @@ pub fn rename_all_field(name: &str, convention: &str) -> String {
 
 /// Apply a serde `rename_all` convention to an enum variant name.
 /// Mirrors serde's conversions, which assume PascalCase Rust variant names.
+///
+/// The hyphenated conventions are converted faithfully, but the resulting name
+/// is not a bare RON identifier and the LSP cannot currently round-trip it —
+/// see the README's "Serde attributes" section.
 pub fn rename_all_variant(name: &str, convention: &str) -> String {
     match convention {
         "lowercase" => name.to_ascii_lowercase(),

@@ -166,9 +166,9 @@ Names come from serde's view of your types rather than from the Rust
 identifiers, so the LSP accepts exactly what your application will deserialize:
 
 - `#[serde(rename = "...")]` and `#[serde(rename_all = "...")]` decide the name
-  completions insert and diagnostics expect. All of serde's cases are
-  understood: `lowercase`, `UPPERCASE`, `PascalCase`, `camelCase`, `snake_case`,
-  `SCREAMING_SNAKE_CASE`, `kebab-case`, and `SCREAMING-KEBAB-CASE`. The
+  completions insert and diagnostics expect. The `rename_all` conventions that
+  produce a plain RON identifier are handled: `lowercase`, `UPPERCASE`,
+  `PascalCase`, `camelCase`, `snake_case`, and `SCREAMING_SNAKE_CASE`. The
   `rename(deserialize = "...")` form is read too, since that's the direction a
   config file travels.
 - `#[serde(alias = "...")]` names are accepted alongside the primary one.
@@ -181,6 +181,17 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
 - A field stops counting as required if it is an `Option<T>`, carries
   `#[serde(default)]` or `#[serde(default = "path")]`, or its container derives
   `Default` or carries a container-level `#[serde(default)]`.
+
+Names containing a hyphen are **not** supported: that means
+`rename_all = "kebab-case"`, `rename_all = "SCREAMING-KEBAB-CASE"`, and any
+explicit `rename` to a hyphenated name, on fields and on enum variants alike.
+RON can only write such a name as a raw identifier (`r#max-size: 3`), which this
+server's grammar doesn't recognise, so a correct file comes back with the name
+chopped at the hyphen — `unknown-field 'size'` plus
+`missing-required-field 'max-size'` — and completions insert the bare
+`max-size: `, which doesn't parse at all. Rename those fields to something
+RON can spell until [#68](https://git.cilki.net/cilki/roniker/issues/68) is
+fixed.
 
 ### Runnable examples
 
