@@ -293,15 +293,18 @@ fn resolve_variant_at(
     first_line: usize,
 ) -> Option<EnumVariant> {
     let position = Position::new(first_line as u32, 0);
-    let mut contexts = vec![tree_sitter_parser::TypeContext {
-        type_name: short_name(&type_info.name).to_string(),
-    }];
-    let mut position_contexts =
-        tree_sitter_parser::find_type_context_at_position(tree, content, position);
-    if !position_contexts.is_empty() {
-        position_contexts.pop();
+    let mut contexts = tree_sitter_parser::find_type_context_at_position(tree, content, position);
+    // The field being resolved belongs to the value that *contains* the
+    // variant, so the variant's own struct is one level too deep. It is the
+    // innermost context only when the variant spans several lines; for a
+    // single-line variant (`mode: Prod(x: 1)`) column 0 of the line already
+    // lands in the containing value and there is nothing to drop.
+    if contexts
+        .last()
+        .is_some_and(|c| c.type_name.as_deref() == Some(variant_name))
+    {
+        contexts.pop();
     }
-    contexts.extend(position_contexts);
 
     let current_type =
         super::navigation::navigate_type_contexts(analyzer, Some(type_info.clone()), &contexts)?;
@@ -1358,6 +1361,96 @@ fn simplify_ron_error(error_msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+    /// The fields of a struct variant used deep inside a document are checked
+    /// against the variant's definition, which means resolving the type that
+    /// owns the variant's field. That has to work however the enclosing values
+    /// are spelled: on one line or several, and with or without their struct
+    /// names (RON lets those be omitted).
+    #[tokio::test]
+    async fn test_struct_variant_fields_in_nested_value() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "PostType".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Detailed".to_string(),
+                fields: vec![FieldInfo {
+                    name: "length".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "post_type".to_string(),
+                type_name: "PostType".to_string(),
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "server".to_string(),
+                type_name: "Server".to_string(),
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+        let config = analyzer.get_type_info("Config").unwrap().clone();
+
+        for (root, nested) in [
+            ("Config", "Server"),
+            ("Config", ""),
+            ("", "Server"),
+            ("", ""),
+        ] {
+            let label = format!("root {:?}, nested {:?}", root, nested);
+
+            // The variant's fields spread over several lines.
+            let multiline = format!(
+                "{root}(\n    server: {nested}(\n        post_type: Detailed(\n            length: 1,\n            bogus: 2,\n        ),\n    ),\n)"
+            );
+            // ...and all on one line, where column 0 of the field's line lands
+            // in the containing value rather than in the variant itself.
+            let single_line = format!(
+                "{root}(\n    server: {nested}(\n        post_type: Detailed(length: 1, bogus: 2),\n    ),\n)"
+            );
+
+            for (shape, content) in [("multi-line", multiline), ("single-line", single_line)] {
+                let diagnostics =
+                    validate_ron_with_analyzer(&content, None, &config, analyzer.clone()).await;
+                assert!(
+                    diagnostics.iter().any(|d| {
+                        d.severity == Some(DiagnosticSeverity::ERROR)
+                            && d.message
+                                .contains("Unknown field 'bogus' in variant 'Detailed'")
+                    }),
+                    "a field the variant doesn't have should be reported ({shape}, {label}). Got: {diagnostics:?}"
+                );
+            }
+
+            // The same documents without the stray field must be clean.
+            let good = format!(
+                "{root}(\n    server: {nested}(\n        post_type: Detailed(\n            length: 1,\n        ),\n    ),\n)"
+            );
+            let diagnostics =
+                validate_ron_with_analyzer(&good, None, &config, analyzer.clone()).await;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+                "a well-formed variant should not error ({label}). Got: {diagnostics:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_enum_variant_validation() {

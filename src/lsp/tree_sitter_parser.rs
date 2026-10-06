@@ -5,15 +5,28 @@ use super::ts_utils::{
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
-/// Represents the nesting context at a cursor position
-#[derive(Debug, Clone)]
+/// One struct value the cursor is inside, i.e. one step of the nesting path
+/// from the document's root value down to the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeContext {
-    /// The type name we're currently inside (e.g., "User", "Post")
-    pub type_name: String,
+    /// The struct name written in the document, when the value has one
+    /// (e.g. `User(...)`). RON lets the name be omitted (`(...)`), in which
+    /// case this is `None` and only `field_name` says what the type is.
+    pub type_name: Option<String>,
+    /// The name of the field this value is the value of (`server` for the
+    /// `(...)` in `server: (...)`), or `None` when the value belongs to no
+    /// field — which is the case for the document's root value.
+    pub field_name: Option<String>,
 }
 
-/// Find the nested type context at a cursor position using tree-sitter
-/// Returns a stack of type contexts from outermost to innermost
+/// Find the nested type context at a cursor position using tree-sitter.
+/// Returns a stack of type contexts from outermost to innermost, with one
+/// entry per enclosing struct value whether or not it names its type. The
+/// first entry is therefore always the document's root value, which lets
+/// [`navigate_type_contexts`] walk the stack without having to guess how the
+/// document was written.
+///
+/// [`navigate_type_contexts`]: super::navigation::navigate_type_contexts
 pub fn find_type_context_at_position(
     tree: &Tree,
     content: &str,
@@ -23,11 +36,10 @@ pub fn find_type_context_at_position(
     if let Some(current) = node_at_position(tree, content, position) {
         // Walk up the tree to collect all struct contexts
         for node in ancestors(current) {
-            if node.kind() == "struct"
-                && let Some(type_name) = struct_name(&node, content)
-            {
+            if node.kind() == "struct" {
                 contexts.push(TypeContext {
-                    type_name: type_name.to_string(),
+                    type_name: struct_name(&node, content).map(str::to_string),
+                    field_name: owning_field_name(&node, content).map(str::to_string),
                 });
             }
         }
@@ -36,6 +48,20 @@ pub fn find_type_context_at_position(
     // Reverse to get outermost to innermost
     contexts.reverse();
     contexts
+}
+
+/// The name of the field whose value `node` is, if any.
+///
+/// The walk stops at the first enclosing `struct`, because a value nested
+/// directly inside another struct value — the `Inner(..)` of `Some(Inner(..))`
+/// — is that struct's payload rather than the value of any field. Wrappers
+/// that aren't structs are walked through, so the element of an array still
+/// finds the field the array belongs to.
+fn owning_field_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
+    ancestors(*node)
+        .skip(1)
+        .take_while(|ancestor| ancestor.kind() != "struct")
+        .find_map(|ancestor| field_name(&ancestor, content))
 }
 
 /// Get the field name at a specific position in RON content using tree-sitter
@@ -297,9 +323,57 @@ mod tests {
         let contexts =
             find_type_context_at_position(&parse(content), content, Position::new(3, 20));
         assert_eq!(contexts.len(), 3);
-        assert_eq!(contexts[0].type_name, "PostReference");
-        assert_eq!(contexts[1].type_name, "Post");
-        assert_eq!(contexts[2].type_name, "User");
+        assert_eq!(contexts[0].type_name.as_deref(), Some("PostReference"));
+        assert_eq!(contexts[1].type_name.as_deref(), Some("Post"));
+        assert_eq!(contexts[2].type_name.as_deref(), Some("User"));
+        // Only `User` is the value of a field; the other two are the root value
+        // and a tuple-struct payload.
+        assert_eq!(contexts[0].field_name, None);
+        assert_eq!(contexts[1].field_name, None);
+        assert_eq!(contexts[2].field_name.as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn test_find_type_context_unnamed_structs() {
+        // RON lets a struct value omit its name. Every enclosing struct still
+        // gets a context, so the first entry is always the root value and the
+        // field name is there to resolve the type from.
+        let content = "(\n    server: (\n        host: \"x\",\n    ),\n)";
+        let contexts =
+            find_type_context_at_position(&parse(content), content, Position::new(2, 10));
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0],
+            TypeContext {
+                type_name: None,
+                field_name: None,
+            }
+        );
+        assert_eq!(
+            contexts[1],
+            TypeContext {
+                type_name: None,
+                field_name: Some("server".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_type_context_unnamed_struct_in_array() {
+        // An array is not a struct, so the element's owning field is still
+        // found through it.
+        let content = "Config(\n    servers: [\n        (host: \"x\"),\n    ],\n)";
+        let contexts =
+            find_type_context_at_position(&parse(content), content, Position::new(2, 12));
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].type_name.as_deref(), Some("Config"));
+        assert_eq!(
+            contexts[1],
+            TypeContext {
+                type_name: None,
+                field_name: Some("servers".to_string()),
+            }
+        );
     }
 
     #[test]
