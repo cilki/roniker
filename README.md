@@ -171,10 +171,16 @@ Opening a RON file matched by the pattern above gets you:
 
 - completions for field names, enum variants, values, and nested struct types,
   spelled out under [Completions](#completions) below
-- hover documentation pulled from the doc comments on your structs
-- go-to-definition back to the Rust source, document symbols, rename, and
-  formatting — what the formatter lays out, and what it throws away, is spelled
-  out under [Formatting](#formatting) below
+- hover documentation pulled from the doc comments on your structs, and
+  go-to-definition back to the Rust source — but a *field* resolves only under
+  its Rust identifier. A field that serde renames (`rename`, `rename_all`, or a
+  name reached through `alias`) answers neither request, even though completions
+  and diagnostics accept exactly that spelling, so a document that the server
+  itself reports as correct has fields with no hover and no definition until
+  [#76](https://git.cilki.net/cilki/roniker/issues/76) is fixed. Enum variants
+  are matched through serde and are not affected.
+- document symbols, rename, and formatting — what the formatter lays out, and
+  what it throws away, is spelled out under [Formatting](#formatting) below
 - diagnostics, each error tagged with a stable code so your editor can filter
   them:
   - `syntax-error` - the file doesn't parse as RON
@@ -337,7 +343,8 @@ document instead.
 ### Serde attributes
 
 Names come from serde's view of your types rather than from the Rust
-identifiers, so the LSP accepts exactly what your application will deserialize:
+identifiers, so completions, diagnostics and code actions use exactly the names
+your application will deserialize:
 
 - `#[serde(rename = "...")]` and `#[serde(rename_all = "...")]` decide the name
   completions insert and diagnostics expect. The `rename_all` conventions that
