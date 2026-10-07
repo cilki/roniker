@@ -139,9 +139,14 @@ language-servers = ["custom-lsp"]
 Opening a RON file matched by the pattern above gets you:
 
 - completions for field names, enum variants, and nested struct types
-- hover documentation pulled from the doc comments on your structs
-- go-to-definition back to the Rust source, document symbols, rename, and
-  formatting (whole document and range)
+- hover documentation pulled from the doc comments on your structs, and
+  go-to-definition back to the Rust source — but only for names spelled as the
+  Rust identifier. A field or variant that serde renames (`rename`,
+  `rename_all`, or a name reached through `alias`) answers neither, even though
+  completions and diagnostics accept it, so these two are useful only on config
+  types whose serde names are their Rust names until
+  [#76](https://git.cilki.net/cilki/roniker/issues/76) is fixed.
+- document symbols, rename, and formatting (whole document and range)
 - diagnostics, each tagged with a stable code so your editor can filter them:
   - `syntax-error` - the file doesn't parse as RON
   - `unknown-field` - the struct has no such field
@@ -163,7 +168,8 @@ Opening a RON file matched by the pattern above gets you:
 ### Serde attributes
 
 Names come from serde's view of your types rather than from the Rust
-identifiers, so the LSP accepts exactly what your application will deserialize:
+identifiers, so completions, diagnostics and code actions use exactly the names
+your application will deserialize:
 
 - `#[serde(rename = "...")]` and `#[serde(rename_all = "...")]` decide the name
   completions insert and diagnostics expect. All of serde's cases are
