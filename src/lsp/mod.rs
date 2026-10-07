@@ -248,16 +248,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        // Use shared navigation helper, falling back to inferring type from RON struct name
-        let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content, tree.as_ref()) {
-            let contexts = tree
-                .as_ref()
-                .map(|t| tree_sitter_parser::find_type_context_at_position(t, &content, position))
-                .unwrap_or_default();
-            self.navigate_to_innermost_type(&type_path, &contexts)
-        } else {
-            None
-        };
+        let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
 
         // Check if the word is a valid field name in the current context type
         if let (Some(info), Some(tree)) = (current_type_info.as_ref(), tree.as_ref()) {
@@ -331,50 +322,29 @@ impl LanguageServer for Backend {
         };
 
         {
-            // Use shared navigation helper, falling back to inferring type from RON struct name
-            let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content, tree.as_ref()) {
-                let contexts = tree
-                    .as_ref()
-                    .map(|t| {
-                        tree_sitter_parser::find_type_context_at_position(t, &content, position)
-                    })
-                    .unwrap_or_default();
-                self.navigate_to_innermost_type(&type_path, &contexts)
-            } else {
-                None
-            };
+            let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
 
             // Now check what the word at cursor is
             if let (Some(type_info), Some(tree)) = (current_type_info, tree.as_ref()) {
-                // Case 1: Hovering over a field name
+                // Case 1: Hovering over a field name, which is either a field of
+                // the enum variant being spelled out or one of the struct's own.
                 if let Some(field_name) =
                     tree_sitter_parser::get_field_at_position(tree, &content, position)
                     && field_name == word
                 {
-                    // First check if we're in an enum variant's fields
-                    if let Some(variant_name) =
+                    let field =
                         tree_sitter_parser::find_current_variant_context(tree, &content, position)
-                        && let Some(variant) = type_info.find_variant(&variant_name)
-                        && let Some(field) = variant.fields.iter().find(|f| f.name == field_name)
-                    {
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!(
-                                    "```rust\n{}: {}\n```\n\n{}",
-                                    field.name,
-                                    field.type_name,
-                                    field.docs.as_deref().unwrap_or("")
-                                ),
-                            }),
-                            range: None,
-                        }));
-                    }
+                            .and_then(|variant_name| type_info.find_variant(&variant_name))
+                            .and_then(|variant| {
+                                variant.fields.iter().find(|f| f.name == field_name)
+                            })
+                            .or_else(|| {
+                                type_info
+                                    .fields()
+                                    .and_then(|fields| fields.iter().find(|f| f.name == field_name))
+                            });
 
-                    // Otherwise check struct fields
-                    if let Some(fields) = type_info.fields()
-                        && let Some(field) = fields.iter().find(|f| f.name == field_name)
-                    {
+                    if let Some(field) = field {
                         return Ok(Some(Hover {
                             contents: HoverContents::Markup(MarkupContent {
                                 kind: MarkupKind::Markdown,
@@ -467,16 +437,7 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Navigate to innermost type using shared helper, falling back to inferring from RON struct name
-        let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content, tree.as_ref()) {
-            let contexts = tree
-                .as_ref()
-                .map(|t| tree_sitter_parser::find_type_context_at_position(t, &content, position))
-                .unwrap_or_default();
-            self.navigate_to_innermost_type(&type_path, &contexts)
-        } else {
-            None
-        };
+        let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
 
         if let (Some(type_info), Some(tree)) = (current_type_info, tree.as_ref()) {
             let completions = completion::generate_completions_for_type(
@@ -680,7 +641,7 @@ impl LanguageServer for Backend {
 
         // Resolve the type that owns the field being renamed, so occurrences of
         // the same name under *other* types are left alone
-        let target_type = self.resolve_owner_type_at(&content, &tree, position);
+        let target_type = self.resolve_owner_type_at(&content, Some(&tree), position);
 
         // Collect the exact name-node ranges of matching fields
         let mut changes = Vec::new();
@@ -696,7 +657,7 @@ impl LanguageServer for Backend {
                 node.start_position().row as u32,
                 node.start_position().column as u32,
             );
-            let owner = self.resolve_owner_type_at(&content, &tree, node_pos);
+            let owner = self.resolve_owner_type_at(&content, Some(&tree), node_pos);
             // When either side can't be resolved, fall back to matching by name
             if let (Some(target), Some(owner)) = (&target_type, &owner)
                 && target.name != owner.name
@@ -851,23 +812,6 @@ impl Backend {
         })
     }
 
-    /// Resolve the top-level type path for a document, either from the configured root type
-    /// or by inferring it from the struct name at the top of the RON content.
-    fn resolve_root_type_path<'a>(
-        &'a self,
-        content: &'a str,
-        tree: Option<&tree_sitter::Tree>,
-    ) -> Option<std::borrow::Cow<'a, str>> {
-        if let Some(path) = &self.rust_analyzer.root_type {
-            return Some(std::borrow::Cow::Borrowed(path.as_str()));
-        }
-        let main_value = ts_utils::find_main_value(tree?)?;
-        let name = ts_utils::struct_name(&main_value, content)?;
-        // Verify the name is actually registered before returning it
-        self.rust_analyzer.get_type_info(name)?;
-        Some(std::borrow::Cow::Owned(name.to_string()))
-    }
-
     /// The variant-field cases of goto_definition: the cursor is inside an enum
     /// variant and `word` may name one of the variant's fields.
     /// Returns `Some(response)` when a definition was found.
@@ -909,31 +853,20 @@ impl Backend {
         ))
     }
 
-    /// Resolve the TypeInfo that owns the fields at `position`: the root type
-    /// navigated through the nested type contexts around the position.
+    /// Resolve the TypeInfo that owns the fields at `position`: the document's
+    /// root type navigated through the nested type contexts around the
+    /// position. Used by goto_definition, hover, completion and rename.
     fn resolve_owner_type_at(
         &self,
         content: &str,
-        tree: &tree_sitter::Tree,
+        tree: Option<&tree_sitter::Tree>,
         position: Position,
     ) -> Option<rust_analyzer::TypeInfo> {
-        let type_path = self.resolve_root_type_path(content, Some(tree))?;
-        let contexts = tree_sitter_parser::find_type_context_at_position(tree, content, position);
-        self.navigate_to_innermost_type(&type_path, &contexts)
-    }
-
-    /// Navigate through nested type contexts to find the innermost type
-    /// This is used by goto_definition, hover, and completion
-    fn navigate_to_innermost_type(
-        &self,
-        top_level_type_path: &str,
-        contexts: &[tree_sitter_parser::TypeContext],
-    ) -> Option<rust_analyzer::TypeInfo> {
-        let start = self
-            .rust_analyzer
-            .get_type_info(top_level_type_path)
-            .cloned();
-        navigation::navigate_type_contexts(&self.rust_analyzer, start, contexts)
+        let root = self.resolve_root_type_info(content, tree)?;
+        let contexts = tree
+            .map(|t| tree_sitter_parser::find_type_context_at_position(t, content, position))
+            .unwrap_or_default();
+        navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
     }
 
     fn format_type_hover(&self, type_info: &rust_analyzer::TypeInfo) -> String {
@@ -1519,6 +1452,55 @@ Document::new(content.to_string()),
         } else {
             panic!("Expected Array completion response");
         }
+    }
+
+    /// A root type that was configured but never registered is not a usable
+    /// root, so the document's own struct name is used instead. Diagnostics and
+    /// code actions have always done this; hover, go-to-definition and
+    /// completion now resolve the root the same way.
+    #[tokio::test]
+    async fn test_hover_falls_back_when_root_type_unregistered() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::NotRegistered");
+        analyzer.add_type(TypeInfo {
+            name: "crate::User".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "id".to_string(),
+                type_name: "u64".to_string(),
+                docs: Some("The unique user identifier".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        let content = "User(\n    id: 42,\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(1, 6),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("hover should fall back to the document's struct name");
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("Expected Markup hover contents");
+        };
+        assert!(
+            markup.value.contains("u64") && markup.value.contains("unique user identifier"),
+            "Hover should describe User::id. Got: {}",
+            markup.value
+        );
     }
 
     /// RON lets a struct value omit its name, both at the root (`(...)`) and
