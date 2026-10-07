@@ -165,6 +165,21 @@ impl EnumVariant {
         }
         self.name.clone()
     }
+
+    /// Whether a document naming `name` is naming this variant: its serialized
+    /// name (honoring `rename`/`rename_all`) or its Rust name, the latter also
+    /// matched case-insensitively.
+    ///
+    /// The case-insensitive fallback is deliberately lenient. A `rename_all`
+    /// convention the analyzer failed to record would otherwise turn every
+    /// variant in a correct document into an "unknown variant" error, and a
+    /// false error is worse than a missed one. This is the one place that
+    /// decides the question, so every feature answers it the same way.
+    pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
+        self.serialized_name(container_rename_all) == name
+            || self.name == name
+            || self.name.eq_ignore_ascii_case(name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,11 +229,18 @@ impl TypeInfo {
         }
     }
 
+    /// Find the variant that a document naming `variant_name` is referring to,
+    /// honoring serde's `rename`/`rename_all` — see
+    /// [`EnumVariant::accepts_name`] for exactly which names are accepted.
+    /// `None` for a struct.
     pub fn find_variant(&self, variant_name: &str) -> Option<&EnumVariant> {
-        match &self.kind {
-            TypeKind::Enum(variants) => variants.iter().find(|v| v.name == variant_name),
-            TypeKind::Struct(_) => None,
-        }
+        let TypeKind::Enum(variants) = &self.kind else {
+            return None;
+        };
+        let rename_all = self.rename_all.as_deref();
+        variants
+            .iter()
+            .find(|v| v.accepts_name(variant_name, rename_all))
     }
 
     /// Find a field by the name serde expects in the serialized form
@@ -234,19 +256,6 @@ impl TypeInfo {
                 .flat_map(|v| &v.fields)
                 .find(|f| f.accepts_name(field_name, None)),
         }
-    }
-
-    /// Find a variant by the name serde expects in the serialized form
-    /// (honoring rename/rename_all), falling back to the Rust variant name.
-    pub fn find_variant_serialized(&self, variant_name: &str) -> Option<&EnumVariant> {
-        let TypeKind::Enum(variants) = &self.kind else {
-            return None;
-        };
-        let rename_all = self.rename_all.as_deref();
-        variants
-            .iter()
-            .find(|v| v.serialized_name(rename_all) == variant_name)
-            .or_else(|| variants.iter().find(|v| v.name == variant_name))
     }
 
     /// The fields serde accepts for this struct: `skip` fields are excluded,

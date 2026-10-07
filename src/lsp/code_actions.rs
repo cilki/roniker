@@ -176,7 +176,7 @@ fn generate_missing_variant_field_actions(
         let Some(field_type_info) = analyzer.get_type_info(&field.type_name) else {
             continue;
         };
-        let Some(variant) = field_type_info.find_variant_serialized(&location.variant_name) else {
+        let Some(variant) = field_type_info.find_variant(&location.variant_name) else {
             continue;
         };
 
@@ -256,7 +256,7 @@ fn generate_missing_field_actions(
     if matches!(type_info.kind, TypeKind::Enum(_)) {
         // Try to detect which variant we're in
         if let Some(variant_name) = detect_current_variant_in_content(content)
-            && let Some(variant) = type_info.find_variant_serialized(&variant_name)
+            && let Some(variant) = type_info.find_variant(&variant_name)
         {
             // Generate actions for this variant's fields
             let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);

@@ -253,7 +253,7 @@ fn generate_field_completions(
             // Check if we're inside a specific variant's fields
             if let Some(variant_name) =
                 tree_sitter_parser::find_current_variant_context(tree, content, position)
-                && let Some(variant) = type_info.find_variant_serialized(&variant_name)
+                && let Some(variant) = type_info.find_variant(&variant_name)
             {
                 // Complete the variant's fields
                 let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);

@@ -106,10 +106,9 @@ pub async fn validate_ron_with_analyzer(
         TypeKind::Struct(_) => {
             diagnostics.extend(validate_struct_fields(tree, content, type_info, &analyzer).await);
         }
-        TypeKind::Enum(variants) => {
-            diagnostics.extend(
-                validate_enum_variant_with_fields(content, variants, type_info, &analyzer).await,
-            );
+        TypeKind::Enum(_) => {
+            diagnostics
+                .extend(validate_enum_variant_with_fields(content, type_info, &analyzer).await);
         }
     }
 
@@ -197,11 +196,10 @@ async fn validate_enum_variant_fields_in_structs(
                     location.variant_name.clone(),
                 );
                 if let Some(Some(variant)) = variant_cache.get(&cache_key)
-                    && !variant.effective_fields().iter().any(|(name, f)| {
-                        name == field_at_pos
-                            || f.name == *field_at_pos
-                            || f.aliases.iter().any(|a| a == field_at_pos)
-                    })
+                    && !variant
+                        .effective_fields()
+                        .iter()
+                        .any(|(_, f)| f.accepts_name(field_at_pos, None))
                 {
                     let line = lines.get(location.line_idx).unwrap_or(&"");
                     if let Some(col) = line
@@ -310,7 +308,7 @@ fn resolve_variant_at(
         super::navigation::navigate_type_contexts(analyzer, Some(type_info.clone()), &contexts)?;
     let field = current_type.find_field_serialized(containing_field_name)?;
     let field_type_info = analyzer.get_type_info(&field.type_name)?;
-    field_type_info.find_variant_serialized(variant_name).cloned()
+    field_type_info.find_variant(variant_name).cloned()
 }
 
 /// Adjust diagnostic line numbers by an offset
@@ -395,14 +393,13 @@ async fn validate_struct_node(
             continue;
         }
 
-        // Match the RON field against the type by serialized name, Rust name or alias
+        // Match the RON field against the type by serialized name, Rust name or
+        // alias. `name` is the serialized name as the *containing* type spells
+        // it, which for a flattened field is not what the field's own container
+        // would produce, so it is compared separately from `accepts_name`.
         let Some(field_info) = effective_fields
             .iter()
-            .find(|(name, f)| {
-                *name == field_name
-                    || f.name == field_name
-                    || f.aliases.iter().any(|a| a.as_str() == field_name)
-            })
+            .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
             .map(|(_, f)| f)
         else {
             if !allow_unknown_fields {
@@ -632,10 +629,10 @@ async fn validate_field_value_node<'a>(
     diagnostics
 }
 
-/// Async version: validate enum variants with field type checking
+/// Validate the document root against an enum `TypeInfo`: the variant it names
+/// must exist, and any data it carries must match that variant's fields.
 async fn validate_enum_variant_with_fields(
     content: &str,
-    variants: &[EnumVariant],
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
@@ -645,12 +642,7 @@ async fn validate_enum_variant_with_fields(
     let parsed_variant = extract_enum_variant_from_text(content);
 
     if let Some(variant) = parsed_variant {
-        // Check if this variant exists (by serialized or Rust name)
-        let rename_all = type_info.rename_all.as_deref();
-        if let Some(variant_def) = variants
-            .iter()
-            .find(|v| v.serialized_name(rename_all) == variant.name || v.name == variant.name)
-        {
+        if let Some(variant_def) = type_info.find_variant(&variant.name) {
             // Variant exists - now validate its fields if it has data
             if let Some(ref data) = variant.data {
                 // Validate that the variant can have data
@@ -679,29 +671,44 @@ async fn validate_enum_variant_with_fields(
                 }
             }
         } else {
-            // Variant doesn't exist
-            let variant_names: Vec<String> = variants
-                .iter()
-                .map(|v| v.serialized_name(rename_all))
-                .collect();
-            let suggestion = did_you_mean(&variant.name, variant_names.iter().map(|s| s.as_str()));
-            diagnostics.push(Diagnostic {
-                range: Range::new(
+            diagnostics.push(unknown_variant(
+                type_info,
+                &variant.name,
+                Range::new(
                     Position::new(variant.line, variant.col),
                     Position::new(variant.line, variant.col + variant.name.len() as u32),
                 ),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!(
-                    "Unknown variant '{}' for enum '{}'{}",
-                    variant.name, type_info.name, suggestion
-                ),
-                code: code(codes::UNKNOWN_VARIANT),
-                ..Default::default()
-            });
+            ));
         }
     }
 
     diagnostics
+}
+
+/// The "unknown variant" diagnostic for a name the enum `type_info` does not
+/// accept, reported at `range` with a "did you mean" suggestion drawn from the
+/// enum's serialized variant names.
+fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Diagnostic {
+    let rename_all = type_info.rename_all.as_deref();
+    let known: Vec<String> = match &type_info.kind {
+        TypeKind::Enum(variants) => variants
+            .iter()
+            .map(|v| v.serialized_name(rename_all))
+            .collect(),
+        TypeKind::Struct(_) => Vec::new(),
+    };
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!(
+            "Unknown variant '{}' for enum '{}'{}",
+            variant_name,
+            type_info.name,
+            did_you_mean(variant_name, known.iter().map(|s| s.as_str()))
+        ),
+        code: code(codes::UNKNOWN_VARIANT),
+        ..Default::default()
+    }
 }
 
 /// Validate a tree-sitter node representing a value against a TypeInfo
@@ -724,7 +731,7 @@ async fn validate_node_with_type_info<'a>(
                 .await,
             );
         }
-        TypeKind::Enum(variants) => {
+        TypeKind::Enum(_) => {
             // A nested enum-typed field value (e.g. `mode: Prod`). The bare
             // variant name is either an identifier node or the leading name of
             // a tuple/struct variant node (`Some(30)`, `Foo(a: 1)`). Validate it
@@ -736,31 +743,14 @@ async fn validate_node_with_type_info<'a>(
                 ts_utils::node_text(node, content)
             };
 
-            if let Some(variant_name) = variant_name.map(str::trim).filter(|n| !n.is_empty()) {
-                let rename_all = type_info.rename_all.as_deref();
-                let variant_match = variants.iter().any(|v| {
-                    v.serialized_name(rename_all) == variant_name
-                        || v.name == variant_name
-                        || v.name.to_lowercase() == variant_name.to_lowercase()
-                });
-                if !variant_match {
-                    let variant_names: Vec<String> = variants
-                        .iter()
-                        .map(|v| v.serialized_name(rename_all))
-                        .collect();
-                    let suggestion =
-                        did_you_mean(variant_name, variant_names.iter().map(|s| s.as_str()));
-                    diagnostics.push(Diagnostic {
-                        range: ts_utils::node_to_lsp_range(node),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!(
-                            "Unknown variant '{}' for enum '{}'{}",
-                            variant_name, type_info.name, suggestion
-                        ),
-                        code: code(codes::UNKNOWN_VARIANT),
-                        ..Default::default()
-                    });
-                }
+            if let Some(variant_name) = variant_name.map(str::trim).filter(|n| !n.is_empty())
+                && type_info.find_variant(variant_name).is_none()
+            {
+                diagnostics.push(unknown_variant(
+                    type_info,
+                    variant_name,
+                    ts_utils::node_to_lsp_range(node),
+                ));
             }
         }
     }
@@ -982,23 +972,14 @@ async fn check_type_mismatch_with_enum_validation(
         // regardless of case (serde rename_all can produce lowercase/snake_case variant names)
         if !type_in_ron.is_empty() && !is_primitive_type(type_in_ron) {
             if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
-                if let TypeKind::Enum(variants) = &type_info.kind {
-                    // For enum fields, accept the serialized name (rename/rename_all),
-                    // the Rust name, or a case-insensitive match as a lenient fallback
-                    let rename_all = type_info.rename_all.as_deref();
-                    let variant_match = variants.iter().any(|v| {
-                        v.serialized_name(rename_all) == type_in_ron
-                            || v.name == type_in_ron
-                            || v.name.to_lowercase() == type_in_ron.to_lowercase()
-                    });
-                    if !variant_match {
-                        return Some(format!(
+                if matches!(type_info.kind, TypeKind::Enum(_)) {
+                    return match type_info.find_variant(type_in_ron) {
+                        Some(_) => None,
+                        None => Some(format!(
                             "unknown variant '{}' for enum {}",
                             type_in_ron, expected_type
-                        ));
-                    }
-                    // Valid enum variant - no error
-                    return None;
+                        )),
+                    };
                 } else if type_in_ron
                     .chars()
                     .next()
