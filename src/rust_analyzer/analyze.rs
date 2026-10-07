@@ -1118,8 +1118,23 @@ mod tests {
         // Lookup by serialized name, with Rust-name fallback
         assert!(config.find_field_serialized("maxConnections").is_some());
         assert!(config.find_field_serialized("max_connections").is_some());
-        assert!(mode.find_variant_serialized("fast_mode").is_some());
-        assert!(mode.find_variant_serialized("legacy").is_some());
+
+        // Every variant lookup goes through EnumVariant::accepts_name: the
+        // serialized name, the Rust name, and the Rust name case-insensitively.
+        let rename_all = mode.rename_all.as_deref();
+        for accepted in ["fast_mode", "FastMode", "fastmode"] {
+            assert!(
+                mode.find_variant(accepted).is_some(),
+                "'{accepted}' names FastMode"
+            );
+        }
+        assert!(mode.find_variant("legacy").is_some(), "explicit rename");
+        assert!(
+            mode.find_variant("OldMode").is_some(),
+            "an explicit rename does not retire the Rust name"
+        );
+        assert!(mode.find_variant("nonsense").is_none());
+        assert!(!old.accepts_name("old_mode", rename_all), "rename wins");
 
         // effective_fields: skip excluded, flatten expanded, names serialized
         let effective = config.effective_fields(&analyzer);

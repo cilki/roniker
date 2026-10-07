@@ -1321,6 +1321,72 @@ Document::new(content.to_string()),
         }
     }
 
+    /// A document names a variant the way serde serializes it, so hover has to
+    /// resolve that name — not only the Rust one. Both `rename_all` and an
+    /// explicit `rename` have to be honored.
+    #[tokio::test]
+    async fn test_lsp_hover_on_serde_renamed_enum_variant() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Status");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Status".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "OnVacation".to_string(),
+                    docs: Some("The user is away".to_string()),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Retired".to_string(),
+                    rename: Some("legacy".to_string()),
+                    docs: Some("The user is never coming back".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("snake_case".to_string()),
+            ..Default::default()
+        });
+
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+
+        // `on_vacation` is OnVacation under rename_all = "snake_case";
+        // `legacy` comes from the explicit rename on Retired.
+        for (content, column, expected_docs) in [
+            ("on_vacation", 3, "The user is away"),
+            ("legacy", 1, "The user is never coming back"),
+        ] {
+            let uri: Url = "file:///test/status.ron".parse().unwrap();
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content.to_string()));
+
+            let hover_result = backend
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        position: Position::new(0, column),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+
+            let Some(Hover {
+                contents: HoverContents::Markup(markup),
+                ..
+            }) = hover_result
+            else {
+                panic!("Hover should resolve the serialized variant name '{content}'");
+            };
+            assert!(
+                markup.value.contains(expected_docs),
+                "Hover on '{content}' should document the variant. Got: {}",
+                markup.value
+            );
+        }
+    }
+
     /// Test that hover works on the type name itself
     #[tokio::test]
     async fn test_lsp_hover_on_type_name() {
