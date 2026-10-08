@@ -242,7 +242,9 @@ fn generate_explicit_type_actions(
     actions
 }
 
-/// Generate code actions for adding missing fields
+/// Generate code actions for adding the fields missing from the document root,
+/// for both a struct root and an enum root — see [`expected_root_fields`], which
+/// is the only thing that differs between them.
 fn generate_missing_field_actions(
     tree: &Tree,
     content: &str,
@@ -250,128 +252,87 @@ fn generate_missing_field_actions(
     url: &Url,
     analyzer: &RustAnalyzer,
 ) -> Vec<CodeActionOrCommand> {
-    let mut actions = Vec::new();
+    let Some((effective_fields, target)) = expected_root_fields(tree, content, type_info, analyzer)
+    else {
+        return Vec::new();
+    };
 
-    // Check if we're in an enum variant context
-    if matches!(type_info.kind, TypeKind::Enum(_)) {
-        // Try to detect which variant we're in
-        if let Some(variant_name) = detect_current_variant_in_content(content)
-            && let Some(variant) = type_info.find_variant(&variant_name)
-        {
-            // Generate actions for this variant's fields
-            let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
-            let effective_fields = variant.effective_fields();
-            let all_missing: Vec<_> = effective_fields
-                .iter()
-                .filter(|(name, field)| {
-                    !ron_fields.contains(name) && !ron_fields.contains(&field.name)
-                })
-                .cloned()
-                .collect();
-
-            let required_missing = if type_info.has_default {
-                Vec::new()
-            } else {
-                super::type_utils::missing_required_fields(&effective_fields, |name| {
-                    ron_fields.iter().any(|f| f == name)
-                })
-            };
-
-            // Code action: Add all required fields for variant
-            if !required_missing.is_empty()
-                && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
-            {
-                actions.push(single_file_action(
-                    url,
-                    format!(
-                        "Add {} required field{} to {}",
-                        required_missing.len(),
-                        plural(required_missing.len()),
-                        variant_name
-                    ),
-                    CodeActionKind::QUICKFIX,
-                    edits,
-                    None,
-                ));
-            }
-
-            // Code action: Add all fields for variant
-            if !all_missing.is_empty()
-                && let Some(edits) = generate_field_insertions(tree, content, &all_missing)
-            {
-                actions.push(single_file_action(
-                    url,
-                    format!(
-                        "Add all {} missing field{} to {}",
-                        all_missing.len(),
-                        plural(all_missing.len()),
-                        variant_name
-                    ),
-                    CodeActionKind::QUICKFIX,
-                    edits,
-                    None,
-                ));
-            }
-
-            return actions;
-        }
-    }
-
-    // Original struct logic
     let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
-    let effective_fields = type_info.effective_fields(analyzer);
+    let present = |name: &str| ron_fields.iter().any(|f| f == name);
 
-    // Find missing fields
     let all_missing: Vec<_> = effective_fields
         .iter()
-        .filter(|(name, field)| !ron_fields.contains(name) && !ron_fields.contains(&field.name))
+        .filter(|(name, field)| !present(name) && !present(&field.name))
         .cloned()
         .collect();
-
-    // Find required missing fields (not Option<T> and no Default trait)
+    // A type that derives Default needs none of its fields spelled out.
     let required_missing = if type_info.has_default {
         Vec::new()
     } else {
-        super::type_utils::missing_required_fields(&effective_fields, |name| {
-            ron_fields.iter().any(|f| f == name)
-        })
+        super::type_utils::missing_required_fields(&effective_fields, present)
     };
 
-    // Code action: Add all required fields
-    if !required_missing.is_empty()
-        && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
-    {
-        actions.push(single_file_action(
+    [
+        ("Add", "required", required_missing),
+        ("Add all", "missing", all_missing),
+    ]
+    .into_iter()
+    .filter(|(_, _, fields)| !fields.is_empty())
+    .filter_map(|(lead, kind, fields)| {
+        let edits = generate_field_insertions(tree, content, &fields)?;
+        Some(single_file_action(
             url,
             format!(
-                "Add {} required field{}",
-                required_missing.len(),
-                plural(required_missing.len())
+                "{lead} {} {kind} field{}{target}",
+                fields.len(),
+                plural(fields.len())
             ),
             CodeActionKind::QUICKFIX,
             edits,
             None,
-        ));
-    }
+        ))
+    })
+    .collect()
+}
 
-    // Code action: Add all fields
-    if !all_missing.is_empty()
-        && let Some(edits) = generate_field_insertions(tree, content, &all_missing)
-    {
-        actions.push(single_file_action(
-            url,
-            format!(
-                "Add all {} missing field{}",
-                all_missing.len(),
-                plural(all_missing.len())
-            ),
-            CodeActionKind::QUICKFIX,
-            edits,
-            None,
-        ));
-    }
+/// The fields the document root is expected to carry, paired with the suffix
+/// that names them in a code action's title.
+///
+/// A struct root is compared against its own fields, an enum root against the
+/// fields of whichever variant the document names; that is the whole difference
+/// between the two, so everything downstream can ignore it.
+///
+/// `None` when there is nothing to compare against: an enum root that names no
+/// known variant — an unknown-variant error rather than a set of absent fields —
+/// or a tuple/newtype, whose fields are positional (`"0"`, `"1"`, ...) and so
+/// have no name that could be inserted.
+fn expected_root_fields(
+    tree: &Tree,
+    content: &str,
+    type_info: &TypeInfo,
+    analyzer: &RustAnalyzer,
+) -> Option<(Vec<(String, FieldInfo)>, String)> {
+    let (fields, target) = match &type_info.kind {
+        TypeKind::Enum(_) => {
+            let name = root_variant_name(tree, content)?;
+            let variant = type_info.find_variant(&name)?;
+            (variant.effective_fields(), format!(" to {}", name))
+        }
+        TypeKind::Struct(_) => (type_info.effective_fields(analyzer), String::new()),
+    };
 
-    actions
+    match fields.iter().any(|(_, field)| field.is_positional()) {
+        true => None,
+        false => Some((fields, target)),
+    }
+}
+
+/// The variant name a root enum value spells out — `Prod` for both the unit
+/// `Prod` and `Prod(...)`. Read off the parse tree, the same way the diagnostics
+/// for that value read it.
+fn root_variant_name(tree: &Tree, content: &str) -> Option<String> {
+    let main_value = super::ts_utils::find_main_value(tree)?;
+    super::ts_utils::extract_enum_variant(&main_value, content).map(|variant| variant.name)
 }
 
 /// Create action to make root-level struct name explicit using tree-sitter
@@ -606,37 +567,6 @@ fn field_indent(content: &str, struct_node: &tree_sitter::Node) -> String {
         Some(field) => leading(field.start_position().row),
         None => leading(own_row) + "    ",
     }
-}
-
-/// Detect which enum variant we're currently inside based on the content
-/// This primarily looks for EnumName::VariantName( pattern
-/// Returns None for regular structs without :: prefix
-fn detect_current_variant_in_content(content: &str) -> Option<String> {
-    // Look for :: pattern which indicates it's definitely a variant
-    let double_colon_idx = content.find("::")?;
-
-    // Find the variant name after ::
-    let after_colons = &content[double_colon_idx + 2..];
-    let variant_start = after_colons
-        .chars()
-        .position(|c| c.is_alphanumeric() || c == '_')?;
-    let variant_part = &after_colons[variant_start..];
-
-    // Extract the variant name (alphanumeric + underscore until opening paren/brace or whitespace)
-    let variant_end = variant_part
-        .chars()
-        .position(|c| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(variant_part.len());
-
-    let variant_name = &variant_part[..variant_end];
-
-    // Check that there's an opening paren or brace after the variant name (with optional whitespace)
-    let remaining = variant_part[variant_end..].trim_start();
-    if (remaining.starts_with('(') || remaining.starts_with('{')) && !variant_name.is_empty() {
-        return Some(variant_name.to_string());
-    }
-
-    None
 }
 
 /// Generate a default value for a given Rust type
@@ -1041,7 +971,10 @@ mod tests {
             ..Default::default()
         };
 
-        let content = "MyEnum::StructVariant(\n    field_a: \"test\"\n)";
+        // How RON actually spells an enum value: the bare variant name. The
+        // `Enum::Variant(...)` form this used to be written with is a RON syntax
+        // error, so it never exercised the feature on a real document.
+        let content = "StructVariant(\n    field_a: \"test\"\n)";
         let url = Url::parse("file:///test.ron").unwrap();
 
         // Create mock analyzer and client for the test
@@ -1068,24 +1001,131 @@ mod tests {
             .collect();
 
         // Should have action mentioning the variant name
-        assert!(titles.iter().any(|t| t.contains("StructVariant")));
-        assert!(titles.iter().any(|t| t.contains("field")));
+        assert!(
+            titles.iter().any(|t| t.contains("StructVariant")),
+            "got: {titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| t.contains("field")),
+            "got: {titles:?}"
+        );
     }
 
+    /// The struct and enum roots share one code path, so the fields a root enum
+    /// variant is missing must be inserted exactly as a struct's would be.
     #[test]
-    fn test_detect_current_variant_in_content() {
-        let content = "MyEnum::StructVariant(\n    field_a: value\n)";
-        let variant = detect_current_variant_in_content(content);
-        println!("Detected variant: {:?}", variant);
-        assert_eq!(variant, Some("StructVariant".to_string()));
+    fn test_enum_variant_missing_field_insertion_matches_struct() {
+        use crate::rust_analyzer::EnumVariant;
+
+        let fields = vec![
+            FieldInfo {
+                name: "a".to_string(),
+                type_name: "u32".to_string(),
+                ..Default::default()
+            },
+            FieldInfo {
+                name: "b".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            },
+        ];
+        let as_enum = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Prod".to_string(),
+                fields: fields.clone(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let as_struct = TypeInfo {
+            name: "Prod".to_string(),
+            kind: TypeKind::Struct(fields),
+            ..Default::default()
+        };
+
+        let content = "Prod(\n    a: 1,\n)";
+        let url = Url::parse("file:///test.ron").unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+
+        let edit_sets = |type_info: &TypeInfo| -> Vec<Vec<TextEdit>> {
+            generate_code_actions(
+                &parse(content),
+                content,
+                type_info,
+                &url,
+                analyzer.clone(),
+                &[],
+            )
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) if a.title.contains("field") => {
+                    Some(a.edit.as_ref()?.changes.as_ref()?.get(&url)?.clone())
+                }
+                _ => None,
+            })
+            .collect()
+        };
+
+        let from_enum = edit_sets(&as_enum);
+        assert!(
+            !from_enum.is_empty(),
+            "a root enum variant's missing fields should be offered"
+        );
+        assert_eq!(
+            from_enum,
+            edit_sets(&as_struct),
+            "the enum root's edits diverged from the struct root's"
+        );
+        for edits in &from_enum {
+            assert_eq!(apply(content, edits), "Prod(\n    a: 1,\n    b: \"\",\n)");
+        }
     }
 
+    /// A tuple variant's fields are positional, so there is no name to insert and
+    /// the action must not be offered at all.
     #[test]
-    fn test_detect_current_variant_in_content_no_match() {
-        let content = "MyStruct(\n    field_a: value\n)";
-        let variant = detect_current_variant_in_content(content);
-        println!("Detected variant (should be None): {:?}", variant);
-        assert!(variant.is_none());
+    fn test_no_missing_field_action_for_tuple_variant() {
+        use crate::rust_analyzer::EnumVariant;
+
+        let type_info = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Port".to_string(),
+                fields: vec![
+                    FieldInfo {
+                        name: "0".to_string(),
+                        type_name: "u16".to_string(),
+                        ..Default::default()
+                    },
+                    FieldInfo {
+                        name: "1".to_string(),
+                        type_name: "String".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let content = "Port(80)";
+        let url = Url::parse("file:///test.ron").unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+
+        let actions =
+            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let titles: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => Some(a.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !titles.iter().any(|t| t.contains("field")),
+            "positional fields have no name to insert: {titles:?}"
+        );
     }
 
     #[test]
