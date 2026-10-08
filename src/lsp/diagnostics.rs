@@ -165,7 +165,8 @@ async fn validate_struct_node(
         let Some(field_name) = ts_utils::field_name(&field_node, content) else {
             continue;
         };
-        let name_range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+        let name_range =
+            ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node), content);
 
         // Duplicate field — report at the second occurrence
         if !present_fields.insert(field_name) {
@@ -235,7 +236,7 @@ async fn validate_struct_node(
         if !missing.is_empty() {
             let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
             diagnostics.push(Diagnostic {
-                range: struct_name_range(node),
+                range: struct_name_range(node, content),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!(
                     "Required fields{}: {}",
@@ -316,27 +317,30 @@ async fn validate_typed_value(
 /// The node's range, clipped to its first line. A multi-line node would
 /// otherwise produce an inverted column range.
 fn first_line_range(node: &tree_sitter::Node, content: &str) -> Range {
+    use super::ts_utils;
+
     let start = node.start_position();
     let end = node.end_position();
     let end_col = if end.row > start.row {
-        content.lines().nth(start.row).unwrap_or("").len() as u32
+        ts_utils::line_width(content, start.row)
     } else {
-        end.column as u32
+        ts_utils::point_to_position(content, end).character
     };
     Range::new(
-        Position::new(start.row as u32, start.column as u32),
+        ts_utils::point_to_position(content, start),
         Position::new(start.row as u32, end_col),
     )
 }
 
 /// The range to report a whole-struct diagnostic at: the struct's name, or a
 /// zero-width range at its start when it is written with unnamed syntax.
-fn struct_name_range(node: &tree_sitter::Node) -> Range {
+fn struct_name_range(node: &tree_sitter::Node, content: &str) -> Range {
     match node.child(0) {
-        Some(name) if name.kind() == "identifier" => super::ts_utils::node_to_lsp_range(&name),
+        Some(name) if name.kind() == "identifier" => {
+            super::ts_utils::node_to_lsp_range(&name, content)
+        }
         _ => {
-            let pos = node.start_position();
-            let pos = Position::new(pos.row as u32, pos.column as u32);
+            let pos = super::ts_utils::point_to_position(content, node.start_position());
             Range::new(pos, pos)
         }
     }
@@ -375,7 +379,7 @@ async fn validate_nested_value<'a>(
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
     let unknown_type_diag = |inner: &str| Diagnostic {
-        range: super::ts_utils::node_to_lsp_range(value_node),
+        range: super::ts_utils::node_to_lsp_range(value_node, content),
         severity: Some(DiagnosticSeverity::ERROR),
         message: format!("Unknown type '{}'", inner),
         code: code(codes::UNKNOWN_TYPE),
@@ -448,7 +452,7 @@ async fn validate_nested_value<'a>(
         } else {
             // Unknown custom type — report an error at the value node
             diagnostics.push(Diagnostic {
-                range: super::ts_utils::node_to_lsp_range(value_node),
+                range: super::ts_utils::node_to_lsp_range(value_node, content),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!("Unknown type '{}'", field_type_normalized),
                 code: code(codes::UNKNOWN_TYPE),
@@ -848,8 +852,24 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     None
 }
 
-/// Parse error position from RON error message
+/// Where to report a syntax error, as an LSP line and column.
+///
+/// RON counts its error column in characters, so it has to be translated into
+/// the UTF-16 code units LSP counts in before it goes out to the editor.
 fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
+    use super::ts_utils;
+
+    let (line, char_col) = parse_error_char_position(error_msg, content);
+    let text = ts_utils::line_at(content, line as usize);
+    let byte_col = text
+        .char_indices()
+        .nth(char_col as usize)
+        .map_or(text.len(), |(byte, _)| byte);
+    (line, ts_utils::utf16_column(text, byte_col))
+}
+
+/// Parse error position from RON error message, with the column in characters.
+fn parse_error_char_position(error_msg: &str, content: &str) -> (u32, u32) {
     // RON error messages often contain position info like "1:5" or "line 1 column 5"
 
     // Try to find "line X column Y" pattern
@@ -906,7 +926,7 @@ fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
             // Next line looks like a field (word followed by colon)
             if next_line.contains(':') && !next_line.starts_with("//") {
                 // Likely missing comma
-                return (idx as u32, line.len().saturating_sub(1) as u32);
+                return (idx as u32, line.chars().count().saturating_sub(1) as u32);
             }
         }
     }
@@ -2635,5 +2655,94 @@ mod tests {
             "Should suggest 'Ephemeral'. Got: {:?}",
             diagnostics
         );
+    }
+
+    /// A diagnostic's range is a column in UTF-16 code units, which is what an
+    /// editor slices the line with. Reporting tree-sitter's byte column instead
+    /// put the squiggle one column right for every extra byte earlier on the
+    /// line, so a document with an accented or emoji string value underlined
+    /// the wrong text.
+    #[tokio::test]
+    async fn test_diagnostic_columns_are_utf16() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+            ]),
+            has_default: true,
+            ..Default::default()
+        };
+
+        // `ü` is two bytes; `🚀` is four bytes and two UTF-16 code units.
+        for host in ["x", "münchen", "🚀"] {
+            let content = format!("Config(host: \"{host}\", bogus: 1, port: 80)");
+            let diagnostics =
+                validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone()).await;
+
+            let unknown = diagnostics
+                .iter()
+                .find(|d| d.code == code(codes::UNKNOWN_FIELD))
+                .unwrap_or_else(|| panic!("'bogus' must be reported. Got: {diagnostics:?}"));
+
+            // Slice the line the way a client does: by UTF-16 code units.
+            let units: Vec<u16> = content.encode_utf16().collect();
+            let start = unknown.range.start.character as usize;
+            let end = unknown.range.end.character as usize;
+            let under = String::from_utf16(&units[start..end]).unwrap();
+            assert_eq!(under, "bogus", "the squiggle must cover the offending field");
+        }
+    }
+
+    /// The same for a type mismatch, whose range is clipped to the value's
+    /// first line.
+    #[tokio::test]
+    async fn test_type_mismatch_columns_are_utf16() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+            ]),
+            has_default: true,
+            ..Default::default()
+        };
+
+        let content = "Config(host: \"🚀\", port: \"nope\")";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let mismatch = diagnostics
+            .iter()
+            .find(|d| d.code == code(codes::TYPE_MISMATCH))
+            .unwrap_or_else(|| panic!("the port value must be reported. Got: {diagnostics:?}"));
+
+        let units: Vec<u16> = content.encode_utf16().collect();
+        let under = String::from_utf16(
+            &units[mismatch.range.start.character as usize..mismatch.range.end.character as usize],
+        )
+        .unwrap();
+        assert_eq!(under, "\"nope\"");
     }
 }

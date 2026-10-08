@@ -497,11 +497,12 @@ impl LanguageServer for Backend {
 
             if formatted != doc.content {
                 let line_count = doc.content.lines().count() as u32;
-                let last_line_len = doc.content.lines().last().map_or(0, |l| l.len()) as u32;
+                let last_line = line_count.saturating_sub(1);
+                let last_column = ts_utils::line_width(&doc.content, last_line as usize);
                 return Ok(Some(vec![TextEdit {
                     range: Range::new(
                         Position::new(0, 0),
-                        Position::new(line_count.saturating_sub(1), last_line_len),
+                        Position::new(last_line, last_column),
                     ),
                     new_text: formatted,
                 }]));
@@ -536,15 +537,19 @@ impl LanguageServer for Backend {
                 {
                     if i == start_line && i == end_line {
                         // Single line selection
-                        let start_byte = char_col_to_byte(line, range.start.character as usize);
-                        let end_byte = char_col_to_byte(line, range.end.character as usize);
+                        let start_byte =
+                            ts_utils::utf16_column_to_byte(line, range.start.character as usize);
+                        let end_byte =
+                            ts_utils::utf16_column_to_byte(line, range.end.character as usize);
                         selected_text.push_str(&line[start_byte..end_byte.max(start_byte)]);
                     } else if i == start_line {
-                        let start_byte = char_col_to_byte(line, range.start.character as usize);
+                        let start_byte =
+                            ts_utils::utf16_column_to_byte(line, range.start.character as usize);
                         selected_text.push_str(&line[start_byte..]);
                         selected_text.push('\n');
                     } else if i == end_line {
-                        let end_byte = char_col_to_byte(line, range.end.character as usize);
+                        let end_byte =
+                            ts_utils::utf16_column_to_byte(line, range.end.character as usize);
                         selected_text.push_str(&line[..end_byte]);
                     } else {
                         selected_text.push_str(line);
@@ -605,7 +610,9 @@ impl LanguageServer for Backend {
 
         // Only field name identifiers are renameable
         Ok(field_name_node_at(tree, &doc.content, position)
-            .map(|name_node| PrepareRenameResponse::Range(ts_utils::node_to_lsp_range(&name_node))))
+            .map(|name_node| {
+                PrepareRenameResponse::Range(ts_utils::node_to_lsp_range(&name_node, &doc.content))
+            }))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
@@ -653,10 +660,7 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            let node_pos = Position::new(
-                node.start_position().row as u32,
-                node.start_position().column as u32,
-            );
+            let node_pos = ts_utils::point_to_position(&content, node.start_position());
             let owner = self.resolve_owner_type_at(&content, Some(&tree), node_pos);
             // When either side can't be resolved, fall back to matching by name
             if let (Some(target), Some(owner)) = (&target_type, &owner)
@@ -666,7 +670,7 @@ impl LanguageServer for Backend {
             }
 
             changes.push(TextEdit {
-                range: ts_utils::node_to_lsp_range(&node),
+                range: ts_utils::node_to_lsp_range(&node, &content),
                 new_text: new_name.clone(),
             });
         }
@@ -740,26 +744,19 @@ fn create_location_response(
     })))
 }
 
-/// Convert an LSP character column to a byte index within a line,
-/// clamping to the end of the line.
-fn char_col_to_byte(line: &str, col: usize) -> usize {
-    line.char_indices()
-        .nth(col)
-        .map(|(i, _)| i)
-        .unwrap_or(line.len())
-}
-
 fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     let line = content.lines().nth(position.line as usize)?;
 
-    // The LSP character offset is a column, not a byte index. Work over the
-    // line's chars so a multibyte character (in a string value or comment) can
-    // never make us slice mid-codepoint and panic.
+    // The LSP character offset is a column in UTF-16 code units, not a byte
+    // index. Convert it to a char index and work over the line's chars, so a
+    // multibyte character (in a string value or comment) earlier on the line
+    // neither shifts the word boundaries nor lets us slice mid-codepoint.
     let chars: Vec<char> = line.chars().collect();
-    let col = position.character as usize;
-    if col > chars.len() {
+    if position.character > ts_utils::utf16_column(line, line.len()) {
         return None;
     }
+    let byte_col = ts_utils::utf16_column_to_byte(line, position.character as usize);
+    let col = line[..byte_col].chars().count();
 
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
 
@@ -2015,6 +2012,53 @@ PostReference(
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
         assert!(fields.contains(&"id".to_string()));
         assert!(fields.contains(&"name".to_string()));
+    }
+
+    /// Incoming change ranges are columns in UTF-16 code units. Treating them
+    /// as characters put the edit one column off for every surrogate pair
+    /// earlier on the line, which silently garbles the document the server
+    /// holds — and so everything it answers from then on.
+    #[test]
+    fn test_incremental_change_after_surrogate_pair() {
+        let mut doc = Document::new("User(name: \"🚀\", id: 1)".to_string());
+
+        // Replace the `1` with `2`. `🚀` is two UTF-16 code units, so the LSP
+        // column of the `1` is two past its character index.
+        let column = "User(name: \"🚀\", id: ".encode_utf16().count() as u32;
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                Position::new(0, column),
+                Position::new(0, column + 1),
+            )),
+            range_length: None,
+            text: "2".to_string(),
+        });
+
+        assert_eq!(doc.content, "User(name: \"🚀\", id: 2)");
+
+        // The reused tree must still agree with the content.
+        let tree = doc.tree.as_ref().unwrap();
+        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
+        assert!(fields.contains(&"name".to_string()), "got {fields:?}");
+        assert!(fields.contains(&"id".to_string()), "got {fields:?}");
+        assert_eq!(
+            tree_sitter_parser::get_field_at_position(tree, &doc.content, Position::new(0, column)),
+            Some("id".to_string())
+        );
+    }
+
+    /// `get_word_at_position` is handed a UTF-16 column too. Enough surrogate
+    /// pairs earlier on the line and a column read as characters doesn't just
+    /// slip within the word, it lands in the next one.
+    #[test]
+    fn test_word_at_position_after_surrogate_pair() {
+        let content = "Config(name: \"🚀🚀🚀🚀\", host: \"a\", port: 80)";
+        let prefix = "Config(name: \"🚀🚀🚀🚀\", ho";
+        let column = prefix.encode_utf16().count() as u32;
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, column)),
+            Some("host".to_string())
+        );
     }
 
     #[test]

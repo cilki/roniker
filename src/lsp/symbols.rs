@@ -29,6 +29,7 @@ fn value_symbols(node: &Node, content: &str) -> Vec<DocumentSymbol> {
                     node,
                     node.child(0).as_ref().unwrap_or(node),
                     children,
+                    content,
                 )],
                 // Anonymous struct: hoist its fields to the parent level
                 None => children,
@@ -57,6 +58,7 @@ fn field_symbol(field_node: &Node, content: &str) -> Option<DocumentSymbol> {
         field_node,
         &name_node,
         children,
+        content,
     ))
 }
 
@@ -67,6 +69,7 @@ fn symbol(
     node: &Node,
     selection_node: &Node,
     children: Vec<DocumentSymbol>,
+    content: &str,
 ) -> DocumentSymbol {
     DocumentSymbol {
         name,
@@ -74,8 +77,8 @@ fn symbol(
         kind,
         tags: None,
         deprecated: None,
-        range: ts_utils::node_to_lsp_range(node),
-        selection_range: ts_utils::node_to_lsp_range(selection_node),
+        range: ts_utils::node_to_lsp_range(node, content),
+        selection_range: ts_utils::node_to_lsp_range(selection_node, content),
         children: if children.is_empty() {
             None
         } else {
@@ -122,6 +125,26 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "debug");
         assert_eq!(symbols[0].kind, SymbolKind::FIELD);
+    }
+
+    /// A symbol's ranges are columns in UTF-16 code units: an editor uses them
+    /// to highlight and reveal the symbol, so a non-ASCII value earlier on the
+    /// line must not shift them.
+    #[test]
+    fn test_selection_range_columns_are_utf16() {
+        let content = "Config(host: \"münchen\", port: 80)";
+        let symbols = document_symbols(&parse(content), content);
+
+        let fields = symbols[0].children.as_ref().unwrap();
+        let port = fields.iter().find(|s| s.name == "port").unwrap();
+
+        let units: Vec<u16> = content.encode_utf16().collect();
+        let selected = String::from_utf16(
+            &units[port.selection_range.start.character as usize
+                ..port.selection_range.end.character as usize],
+        )
+        .unwrap();
+        assert_eq!(selected, "port");
     }
 
     #[test]

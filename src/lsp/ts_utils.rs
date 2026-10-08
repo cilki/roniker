@@ -54,44 +54,81 @@ pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> Option<Tree> {
     PARSER.with(|parser| parser.borrow_mut().parse_with(content, old_tree))
 }
 
+/// The text of row `row`, counting rows the way tree-sitter does: one per `\n`,
+/// with any `\r` left in place. Empty when the row is past the end of `content`.
+pub fn line_at(content: &str, row: usize) -> &str {
+    content.split('\n').nth(row).unwrap_or("")
+}
+
+/// The UTF-16 column that a byte column on `line` corresponds to.
+///
+/// LSP counts `Position::character` in UTF-16 code units, while tree-sitter
+/// counts `Point::column` in bytes. The two only agree on an all-ASCII line, so
+/// everything the server hands back to the editor has to go through here or the
+/// ranges land one position too far right for every extra byte earlier on the
+/// line.
+pub fn utf16_column(line: &str, byte_column: usize) -> u32 {
+    let mut end = byte_column.min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if line.as_bytes()[..end].is_ascii() {
+        return end as u32;
+    }
+    line[..end].encode_utf16().count() as u32
+}
+
+/// The byte column on `line` that a UTF-16 column corresponds to, clamped to the
+/// end of the line. The inverse of [`utf16_column`].
+pub fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
+    if line.is_ascii() {
+        return utf16_column.min(line.len());
+    }
+    let mut units = 0;
+    for (byte, ch) in line.char_indices() {
+        if units >= utf16_column {
+            return byte;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}
+
+/// The width of row `row` in UTF-16 code units, i.e. the column just past its
+/// last character.
+pub fn line_width(content: &str, row: usize) -> u32 {
+    let line = line_at(content, row);
+    utf16_column(line, line.len())
+}
+
+/// Convert a tree-sitter `Point` (row + byte column) to an LSP `Position`
+/// (line + UTF-16 column).
+pub fn point_to_position(content: &str, point: tree_sitter::Point) -> Position {
+    Position {
+        line: point.row as u32,
+        character: utf16_column(line_at(content, point.row), point.column),
+    }
+}
+
 /// Convert LSP Position to byte offset in content
 pub fn position_to_byte_offset(content: &str, position: Position) -> usize {
     let mut offset = 0;
-    let mut current_line = 0;
-    let mut current_col = 0;
 
-    for ch in content.chars() {
-        if current_line == position.line as usize && current_col == position.character as usize {
-            return offset;
+    for (row, line) in content.split('\n').enumerate() {
+        if row == position.line as usize {
+            return offset + utf16_column_to_byte(line, position.character as usize);
         }
-
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 0;
-        } else {
-            current_col += 1;
-        }
-
-        offset += ch.len_utf8();
+        offset += line.len() + 1; // + the '\n' that split consumed
     }
 
-    offset
+    content.len()
 }
 
-/// Convert tree-sitter byte range to LSP Range
-pub fn node_to_lsp_range(node: &Node) -> Range {
-    let start_pos = node.start_position();
-    let end_pos = node.end_position();
-
+/// Convert a node's byte range to an LSP Range
+pub fn node_to_lsp_range(node: &Node, content: &str) -> Range {
     Range {
-        start: Position {
-            line: start_pos.row as u32,
-            character: start_pos.column as u32,
-        },
-        end: Position {
-            line: end_pos.row as u32,
-            character: end_pos.column as u32,
-        },
+        start: point_to_position(content, node.start_position()),
+        end: point_to_position(content, node.end_position()),
     }
 }
 
@@ -316,7 +353,7 @@ pub fn extract_enum_variant(node: &Node, content: &str) -> Option<ParsedEnumVari
 
     Some(ParsedEnumVariant {
         name: name.to_string(),
-        range: node_to_lsp_range(&name_node),
+        range: node_to_lsp_range(&name_node, content),
     })
 }
 
@@ -409,6 +446,101 @@ mod tests {
         let content = "abc\ndef";
         let offset = position_to_byte_offset(content, Position::new(1, 1));
         assert_eq!(offset, 5); // After "abc\nd"
+    }
+
+    /// LSP columns count UTF-16 code units and tree-sitter columns count bytes.
+    /// Converting between them has to account for both multibyte characters
+    /// (`ü` is 2 bytes, 1 code unit) and surrogate pairs (`🚀` is 4 bytes, 2
+    /// code units).
+    #[test]
+    fn test_utf16_column_conversions() {
+        let line = "a(\"ü🚀\", b: 1)";
+
+        // byte column -> UTF-16 column, at every character boundary
+        let boundaries: [(usize, u32); 6] = [
+            (0, 0),   // start
+            (3, 3),   // after `a("`
+            (5, 4),   // after `ü` (2 bytes, 1 unit)
+            (9, 6),   // after `🚀` (4 bytes, 2 units)
+            (12, 9),  // after `", `
+            (13, 10), // after `b`
+        ];
+        for (byte, utf16) in boundaries {
+            assert_eq!(
+                utf16_column(line, byte),
+                utf16,
+                "byte column {byte} is UTF-16 column {utf16}"
+            );
+            assert_eq!(
+                utf16_column_to_byte(line, utf16 as usize),
+                byte,
+                "UTF-16 column {utf16} is byte column {byte}"
+            );
+        }
+
+        // Both directions clamp past the end of the line rather than panicking,
+        // and a byte column in the middle of a character snaps back to its start.
+        assert_eq!(utf16_column(line, line.len() + 10), 14);
+        assert_eq!(utf16_column_to_byte(line, 999), line.len());
+        assert_eq!(utf16_column(line, 4), 3, "mid-`ü` snaps back to its start");
+        assert_eq!(utf16_column(line, 7), 4, "mid-`🚀` snaps back to its start");
+    }
+
+    /// A node's reported range is in UTF-16 columns, so an editor underlines
+    /// the node itself and not whatever sits that many *bytes* along the line.
+    #[test]
+    fn test_node_range_is_utf16_not_bytes() {
+        let content = "Config(host: \"münchen\", port: 80)";
+        let tree = parse(content).unwrap();
+
+        let port = descendants_by_kind(&tree, "field")
+            .into_iter()
+            .find(|f| field_name(f, content) == Some("port"))
+            .expect("the `port` field should parse");
+        let range = node_to_lsp_range(&port.child(0).unwrap(), content);
+
+        let expected = content.char_indices().position(|(_, c)| c == 'p').unwrap();
+        assert_eq!(range.start.character as usize, expected);
+        assert_eq!(range.end.character as usize, expected + "port".len());
+    }
+
+    /// Round-tripping a position through a byte offset has to be lossless, or
+    /// requests land on the wrong node once a line holds anything non-ASCII.
+    #[test]
+    fn test_position_byte_offset_round_trip() {
+        // The field names sit *after* the surrogate pair on the same line, so
+        // a column counted in anything but UTF-16 code units resolves to the
+        // wrong node.
+        let content = "Config(\n    host: \"🚀 prod\", port: 80, debug: true,\n)";
+        let tree = parse(content).unwrap();
+
+        for field in descendants_by_kind(&tree, "field") {
+            let name = field.child(0).unwrap();
+            let position = point_to_position(content, name.start_position());
+            assert_eq!(
+                position_to_byte_offset(content, position),
+                name.start_byte(),
+                "position {position:?} should map back to the node it came from"
+            );
+            assert_eq!(
+                node_at_position(&tree, content, position).map(|n| n.id()),
+                Some(name.id()),
+                "position {position:?} should resolve to the field name node"
+            );
+        }
+    }
+
+    #[test]
+    fn test_line_at_and_line_width() {
+        let content = "ü\nab🚀\n";
+        assert_eq!(line_at(content, 0), "ü");
+        assert_eq!(line_at(content, 1), "ab🚀");
+        assert_eq!(line_at(content, 2), "");
+        assert_eq!(line_at(content, 9), "");
+
+        assert_eq!(line_width(content, 0), 1);
+        assert_eq!(line_width(content, 1), 4, "`ab` plus a surrogate pair");
+        assert_eq!(line_width(content, 2), 0);
     }
 
     #[test]

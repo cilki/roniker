@@ -103,8 +103,8 @@ pub fn generate_remove_field_actions(
             )
         } else {
             Range::new(
-                Position::new(start.row as u32, start.column as u32),
-                Position::new(end.row as u32, end.column as u32),
+                ts_utils::point_to_position(content, start),
+                ts_utils::point_to_position(content, end),
             )
         };
 
@@ -349,17 +349,14 @@ fn create_explicit_root_type_action(
 
     if main_value.kind() == "struct" && ts_utils::struct_name(&main_value, content).is_none() {
         let type_name = super::type_utils::short_name(&type_info.name);
-        let pos = main_value.start_position();
+        let pos = ts_utils::point_to_position(content, main_value.start_position());
 
         return Some(single_file_action(
             url,
             format!("Make struct name explicit: {}", type_name),
             CodeActionKind::REFACTOR,
             vec![TextEdit {
-                range: Range::new(
-                    Position::new(pos.row as u32, pos.column as u32),
-                    Position::new(pos.row as u32, pos.column as u32),
-                ),
+                range: Range::new(pos, pos),
                 new_text: type_name.to_string(),
             }],
             None,
@@ -398,16 +395,13 @@ fn create_explicit_field_type_action(
                 let clean_type = super::type_utils::extract_inner_type(&type_name, "Option<")
                     .unwrap_or(&type_name);
 
-                let pos = value_node.start_position();
+                let pos = ts_utils::point_to_position(content, value_node.start_position());
                 return Some(single_file_action(
                     url,
                     format!("Make field type explicit: {} {}", field.name, clean_type),
                     CodeActionKind::REFACTOR,
                     vec![TextEdit {
-                        range: Range::new(
-                            Position::new(pos.row as u32, pos.column as u32),
-                            Position::new(pos.row as u32, pos.column as u32),
-                        ),
+                        range: Range::new(pos, pos),
                         new_text: clean_type.to_string(),
                     }],
                     None,
@@ -479,7 +473,7 @@ fn generate_field_insertions(
         .contains('\n');
 
     let anchor_pos = anchor.end_position();
-    let separator_pos = Position::new(anchor_pos.row as u32, anchor_pos.column as u32);
+    let separator_pos = ts_utils::point_to_position(content, anchor_pos);
 
     let mut body = String::new();
     if on_one_line {
@@ -516,9 +510,12 @@ fn generate_field_insertions(
             body_byte += 1;
         }
     }
-    let body_pos = Position::new(
-        anchor_pos.row as u32,
-        (anchor_pos.column + (body_byte - anchor_end)) as u32,
+    let body_pos = ts_utils::point_to_position(
+        content,
+        tree_sitter::Point {
+            row: anchor_pos.row,
+            column: anchor_pos.column + (body_byte - anchor_end),
+        },
     );
 
     let separator = if needs_separator { "," } else { "" };
@@ -1153,6 +1150,56 @@ mod tests {
         assert_eq!(edits[0].new_text, "");
         assert_eq!(edits[0].range.start, Position::new(2, 0));
         assert_eq!(edits[0].range.end, Position::new(3, 0));
+    }
+
+    /// Edit ranges are columns in UTF-16 code units, not bytes. A non-ASCII
+    /// string value earlier on the line used to shift every edit on that line
+    /// one column right per extra byte, so applying the quick-fix ate the
+    /// wrong text instead of the field it named.
+    #[test]
+    fn test_remove_field_action_columns_are_utf16() {
+        let content = "(host: \"münchen\", bogus: 1, port: 80)";
+        let url = Url::parse("file:///test.ron").unwrap();
+        let start = content.chars().position(|c| c == 'b').unwrap() as u32;
+        let diagnostic = Diagnostic {
+            range: Range::new(Position::new(0, start), Position::new(0, start + 5)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "Unknown field 'bogus'".to_string(),
+            code: Some(NumberOrString::String("unknown-field".to_string())),
+            ..Default::default()
+        };
+
+        let actions = generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action, got {actions:?}");
+        };
+        assert_eq!(action.title, "Remove field 'bogus'");
+
+        let edits = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&url];
+        assert_eq!(
+            apply(content, edits),
+            // The separating space is left behind, as it is for an ASCII-only
+            // document; what matters is that `bogus: 1,` is what went away.
+            "(host: \"münchen\",  port: 80)",
+            "the quick-fix must remove the field it named and nothing else"
+        );
+    }
+
+    /// Insertions anchor on the last thing inside the parens, whose column is
+    /// likewise reported in UTF-16 code units.
+    #[test]
+    fn test_field_insertion_columns_are_utf16() {
+        assert_eq!(
+            insert("(host: \"münchen\")", &[("port", "u16")]),
+            "(host: \"münchen\", port: 0)"
+        );
+        assert_eq!(
+            insert(
+                "Config(\n    host: \"münchen\", // the office\n)",
+                &[("port", "u16")]
+            ),
+            "Config(\n    host: \"münchen\", // the office\n    port: 0,\n)"
+        );
     }
 
     #[test]

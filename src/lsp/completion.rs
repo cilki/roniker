@@ -42,7 +42,7 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
             // Inside this struct's parentheses. A cursor still on the struct's
             // own name is not in the body yet, so it falls through to the
             // enclosing field instead.
-            "struct" if inside_struct_body(&ancestor, position) => {
+            "struct" if inside_struct_body(&ancestor, content, position) => {
                 return struct_body_context(&ancestor, tree, content, position);
             }
             "field" => return field_completion_context(&ancestor, content, position),
@@ -56,7 +56,7 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
 
 /// Whether `position` is inside `struct_node`'s parentheses rather than on the
 /// struct name that precedes them.
-fn inside_struct_body(struct_node: &tree_sitter::Node, position: Position) -> bool {
+fn inside_struct_body(struct_node: &tree_sitter::Node, content: &str, position: Position) -> bool {
     use super::ts_utils;
 
     let Some(open_paren) = ts_utils::child_by_kind(struct_node, "(") else {
@@ -64,9 +64,9 @@ fn inside_struct_body(struct_node: &tree_sitter::Node, position: Position) -> bo
         // node as its body, which is what the cursor is editing.
         return true;
     };
-    let open_end = open_paren.end_position();
-    position.line > open_end.row as u32
-        || (position.line == open_end.row as u32 && position.character >= open_end.column as u32)
+    let open_end = ts_utils::point_to_position(content, open_paren.end_position());
+    position.line > open_end.line
+        || (position.line == open_end.line && position.character >= open_end.character)
 }
 
 /// The context for a cursor inside a struct's parentheses: the value position of
@@ -116,9 +116,9 @@ fn field_completion_context(
         (field_name_node, ts_utils::field_value(field_node))
     {
         // If cursor is after the field name, we're completing a value
-        let name_end = field_name.end_position();
-        if position.line > name_end.row as u32
-            || (position.line == name_end.row as u32 && position.character > name_end.column as u32)
+        let name_end = ts_utils::point_to_position(content, field_name.end_position());
+        if position.line > name_end.line
+            || (position.line == name_end.line && position.character > name_end.character)
         {
             let field = ts_utils::field_name(field_node, content).map(str::to_string);
 
