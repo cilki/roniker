@@ -288,65 +288,35 @@ pub fn is_empty_structure(node: &Node) -> bool {
     }
 }
 
-/// Information about a parsed enum variant
+/// The enum variant a value names, and where that name is written.
 #[derive(Debug, Clone)]
 pub struct ParsedEnumVariant {
     pub name: String,
-    pub data: Option<String>,
-    pub line: u32,
-    pub col: u32,
+    pub range: Range,
 }
 
-/// Extract enum variant information from a struct node
-/// Handles: UnitVariant, TupleVariant(data), StructVariant { fields }
+/// The enum variant a value names, if it names one.
+///
+/// RON spells a unit variant as a bare name (`Prod`), and tuple and struct
+/// variants as `Prod(30)` / `Prod(retries: 3)` — the latter two both parsing as
+/// a `struct` node whose leading identifier is the variant name. `None` for
+/// anything that names no variant, including a struct written with RON's
+/// unnamed syntax (`(retries: 3)`).
 pub fn extract_enum_variant(node: &Node, content: &str) -> Option<ParsedEnumVariant> {
-    if node.kind() != "struct" && node.kind() != "identifier" {
+    let name_node = match node.kind() {
+        "struct" => node.child(0).filter(|c| c.kind() == "identifier")?,
+        "identifier" => *node,
+        _ => return None,
+    };
+
+    let name = node_text(&name_node, content)?.trim();
+    if name.is_empty() {
         return None;
     }
 
-    // Get variant name
-    let name = if node.kind() == "identifier" {
-        node_text(node, content)?.to_string()
-    } else {
-        struct_name(node, content)?.to_string()
-    };
-
-    let pos = node.start_position();
-    let line = pos.row as u32;
-    let col = pos.column as u32;
-
-    // Get data if it's a struct variant
-    let data = if node.kind() == "struct" {
-        let fields = struct_fields(node);
-        let values = struct_values(node, content);
-
-        if !fields.is_empty() || !values.is_empty() {
-            // Extract the content between parens
-            let start = node.start_byte();
-            let end = node.end_byte();
-            let full_text = &content.as_bytes()[start..end];
-            let text = std::str::from_utf8(full_text).ok()?;
-
-            // Find content between first ( and last )
-            if let Some(paren_start) = text.find('(')
-                && let Some(paren_end) = text.rfind(')')
-            {
-                Some(text[paren_start + 1..paren_end].to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     Some(ParsedEnumVariant {
-        name,
-        data,
-        line,
-        col,
+        name: name.to_string(),
+        range: node_to_lsp_range(&name_node),
     })
 }
 

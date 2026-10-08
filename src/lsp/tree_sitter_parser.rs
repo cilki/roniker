@@ -169,7 +169,6 @@ pub fn get_containing_field_context(
 /// Information about a variant field location in RON content
 #[derive(Debug, Clone)]
 pub struct VariantFieldLocation {
-    pub line_idx: usize,
     pub variant_name: String,
     pub containing_field_name: String,
     pub field_at_position: Option<String>,
@@ -237,14 +236,11 @@ fn collect_fields_in_node(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "field" {
-            let line_idx = child.start_position().row;
-
             // Extract field name
             let field_at_position = field_name(&child, content).map(|s| s.to_string());
 
             if let Some(containing_field) = containing_field_name {
                 locations.push(VariantFieldLocation {
-                    line_idx,
                     variant_name: variant_name.to_string(),
                     containing_field_name: containing_field.clone(),
                     field_at_position,

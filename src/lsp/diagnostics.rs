@@ -1,10 +1,8 @@
-use super::tree_sitter_parser;
-use super::ts_utils::ParsedEnumVariant;
 use super::type_utils::{
     closest_name, extract_inner_type, is_custom_type, is_primitive_type, missing_required_fields,
     normalize_type, short_name,
 };
-use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
@@ -36,30 +34,53 @@ fn did_you_mean<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>)
     }
 }
 
-/// Push an "unknown field" diagnostic reported at the field's name node,
-/// appending a "did you mean" suggestion drawn from `effective_fields`.
-fn push_unknown_field(
-    diagnostics: &mut Vec<Diagnostic>,
-    field_node: tree_sitter::Node,
-    field_name: &str,
-    effective_fields: &[(String, FieldInfo)],
-) {
-    // Report at the field name node
-    let range = super::ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
-    let suggestion = did_you_mean(
-        field_name,
-        effective_fields.iter().map(|(name, _)| name.as_str()),
-    );
-    diagnostics.push(Diagnostic {
-        range,
-        severity: Some(DiagnosticSeverity::ERROR),
-        message: format!("Unknown field '{}'{}", field_name, suggestion),
-        code: code(codes::UNKNOWN_FIELD),
-        ..Default::default()
-    });
+/// What a `struct` node in the document is expected to contain.
+///
+/// RON spells a struct value and an enum's struct variant the same way, so both
+/// are described by this and validated by [`validate_struct_node`]. Everything
+/// that differs between the two lives here.
+struct ExpectedStruct<'a> {
+    /// The names serde accepts, as `(serialized_name, field)` pairs: `skip`
+    /// excluded, `flatten` expanded.
+    fields: Vec<(String, FieldInfo)>,
+    /// A `flatten` target the analyzer can't resolve (e.g. a `HashMap`) makes
+    /// serde accept arbitrary extra keys, so unknown fields aren't reported.
+    allow_unknown_fields: bool,
+    /// The container derives `Default`, so an absent field is not an error.
+    has_default: bool,
+    /// The enum variant this value spells out, when it is one. Only affects the
+    /// wording of the diagnostics.
+    variant: Option<&'a str>,
+    /// True only for the document's root value, which is the only place the
+    /// informational "field: Type" hints are emitted.
+    at_root: bool,
 }
 
-/// Validate RON with access to RustAnalyzer for recursive type lookups
+impl ExpectedStruct<'_> {
+    /// `" in variant 'V'"` when this value is an enum variant, else empty.
+    fn in_variant(&self) -> String {
+        match self.variant {
+            Some(name) => format!(" in variant '{}'", name),
+            None => String::new(),
+        }
+    }
+
+    /// The field serde would fill from a RON field named `field_name`.
+    ///
+    /// `name` is the serialized name as the *containing* type spells it, which
+    /// for a flattened field is not what the field's own container would
+    /// produce, so it is compared separately from `accepts_name`.
+    fn matching_field(&self, field_name: &str) -> Option<&FieldInfo> {
+        self.fields
+            .iter()
+            .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
+            .map(|(_, f)| f)
+    }
+}
+
+/// Every diagnostic for a RON document whose root value is declared to be
+/// `type_info`: a syntax error if it doesn't parse, and otherwise whatever a
+/// walk of the parse tree turns up.
 pub async fn validate_ron_with_analyzer(
     content: &str,
     tree: Option<&Tree>,
@@ -68,8 +89,7 @@ pub async fn validate_ron_with_analyzer(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // Reuse the document's tree if provided; otherwise (e.g. when recursing
-    // into extracted fragments) parse the content once here.
+    // Reuse the document's tree if provided; otherwise parse the content here.
     let local_tree;
     let tree = match tree {
         Some(t) => t,
@@ -102,255 +122,30 @@ pub async fn validate_ron_with_analyzer(
         return diagnostics;
     }
 
-    match &type_info.kind {
-        TypeKind::Struct(_) => {
-            diagnostics.extend(validate_struct_fields(tree, content, type_info, &analyzer).await);
-        }
-        TypeKind::Enum(_) => {
-            diagnostics
-                .extend(validate_enum_variant_with_fields(content, type_info, &analyzer).await);
-        }
-    }
-
-    // Check for enum variant fields (scans the whole file, so only call once)
-    diagnostics.extend(
-        validate_enum_variant_fields_in_structs(tree, content, type_info, &analyzer).await,
-    );
-
-    // Deduplicate diagnostics by message and position
-    let mut seen = std::collections::HashSet::new();
-    diagnostics.retain(|d| {
-        let key = (
-            d.range.start.line,
-            d.range.start.character,
-            d.message.clone(),
+    // Everything else is a single walk of the parse tree from the root value
+    // down, validating each value against the type it is declared as. Each
+    // value is visited once, so nothing is reported twice.
+    if let Some(main_value) = super::ts_utils::find_main_value(tree) {
+        diagnostics.extend(
+            validate_node_with_type_info(&main_value, content, type_info, &analyzer, true).await,
         );
-        seen.insert(key)
-    });
-
-    diagnostics
-}
-
-/// Validate enum variant fields within struct fields using the same logic as goto_definition
-async fn validate_enum_variant_fields_in_structs(
-    tree: &Tree,
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut reported_errors = std::collections::HashSet::new();
-
-    // Collect all variant locations and group by variant to check for missing fields
-    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(tree, content);
-    let mut variant_info: std::collections::HashMap<
-        (String, String),
-        (usize, std::collections::HashSet<String>),
-    > = std::collections::HashMap::new();
-
-    // Cache for variant type lookups: (containing_field_name, variant_name) -> Option<EnumVariant>
-    let mut variant_cache: std::collections::HashMap<(String, String), Option<EnumVariant>> =
-        std::collections::HashMap::new();
-
-    // First pass: collect all fields present for each variant
-    let lines: Vec<&str> = content.lines().collect();
-    for location in &variant_locations {
-        let key = (
-            location.containing_field_name.clone(),
-            location.variant_name.clone(),
-        );
-        let entry = variant_info
-            .entry(key)
-            .or_insert((location.line_idx, std::collections::HashSet::new()));
-        if let Some(ref field_at_pos) = location.field_at_position {
-            entry.1.insert(field_at_pos.clone());
-        }
-    }
-
-    // Second pass: resolve each unique variant's definition ONCE and cache it
-    for ((containing_field_name, variant_name), (first_line, _present_fields)) in &variant_info {
-        let key = (containing_field_name.clone(), variant_name.clone());
-        if variant_cache.contains_key(&key) {
-            continue;
-        }
-
-        let variant = resolve_variant_at(
-            tree,
-            content,
-            type_info,
-            analyzer,
-            containing_field_name,
-            variant_name,
-            *first_line,
-        );
-        variant_cache.insert(key, variant);
-    }
-
-    // Third pass: check all field locations using cached variant info
-    for location in &variant_locations {
-        if let Some(ref field_at_pos) = location.field_at_position {
-            let error_key = (location.line_idx, field_at_pos.clone());
-            if !reported_errors.contains(&error_key) {
-                let cache_key = (
-                    location.containing_field_name.clone(),
-                    location.variant_name.clone(),
-                );
-                if let Some(Some(variant)) = variant_cache.get(&cache_key)
-                    && !variant
-                        .effective_fields()
-                        .iter()
-                        .any(|(_, f)| f.accepts_name(field_at_pos, None))
-                {
-                    let line = lines.get(location.line_idx).unwrap_or(&"");
-                    if let Some(col) = line
-                        .find(&format!("{}:", field_at_pos))
-                        .or_else(|| line.find(&format!("{} :", field_at_pos)))
-                    {
-                        let variant_fields = variant.effective_fields();
-                        let suggestion = did_you_mean(
-                            field_at_pos,
-                            variant_fields.iter().map(|(name, _)| name.as_str()),
-                        );
-                        diagnostics.push(Diagnostic {
-                            range: Range::new(
-                                Position::new(location.line_idx as u32, col as u32),
-                                Position::new(
-                                    location.line_idx as u32,
-                                    (col + field_at_pos.len()) as u32,
-                                ),
-                            ),
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!(
-                                "Unknown field '{}' in variant '{}'{}",
-                                field_at_pos, location.variant_name, suggestion
-                            ),
-                            code: code(codes::UNKNOWN_FIELD),
-                            ..Default::default()
-                        });
-                        reported_errors.insert(error_key);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fourth pass: check for missing required fields using cached variant info
-    for ((containing_field_name, variant_name), (first_line, present_fields)) in variant_info {
-        let cache_key = (containing_field_name.clone(), variant_name.clone());
-        if let Some(Some(variant)) = variant_cache.get(&cache_key) {
-            for (vfield_name, _) in missing_required_fields(&variant.effective_fields(), |name| {
-                present_fields.contains(name)
-            }) {
-                // Find the variant opening line to report the error
-                // Search backwards from first_line to find the line with the variant name
-                let mut variant_line_idx = first_line;
-                let mut variant_col = 0;
-                for i in (0..=first_line).rev() {
-                    if let Some(line) = lines.get(i)
-                        && let Some(col) = line.find(&variant_name)
-                    {
-                        variant_line_idx = i;
-                        variant_col = col;
-                        break;
-                    }
-                }
-
-                diagnostics.push(Diagnostic {
-                    range: Range::new(
-                        Position::new(variant_line_idx as u32, variant_col as u32),
-                        Position::new(
-                            variant_line_idx as u32,
-                            (variant_col + variant_name.len()) as u32,
-                        ),
-                    ),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!(
-                        "Missing required field '{}' in variant '{}'",
-                        vfield_name, variant_name
-                    ),
-                    code: code(codes::MISSING_REQUIRED_FIELD),
-                    ..Default::default()
-                });
-            }
-        }
     }
 
     diagnostics
 }
 
-/// Resolve the enum variant definition for a variant used at a given position:
-/// navigate to the innermost containing type, then look up the containing
-/// field's enum type and its variant.
-fn resolve_variant_at(
-    tree: &Tree,
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: &RustAnalyzer,
-    containing_field_name: &str,
-    variant_name: &str,
-    first_line: usize,
-) -> Option<EnumVariant> {
-    let position = Position::new(first_line as u32, 0);
-    let mut contexts = tree_sitter_parser::find_type_context_at_position(tree, content, position);
-    // The field being resolved belongs to the value that *contains* the
-    // variant, so the variant's own struct is one level too deep. It is the
-    // innermost context only when the variant spans several lines; for a
-    // single-line variant (`mode: Prod(x: 1)`) column 0 of the line already
-    // lands in the containing value and there is nothing to drop.
-    if contexts
-        .last()
-        .is_some_and(|c| c.type_name.as_deref() == Some(variant_name))
-    {
-        contexts.pop();
-    }
-
-    let current_type =
-        super::navigation::navigate_type_contexts(analyzer, Some(type_info.clone()), &contexts)?;
-    let field = current_type.find_field_serialized(containing_field_name)?;
-    let field_type_info = analyzer.get_type_info(&field.type_name)?;
-    field_type_info.find_variant(variant_name).cloned()
-}
-
-/// Adjust diagnostic line numbers by an offset
-fn adjust_diagnostic_positions(diagnostics: Vec<Diagnostic>, line_offset: u32) -> Vec<Diagnostic> {
-    diagnostics
-        .into_iter()
-        .map(|mut d| {
-            d.range.start.line += line_offset;
-            d.range.end.line += line_offset;
-            d
-        })
-        .collect()
-}
-
-/// Validate the document root against a struct `TypeInfo`.
-async fn validate_struct_fields(
-    tree: &Tree,
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
-    let Some(main_value) = super::ts_utils::find_main_value(tree) else {
-        return Vec::new();
-    };
-    validate_struct_node(&main_value, content, type_info, analyzer, true).await
-}
-
-/// Validate a `struct` node's named fields against a struct `TypeInfo`:
-/// duplicate fields, unknown fields, each field's value, and missing required
-/// fields.
+/// Validate a `struct` node's named fields against what it is expected to
+/// contain: duplicate fields, unknown fields, each field's value, and missing
+/// required fields.
 ///
-/// Every struct in the document goes through here — the root via
-/// `validate_struct_fields` and nested values via `validate_node_with_type_info`
-/// — so the field-matching, type-checking and missing-field rules exist in
-/// exactly one place. `at_root` is true only for the document root, and gates
-/// the informational type hints, which are deliberately top-level only.
+/// Every named-field value in the document goes through here — a struct type's
+/// value and an enum's struct variant alike — so the field-matching,
+/// type-checking and missing-field rules exist in exactly one place.
 async fn validate_struct_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
-    type_info: &TypeInfo,
+    expected: &ExpectedStruct<'_>,
     analyzer: &Arc<RustAnalyzer>,
-    at_root: bool,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
@@ -358,20 +153,11 @@ async fn validate_struct_node(
     if node.kind() != "struct" {
         return diagnostics;
     }
-    // Tuple/newtype structs have positional fields ("0", "1", ...) — named-field
-    // validation doesn't apply to them.
-    let Some(fields) = type_info.fields() else {
-        return diagnostics;
-    };
-    if fields.iter().all(FieldInfo::is_positional) {
+    // Tuple/newtype structs and variants have positional fields ("0", "1", ...)
+    // — named-field validation doesn't apply to them.
+    if expected.fields.iter().all(|(_, f)| f.is_positional()) {
         return diagnostics;
     }
-
-    // The names serde accepts: serialized names, `skip` excluded, `flatten`
-    // expanded when the analyzer can resolve the flattened type.
-    let effective_fields = type_info.effective_fields(analyzer);
-    // A flatten target we can't resolve (e.g. HashMap) accepts arbitrary keys.
-    let allow_unknown_fields = type_info.has_unresolved_flatten(analyzer);
 
     let mut present_fields: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
@@ -393,17 +179,23 @@ async fn validate_struct_node(
             continue;
         }
 
-        // Match the RON field against the type by serialized name, Rust name or
-        // alias. `name` is the serialized name as the *containing* type spells
-        // it, which for a flattened field is not what the field's own container
-        // would produce, so it is compared separately from `accepts_name`.
-        let Some(field_info) = effective_fields
-            .iter()
-            .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
-            .map(|(_, f)| f)
-        else {
-            if !allow_unknown_fields {
-                push_unknown_field(&mut diagnostics, field_node, field_name, &effective_fields);
+        let Some(field_info) = expected.matching_field(field_name) else {
+            if !expected.allow_unknown_fields {
+                diagnostics.push(Diagnostic {
+                    range: name_range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!(
+                        "Unknown field '{}'{}{}",
+                        field_name,
+                        expected.in_variant(),
+                        did_you_mean(
+                            field_name,
+                            expected.fields.iter().map(|(name, _)| name.as_str())
+                        )
+                    ),
+                    code: code(codes::UNKNOWN_FIELD),
+                    ..Default::default()
+                });
             }
             continue;
         };
@@ -413,7 +205,7 @@ async fn validate_struct_node(
         };
 
         // Hint the field's declared type, but only when the RON doesn't name it already
-        if at_root
+        if expected.at_root
             && ts_utils::struct_name(&value_node, content).is_none()
             && value_node.kind() != "identifier"
         {
@@ -425,75 +217,31 @@ async fn validate_struct_node(
             });
         }
 
-        // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
-        // validate_field_value_node handles all generic-wrapper cases
-        // uniformly, so there are no per-container special cases here.
-        let deep_diags = Box::pin(validate_field_value_node(
-            &value_node,
-            content,
-            &field_info.type_name,
-            analyzer,
-        ))
-        .await;
-        if !deep_diags.is_empty() {
-            diagnostics.extend(deep_diags);
-            continue; // skip the primitive check for this field
-        }
-
-        // Primitive / surface-level type check. The value's own source text
-        // carries everything the check needs, so it runs at every nesting depth
-        // rather than only on fields of the document root.
-        //
-        // Only non-custom types (primitives and std generic wrappers) are
-        // checked against the typed RON value; custom structs and enums are
-        // judged from the source text alone. Parsing lazily keeps a nested
-        // struct's whole subtree from being re-parsed once per level.
-        let value_text = ts_utils::node_text(&value_node, content);
-        let parsed_field_value = match is_custom_type(&field_info.type_name) {
-            true => None,
-            false => value_text.and_then(|text| ron::from_str::<Value>(text).ok()),
-        };
-
-        // Positions come directly from the tree-sitter node — no line adjustment.
-        if let Some(error_msg) = check_type_mismatch_with_enum_validation(
-            parsed_field_value.as_ref(),
-            &field_info.type_name,
-            value_text,
-            analyzer,
-        )
-        .await
-        {
-            let pos = value_node.start_position();
-            let end_pos = value_node.end_position();
-            // For multi-line nodes, use end of first line to avoid inverted column ranges
-            let end_col = if end_pos.row > pos.row {
-                content.lines().nth(pos.row).unwrap_or("").len() as u32
-            } else {
-                end_pos.column as u32
-            };
-            diagnostics.push(Diagnostic {
-                range: Range::new(
-                    Position::new(pos.row as u32, pos.column as u32),
-                    Position::new(pos.row as u32, end_col),
-                ),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Type mismatch: {}", error_msg),
-                code: code(codes::TYPE_MISMATCH),
-                ..Default::default()
-            });
-        }
+        diagnostics.extend(
+            Box::pin(validate_typed_value(
+                &value_node,
+                content,
+                &field_info.type_name,
+                analyzer,
+            ))
+            .await,
+        );
     }
 
     // Missing required fields: compare expected fields against those we saw above.
-    if !type_info.has_default {
+    if !expected.has_default {
         let missing =
-            missing_required_fields(&effective_fields, |name| present_fields.contains(name));
+            missing_required_fields(&expected.fields, |name| present_fields.contains(name));
         if !missing.is_empty() {
             let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
             diagnostics.push(Diagnostic {
                 range: struct_name_range(node),
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Required fields: {}", missing_names.join(", ")),
+                message: format!(
+                    "Required fields{}: {}",
+                    expected.in_variant(),
+                    missing_names.join(", ")
+                ),
                 code: code(codes::MISSING_REQUIRED_FIELD),
                 ..Default::default()
             });
@@ -501,6 +249,84 @@ async fn validate_struct_node(
     }
 
     diagnostics
+}
+
+/// Validate one value against the type it is declared as.
+///
+/// Recursion into the value comes first: a custom struct/enum, or a generic
+/// wrapper around one, is checked field by field. Only when that finds nothing
+/// — including when the type isn't one we recurse into at all — is the value's
+/// own shape checked against the declared primitive or std type.
+///
+/// Every typed value in the document is checked here, whether it is a struct
+/// field's value or a tuple variant's payload.
+async fn validate_typed_value(
+    value_node: &tree_sitter::Node<'_>,
+    content: &str,
+    declared_type: &str,
+    analyzer: &Arc<RustAnalyzer>,
+) -> Vec<Diagnostic> {
+    // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
+    // validate_nested_value handles all generic-wrapper cases uniformly, so
+    // there are no per-container special cases here.
+    let deep = Box::pin(validate_nested_value(
+        value_node,
+        content,
+        declared_type,
+        analyzer,
+    ))
+    .await;
+    if !deep.is_empty() {
+        return deep;
+    }
+
+    // Primitive / surface-level type check. The value's own source text carries
+    // everything the check needs, so it runs at every nesting depth.
+    //
+    // Only non-custom types (primitives and std generic wrappers) are checked
+    // against the typed RON value; custom structs and enums are judged from the
+    // source text alone. Parsing lazily keeps a nested struct's whole subtree
+    // from being re-parsed once per level.
+    let value_text = super::ts_utils::node_text(value_node, content);
+    let parsed_value = match is_custom_type(declared_type) {
+        true => None,
+        false => value_text.and_then(|text| ron::from_str::<Value>(text).ok()),
+    };
+
+    let Some(error_msg) = check_type_mismatch_with_enum_validation(
+        parsed_value.as_ref(),
+        declared_type,
+        value_text,
+        analyzer,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    vec![Diagnostic {
+        range: first_line_range(value_node, content),
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!("Type mismatch: {}", error_msg),
+        code: code(codes::TYPE_MISMATCH),
+        ..Default::default()
+    }]
+}
+
+/// The node's range, clipped to its first line. A multi-line node would
+/// otherwise produce an inverted column range.
+fn first_line_range(node: &tree_sitter::Node, content: &str) -> Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    let end_col = if end.row > start.row {
+        content.lines().nth(start.row).unwrap_or("").len() as u32
+    } else {
+        end.column as u32
+    };
+    Range::new(
+        Position::new(start.row as u32, start.column as u32),
+        Position::new(start.row as u32, end_col),
+    )
 }
 
 /// The range to report a whole-struct diagnostic at: the struct's name, or a
@@ -531,12 +357,14 @@ fn unwrap_some<'a>(node: &tree_sitter::Node<'a>, content: &str) -> Option<tree_s
     }
 }
 
-/// Validate a single field's value node against its declared Rust type.
+/// Recurse into a value whose declared type is a custom struct/enum, or a
+/// generic wrapper around one.
 ///
-/// This is the single place that decides how to recurse into generic wrappers
-/// (Vec<T>, Option<T>, …) and plain custom types. Both `validate_struct_fields`
-/// and `validate_node_with_type_info` delegate here so the logic isn't duplicated.
-async fn validate_field_value_node<'a>(
+/// This is the single place that decides how to unwrap generic wrappers
+/// (Vec<T>, Option<T>, …). Nothing is reported for a type we don't recurse
+/// into — the caller ([`validate_typed_value`]) checks those against the
+/// value's own shape instead.
+async fn validate_nested_value<'a>(
     value_node: &tree_sitter::Node<'a>,
     content: &str,
     field_type: &str,
@@ -570,6 +398,7 @@ async fn validate_field_value_node<'a>(
                                 content,
                                 &inner_type_info,
                                 analyzer,
+                                false,
                             ))
                             .await;
                             diagnostics.extend(elem_diags);
@@ -596,6 +425,7 @@ async fn validate_field_value_node<'a>(
                     content,
                     &inner_type_info,
                     analyzer,
+                    false,
                 ))
                 .await;
                 diagnostics.extend(nested_diags);
@@ -611,6 +441,7 @@ async fn validate_field_value_node<'a>(
                 content,
                 &nested_type_info,
                 analyzer,
+                false,
             ))
             .await;
             diagnostics.extend(nested_diags);
@@ -623,62 +454,6 @@ async fn validate_field_value_node<'a>(
                 code: code(codes::UNKNOWN_TYPE),
                 ..Default::default()
             });
-        }
-    }
-
-    diagnostics
-}
-
-/// Validate the document root against an enum `TypeInfo`: the variant it names
-/// must exist, and any data it carries must match that variant's fields.
-async fn validate_enum_variant_with_fields(
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    // For enums, we need to parse the variant from the raw text
-    let parsed_variant = extract_enum_variant_from_text(content);
-
-    if let Some(variant) = parsed_variant {
-        if let Some(variant_def) = type_info.find_variant(&variant.name) {
-            // Variant exists - now validate its fields if it has data
-            if let Some(ref data) = variant.data {
-                // Validate that the variant can have data
-                if variant_def.fields.is_empty() {
-                    diagnostics.push(Diagnostic {
-                        range: Range::new(
-                            Position::new(variant.line, variant.col),
-                            Position::new(variant.line, variant.col + variant.name.len() as u32),
-                        ),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!(
-                            "Variant '{}' is a unit variant and cannot have data",
-                            variant.name
-                        ),
-                        code: code(codes::TYPE_MISMATCH),
-                        ..Default::default()
-                    });
-                } else {
-                    // Validate the fields
-                    let mut field_diagnostics =
-                        validate_variant_field_data(data, &variant_def.fields, analyzer).await;
-                    // Adjust positions to account for the variant line offset
-                    field_diagnostics =
-                        adjust_diagnostic_positions(field_diagnostics, variant.line);
-                    diagnostics.extend(field_diagnostics);
-                }
-            }
-        } else {
-            diagnostics.push(unknown_variant(
-                type_info,
-                &variant.name,
-                Range::new(
-                    Position::new(variant.line, variant.col),
-                    Position::new(variant.line, variant.col + variant.name.len() as u32),
-                ),
-            ));
         }
     }
 
@@ -711,245 +486,112 @@ fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Di
     }
 }
 
-/// Validate a tree-sitter node representing a value against a TypeInfo
-/// This properly handles nested structures by walking the tree directly
+/// Validate the value `node` against the type it is declared as, recursing into
+/// the tree. The document's root value and every nested value go through here,
+/// so a type is validated the same way wherever it appears.
+///
+/// `at_root` is true only for the document's root value, and gates the
+/// informational type hints, which are deliberately top-level only.
 async fn validate_node_with_type_info<'a>(
     node: &tree_sitter::Node<'a>,
     content: &str,
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
+    at_root: bool,
 ) -> Vec<Diagnostic> {
-    use super::ts_utils;
-    let mut diagnostics = Vec::new();
-
     match &type_info.kind {
         TypeKind::Struct(_) => {
+            let expected = ExpectedStruct {
+                // The names serde accepts: serialized names, `skip` excluded,
+                // `flatten` expanded when the analyzer can resolve the target.
+                fields: type_info.effective_fields(analyzer),
+                allow_unknown_fields: type_info.has_unresolved_flatten(analyzer),
+                has_default: type_info.has_default,
+                variant: None,
+                at_root,
+            };
+            Box::pin(validate_struct_node(node, content, &expected, analyzer)).await
+        }
+        TypeKind::Enum(_) => Box::pin(validate_enum_node(node, content, type_info, analyzer)).await,
+    }
+}
+
+/// Validate a value written where an enum is expected: the variant it names
+/// must exist, and whatever data it carries must match that variant's fields.
+///
+/// RON spells a unit variant as a bare name (`Prod`), a tuple variant as
+/// `Prod(30)` and a struct variant as `Prod(retries: 3)` — the last two both
+/// parsing as a `struct` node whose leading identifier is the variant name.
+async fn validate_enum_node(
+    node: &tree_sitter::Node<'_>,
+    content: &str,
+    type_info: &TypeInfo,
+    analyzer: &Arc<RustAnalyzer>,
+) -> Vec<Diagnostic> {
+    use super::ts_utils;
+
+    // A value that names no variant — an unnamed struct, or a primitive written
+    // where the enum belongs — is left to the caller's surface type check.
+    let Some(named) = ts_utils::extract_enum_variant(node, content) else {
+        return Vec::new();
+    };
+
+    let Some(variant) = type_info.find_variant(&named.name) else {
+        return vec![unknown_variant(type_info, &named.name, named.range)];
+    };
+
+    // A bare name carries no data, so the variant is already fully checked.
+    if node.kind() != "struct" {
+        return Vec::new();
+    }
+
+    let payload = ts_utils::struct_values(node, content);
+    let named_fields = ts_utils::struct_fields(node);
+
+    if variant.fields.is_empty() {
+        if payload.is_empty() && named_fields.is_empty() {
+            return Vec::new();
+        }
+        return vec![Diagnostic {
+            range: named.range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!(
+                "Variant '{}' is a unit variant and cannot have data",
+                named.name
+            ),
+            code: code(codes::TYPE_MISMATCH),
+            ..Default::default()
+        }];
+    }
+
+    let expected = variant.effective_fields();
+
+    // A tuple variant's fields are named by position ("0", "1", ...), so they
+    // are matched to the payload values in order rather than by name.
+    if expected.iter().all(|(_, f)| f.is_positional()) {
+        let mut diagnostics = Vec::new();
+        for (value_node, (_, field)) in payload.iter().zip(&expected) {
             diagnostics.extend(
-                Box::pin(validate_struct_node(
-                    node, content, type_info, analyzer, false,
+                Box::pin(validate_typed_value(
+                    value_node,
+                    content,
+                    &field.type_name,
+                    analyzer,
                 ))
                 .await,
             );
         }
-        TypeKind::Enum(_) => {
-            // A nested enum-typed field value (e.g. `mode: Prod`). The bare
-            // variant name is either an identifier node or the leading name of
-            // a tuple/struct variant node (`Some(30)`, `Foo(a: 1)`). Validate it
-            // here; the document-root enum case is handled by
-            // validate_enum_variant_with_fields.
-            let variant_name = if node.kind() == "struct" {
-                ts_utils::struct_name(node, content)
-            } else {
-                ts_utils::node_text(node, content)
-            };
-
-            if let Some(variant_name) = variant_name.map(str::trim).filter(|n| !n.is_empty())
-                && type_info.find_variant(variant_name).is_none()
-            {
-                diagnostics.push(unknown_variant(
-                    type_info,
-                    variant_name,
-                    ts_utils::node_to_lsp_range(node),
-                ));
-            }
-        }
+        return diagnostics;
     }
 
-    diagnostics
-}
-
-/// Validate the data inside an enum variant (tuple or struct fields)
-/// This recursively validates nested types
-async fn validate_variant_field_data(
-    data: &str,
-    expected_fields: &[FieldInfo],
-    analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    // For single-field tuple variants with Vec<CustomType>, use tree-sitter validation
-    if expected_fields.len() == 1 {
-        let field_type = &expected_fields[0].type_name;
-        let normalized_type = normalize_type(field_type);
-
-        // Check if it's Vec<CustomType>
-        if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
-            if is_custom_type(inner_type)
-                && let Some(nested_type_info) = analyzer.get_type_info(inner_type).cloned()
-            {
-                // Parse with tree-sitter
-                use super::ts_utils;
-
-                if let Some(tree) = ts_utils::parse(data)
-                    && let Some(array_node) = ts_utils::find_main_value(&tree)
-                    && array_node.kind() == "array"
-                {
-                    let mut cursor = array_node.walk();
-                    for elem_node in array_node.children(&mut cursor) {
-                        if elem_node.kind() != "["
-                            && elem_node.kind() != "]"
-                            && elem_node.kind() != ","
-                        {
-                            let elem_diags = Box::pin(validate_node_with_type_info(
-                                &elem_node,
-                                data,
-                                &nested_type_info,
-                                analyzer,
-                            ))
-                            .await;
-                            diagnostics.extend(elem_diags);
-                        }
-                    }
-                }
-                return diagnostics;
-            }
-        } else if !is_primitive_type(field_type) {
-            // Non-generic custom type - recursively validate
-            if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
-                let nested_diags = Box::pin(validate_ron_with_analyzer(
-                    data,
-                    None,
-                    &nested_type_info,
-                    analyzer.clone(),
-                ))
-                .await;
-                diagnostics.extend(nested_diags);
-                return diagnostics;
-            }
-        }
-    }
-
-    // Try to parse the data as RON
-    // For struct variants, the data contains named fields like "field1: val, field2: val"
-    // For tuple variants, the data contains unnamed values like "val1, val2"
-    let has_named_fields = expected_fields.iter().any(|f| !f.is_positional());
-
-    let parsed_data = if has_named_fields {
-        // Struct-like variant: wrap the named fields in parentheses for RON parsing
-        // RON syntax for struct variants is: VariantName( field: value )
-        ron::from_str::<Value>(&format!("Temp({})", data))
-    } else if data.contains(',') || expected_fields.len() > 1 {
-        // Tuple variant with multiple fields
-        ron::from_str::<Value>(&format!("({})", data))
-    } else {
-        // Single unnamed field
-        ron::from_str::<Value>(data)
+    let expected = ExpectedStruct {
+        fields: expected,
+        allow_unknown_fields: false,
+        has_default: type_info.has_default,
+        variant: Some(&named.name),
+        at_root: false,
     };
-
-    match parsed_data {
-        Ok(value) => {
-            // Validate fields based on whether it's named or unnamed
-            if expected_fields.iter().all(|f| !f.is_positional()) {
-                // Named fields (struct-like variant)
-                if let Value::Map(map) = &value {
-                    // Validate field types
-                    for field in expected_fields {
-                        if let Some(field_value) = map.get(&Value::String(field.name.clone()))
-                            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                                Some(field_value),
-                                &field.type_name,
-                                extract_field_value_text(data, &field.name).as_deref(),
-                                analyzer,
-                            )
-                            .await
-                        {
-                            diagnostics.push(Diagnostic {
-                                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Type mismatch in variant field: {}", error_msg),
-                                code: code(codes::TYPE_MISMATCH),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-            } else {
-                // Unnamed fields (tuple variant)
-                // For tuple variants, fields are named "0", "1", "2", etc.
-                if let Value::Seq(values) = value {
-                    for (i, field) in expected_fields.iter().enumerate() {
-                        if let Some(field_value) = values.get(i)
-                            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                                Some(field_value),
-                                &field.type_name,
-                                extract_field_value_text(data, &field.name).as_deref(),
-                                analyzer,
-                            )
-                            .await
-                        {
-                            diagnostics.push(Diagnostic {
-                                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!(
-                                    "Type mismatch in variant field {}: {}",
-                                    i, error_msg
-                                ),
-                                code: code(codes::TYPE_MISMATCH),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                } else if expected_fields.len() == 1 {
-                    // Single field tuple variant
-                    if let Some(error_msg) = check_type_mismatch_with_enum_validation(
-                        Some(&value),
-                        &expected_fields[0].type_name,
-                        extract_field_value_text(data, &expected_fields[0].name).as_deref(),
-                        analyzer,
-                    )
-                    .await
-                    {
-                        diagnostics.push(Diagnostic {
-                            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!("Type mismatch in variant field: {}", error_msg),
-                            code: code(codes::TYPE_MISMATCH),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            // Failed to parse - could be syntax error
-            diagnostics.push(Diagnostic {
-                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: "Invalid syntax in enum variant data".to_string(),
-                code: code(codes::SYNTAX_ERROR),
-                ..Default::default()
-            });
-        }
-    }
-
-    diagnostics
-}
-
-/// Extract the variant name and data from raw RON text using tree-sitter
-/// Enums can be: Simple (Long), tuple (Long(...)), or struct-like (Long { ... })
-fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
-    use super::ts_utils;
-
-    // Skip type annotation if present
-    let ron_content = if content.trim_start().starts_with("/*") {
-        if let Some(end_idx) = content.find("*/") {
-            &content[end_idx + 2..]
-        } else {
-            content
-        }
-    } else {
-        content
-    };
-
-    // Reuse the thread-local parser instead of building a fresh one (which
-    // reloads the RON grammar) on every diagnostics pass.
-    let tree = ts_utils::parse(ron_content)?;
-
-    // Find the main value (should be an identifier or struct representing the variant)
-    let main_value = ts_utils::find_main_value(&tree);
-
-    let main_value = main_value?;
-    ts_utils::extract_enum_variant(&main_value, ron_content)
+    Box::pin(validate_struct_node(node, content, &expected, analyzer)).await
 }
 
 /// Type checking with enum variant validation (async, uses analyzer)
@@ -1076,35 +718,6 @@ fn check_type_mismatch_deep(
                 return Some(format!("expected {}, got bool", expected_type));
             }
             // Otherwise assume it's an enum variant (we'd need more context to validate)
-        }
-    }
-
-    None
-}
-
-/// Extract the raw text value for a field of the struct at the top of `content`.
-fn extract_field_value_text(content: &str, field_name: &str) -> Option<String> {
-    use super::ts_utils;
-
-    let tree = ts_utils::parse(content)?;
-    let main_value = ts_utils::find_main_value(&tree)?;
-
-    if main_value.kind() == "struct" || main_value.kind() == "ERROR" {
-        // For ERROR nodes, find the struct sibling
-        let struct_node = if main_value.kind() == "ERROR" {
-            ts_utils::child_by_kind(&tree.root_node(), "struct")?
-        } else {
-            main_value
-        };
-
-        let field_nodes = ts_utils::struct_fields(&struct_node);
-        for field_node in field_nodes {
-            if let Some(name) = ts_utils::field_name(&field_node, content)
-                && name == field_name
-                && let Some(value_node) = ts_utils::field_value(&field_node)
-            {
-                return ts_utils::node_text(&value_node, content).map(|s| s.to_string());
-            }
         }
     }
 
@@ -1982,38 +1595,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_extract_field_value_for_enum() {
-        let content = r#"Post(
-    id: 42,
-    post_type: Detailed( length: 1 ),
-)"#;
-        let extracted = extract_field_value_text(content, "post_type");
-        println!("Extracted post_type value: {:?}", extracted);
-        assert!(extracted.is_some());
-        let value = extracted.unwrap();
-        assert_eq!(value, "Detailed( length: 1 )");
-    }
-
-    #[test]
-    fn test_extract_nested_enum_variant() {
-        let content = r#"/* @[crate::models::Message] */
-
-PostReference(Post(
-    id: 42,
-    title: "test",
-))"#;
-        let variant = extract_enum_variant_from_text(content);
-        assert!(variant.is_some());
-        let variant = variant.unwrap();
-        assert_eq!(variant.name, "PostReference");
-        println!("Extracted data: {:?}", variant.data);
-        assert!(variant.data.is_some());
-        let data = variant.data.unwrap();
-        assert!(data.contains("Post("));
-        assert!(data.contains("id: 42"));
-    }
-
     #[tokio::test]
     async fn test_unit_variant_with_data_error() {
         let analyzer = Arc::new(RustAnalyzer::new());
@@ -2861,6 +2442,170 @@ PostReference(Post(
             "Unrelated field should have no suggestion. Got: {:?}",
             diagnostics
         );
+    }
+
+    /// A struct variant spells out named fields exactly the way a struct value
+    /// does, so it goes through the same validator: its field values are
+    /// type-checked, recursed into, and reported at their own position — not at
+    /// the top of the file — wherever in the document the variant appears.
+    #[tokio::test]
+    async fn test_variant_fields_validated_like_struct_fields() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Leaf".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Tuned".to_string(),
+                fields: vec![
+                    FieldInfo {
+                        name: "retries".to_string(),
+                        type_name: "u32".to_string(),
+                        ..Default::default()
+                    },
+                    FieldInfo {
+                        name: "inner".to_string(),
+                        type_name: "Leaf".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let mode = analyzer.get_type_info("Mode").unwrap().clone();
+        let config = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "mode".to_string(),
+                type_name: "Mode".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let analyzer = Arc::new(analyzer);
+
+        // The same variant as the document root, and as a nested field value.
+        let as_root = (
+            "Tuned(\n    retries: \"x\",\n    inner: (port: \"80\"),\n)",
+            &mode,
+            1,
+        );
+        let as_nested = (
+            "Config(\n    mode: Tuned(\n        retries: \"x\",\n        inner: (port: \"80\"),\n    ),\n)",
+            &config,
+            2,
+        );
+
+        for (content, root_type, retries_line) in [as_root, as_nested] {
+            let diagnostics =
+                validate_ron_with_analyzer(content, None, root_type, analyzer.clone()).await;
+
+            let retries = diagnostics
+                .iter()
+                .find(|d| d.message.contains("expected u32, got string"))
+                .unwrap_or_else(|| {
+                    panic!("a variant field's own type must be checked. Got: {diagnostics:?}")
+                });
+            assert_eq!(
+                retries.range.start.line, retries_line,
+                "the mismatch belongs on the offending line, not the top of the file"
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("expected u16, got string")),
+                "a struct nested inside a variant field must be validated too. Got: {diagnostics:?}"
+            );
+        }
+
+        // A required field the variant is missing is reported at the variant's
+        // own name, and names the variant it belongs to.
+        let diagnostics = validate_ron_with_analyzer(
+            "Config(\n    mode: Tuned(retries: 1),\n)",
+            None,
+            &config,
+            analyzer.clone(),
+        )
+        .await;
+        let missing_code = code(codes::MISSING_REQUIRED_FIELD);
+        let missing = diagnostics
+            .iter()
+            .find(|d| d.code == missing_code)
+            .unwrap_or_else(|| panic!("a missing variant field must error. Got: {diagnostics:?}"));
+        assert_eq!(missing.message, "Required fields in variant 'Tuned': inner");
+        assert_eq!(missing.range.start, Position::new(1, 10));
+
+        // ...and the complete variant raises nothing, at either depth.
+        for content in [
+            "Config(\n    mode: Tuned(retries: 1, inner: (port: 80)),\n)",
+            "Config(\n    mode: Tuned(retries: 1, inner: Leaf(port: 80)),\n)",
+        ] {
+            let diagnostics =
+                validate_ron_with_analyzer(content, None, &config, analyzer.clone()).await;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+                "'{content}' is valid and should raise nothing. Got: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// A tuple variant's payload is matched to its positional fields in order
+    /// and checked against their declared types, like any other value.
+    #[tokio::test]
+    async fn test_tuple_variant_payload_type_checked() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Value".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Pair".to_string(),
+                fields: vec![
+                    FieldInfo {
+                        name: "0".to_string(),
+                        type_name: "i32".to_string(),
+                        ..Default::default()
+                    },
+                    FieldInfo {
+                        name: "1".to_string(),
+                        type_name: "String".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let diagnostics =
+            validate_ron_with_analyzer(r#"Pair(1, "a")"#, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "a well-typed payload should raise nothing. Got: {diagnostics:?}"
+        );
+
+        // The second element is declared String, so a number is wrong — and the
+        // error belongs at that element, not at the start of the variant.
+        let diagnostics =
+            validate_ron_with_analyzer("Pair(1, 2)", None, &type_info, analyzer.clone()).await;
+        let mismatch = diagnostics
+            .iter()
+            .find(|d| d.message.contains("expected String, got number"))
+            .unwrap_or_else(|| {
+                panic!("a tuple variant's payload must be checked. Got: {diagnostics:?}")
+            });
+        assert_eq!(mismatch.range.start, Position::new(0, 8));
     }
 
     #[tokio::test]
