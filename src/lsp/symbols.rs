@@ -9,6 +9,10 @@ pub fn document_symbols(tree: &Tree, content: &str) -> Vec<DocumentSymbol> {
     let Some(main_value) = ts_utils::find_main_value(tree) else {
         return Vec::new();
     };
+    // The outline is built recursively, so a tree too deep to walk gets none.
+    if ts_utils::exceeds_max_depth(&main_value) {
+        return Vec::new();
+    }
     value_symbols(&main_value, content)
 }
 
@@ -157,5 +161,19 @@ mod tests {
         let users = symbols[0].children.as_ref().unwrap();
         assert_eq!(users.len(), 2);
         assert!(users.iter().all(|s| s.name == "User"));
+    }
+
+    /// The outline is built recursively, so a document nested far enough used
+    /// to exhaust the stack and abort the process. Editors ask for the outline
+    /// on their own, without the user requesting anything, so merely opening
+    /// such a file was enough to take the server down.
+    ///
+    /// If the depth guard regresses this test does not fail, it kills the test
+    /// binary with a stack overflow, which is the point.
+    #[test]
+    fn test_deeply_nested_document_yields_no_symbols() {
+        let depth = ts_utils::MAX_TREE_DEPTH * 20;
+        let content = format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth));
+        assert!(document_symbols(&parse(&content), &content).is_empty());
     }
 }

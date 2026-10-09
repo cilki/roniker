@@ -142,6 +142,39 @@ pub fn is_comment(node: &Node) -> bool {
     matches!(node.kind(), "line_comment" | "block_comment")
 }
 
+/// The deepest parse tree the server will walk.
+///
+/// Tree-sitter parses iteratively and happily builds a tree as deep as the
+/// document nests, but the walks over it here are recursive, so a document
+/// nested deeply enough exhausts the thread's stack. That is not an error a
+/// server can recover from: the runtime aborts the whole process, taking the
+/// language server down with whatever file the editor happened to open. The
+/// walks therefore refuse to start on a tree deeper than this.
+///
+/// Nothing a RON document can legitimately contain comes close. `ron` itself
+/// gives up past 64 levels of nesting, which is a tree about 130 nodes deep, so
+/// a document that trips this limit already fails to deserialize and is already
+/// reported as a syntax error.
+pub const MAX_TREE_DEPTH: usize = 256;
+
+/// Whether `node`'s subtree is nested deeper than [`MAX_TREE_DEPTH`].
+///
+/// Deliberately iterative: a recursive depth check would blow the stack on
+/// exactly the input it exists to reject.
+pub fn exceeds_max_depth(node: &Node) -> bool {
+    let mut stack = vec![(*node, 1usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, depth + 1));
+        }
+    }
+    false
+}
+
 /// Find the deepest node at a given position
 pub fn node_at_position<'a>(tree: &'a Tree, content: &str, position: Position) -> Option<Node<'a>> {
     let byte_offset = position_to_byte_offset(content, position);
@@ -360,6 +393,31 @@ pub fn extract_enum_variant(node: &Node, content: &str) -> Option<ParsedEnumVari
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A RON document nesting `depth` structs inside each other.
+    fn nested(depth: usize) -> String {
+        format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn test_exceeds_max_depth_passes_realistic_documents() {
+        // The deepest document `ron` will deserialize must still be walkable,
+        // or formatting and the outline would quietly stop working on a file
+        // the rest of the server considers valid.
+        let content = nested(64);
+        assert!(
+            ron::from_str::<ron::Value>(&content).is_ok(),
+            "fixture must be a document ron accepts"
+        );
+        let tree = parse(&content).unwrap();
+        assert!(!exceeds_max_depth(&tree.root_node()));
+    }
+
+    #[test]
+    fn test_exceeds_max_depth_rejects_deeply_nested_documents() {
+        let tree = parse(&nested(MAX_TREE_DEPTH + 1)).unwrap();
+        assert!(exceeds_max_depth(&tree.root_node()));
+    }
 
     #[test]
     fn test_parse_simple_struct() {

@@ -1,6 +1,6 @@
 use super::ts_utils::{
-    ancestors, child_by_kind, field_name, node_at_position, node_text, position_to_byte_offset,
-    struct_name,
+    self, ancestors, child_by_kind, field_name, node_at_position, node_text,
+    position_to_byte_offset, struct_name,
 };
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
@@ -178,6 +178,11 @@ pub struct VariantFieldLocation {
 pub fn find_all_variant_field_locations(tree: &Tree, content: &str) -> Vec<VariantFieldLocation> {
     let mut locations = Vec::new();
     let root = tree.root_node();
+
+    // `visit_fields` recurses, so a tree too deep to walk yields nothing.
+    if ts_utils::exceeds_max_depth(&root) {
+        return locations;
+    }
 
     // Walk the tree to find all field nodes that are inside struct variants
     visit_fields(&root, content, &mut locations);
@@ -454,5 +459,17 @@ mod tests {
 
         let containing_field = get_containing_field_context(&tree, content, position);
         assert_eq!(containing_field, Some("post_type".to_string()));
+    }
+
+    /// `visit_fields` recurses, so a document nested far enough used to
+    /// exhaust the stack and abort the process.
+    ///
+    /// If the depth guard regresses this test does not fail, it kills the test
+    /// binary with a stack overflow, which is the point.
+    #[test]
+    fn test_deeply_nested_document_yields_no_variant_locations() {
+        let depth = ts_utils::MAX_TREE_DEPTH * 20;
+        let content = format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth));
+        assert!(find_all_variant_field_locations(&parse(&content), &content).is_empty());
     }
 }
