@@ -108,14 +108,12 @@ pub async fn validate_ron_with_analyzer(
 
     // If parsing failed, return syntax error
     if let Err(e) = &parsed_value {
-        let error_msg = e.to_string();
-        let (line, col) = parse_error_position(&error_msg, content);
-        let simplified_msg = simplify_ron_error(&error_msg);
-
         diagnostics.push(Diagnostic {
-            range: Range::new(Position::new(line, col), Position::new(line, col + 1)),
+            range: parse_error_range(&e.span, content),
             severity: Some(DiagnosticSeverity::ERROR),
-            message: simplified_msg,
+            // `e.code` is the message without the span prefix that `e` itself
+            // would print; the span is already carried by `range`.
+            message: format!("RON syntax error: {}", e.code),
             code: code(codes::SYNTAX_ERROR),
             ..Default::default()
         });
@@ -852,129 +850,179 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     None
 }
 
-/// Where to report a syntax error, as an LSP line and column.
+/// Where to report a syntax error: the span RON failed in, translated into LSP
+/// coordinates.
 ///
-/// RON counts its error column in characters, so it has to be translated into
-/// the UTF-16 code units LSP counts in before it goes out to the editor.
-fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
+/// RON numbers lines and columns from one and counts columns in characters; LSP
+/// numbers lines from zero and counts columns in UTF-16 code units.
+fn parse_error_range(span: &ron::error::Span, content: &str) -> Range {
+    let start = error_position(&span.start, content);
+    let end = error_position(&span.end, content);
+
+    // An empty range is invisible in most editors, so widen it to cover the
+    // character the parser stopped on.
+    if start == end {
+        Range::new(start, Position::new(start.line, start.character + 1))
+    } else {
+        Range::new(start, end)
+    }
+}
+
+/// One end of a RON error span as an LSP position.
+fn error_position(position: &ron::error::Position, content: &str) -> Position {
     use super::ts_utils;
 
-    let (line, char_col) = parse_error_char_position(error_msg, content);
+    let line = position.line.saturating_sub(1) as u32;
+    let char_col = position.col.saturating_sub(1);
     let text = ts_utils::line_at(content, line as usize);
     let byte_col = text
         .char_indices()
-        .nth(char_col as usize)
+        .nth(char_col)
         .map_or(text.len(), |(byte, _)| byte);
-    (line, ts_utils::utf16_column(text, byte_col))
-}
-
-/// Parse error position from RON error message, with the column in characters.
-fn parse_error_char_position(error_msg: &str, content: &str) -> (u32, u32) {
-    // RON error messages often contain position info like "1:5" or "line 1 column 5"
-
-    // Try to find "line X column Y" pattern
-    if let Some(line_start) = error_msg.find("line ") {
-        let rest = &error_msg[line_start + 5..];
-        if let Some(line_end) = rest.find(|c: char| !c.is_numeric())
-            && let Ok(line) = rest[..line_end].parse::<u32>()
-            && let Some(col_start) = rest.find("column ")
-        {
-            let col_rest = &rest[col_start + 7..];
-            if let Some(col_end) = col_rest.find(|c: char| !c.is_numeric())
-                && let Ok(col) = col_rest[..col_end].parse::<u32>()
-            {
-                // RON reports 1-indexed, LSP expects 0-indexed
-                return (line.saturating_sub(1), col.saturating_sub(1));
-            }
-        }
-    }
-
-    // Try to find "X:Y" pattern (common in parsers)
-    if let Some(colon_pos) = error_msg.find(':') {
-        let before = &error_msg[..colon_pos];
-        // Find the last number before the colon
-        if let Some(line_start) = before.rfind(|c: char| !c.is_numeric()) {
-            let line_str = &before[line_start + 1..];
-            if let Ok(line) = line_str.parse::<u32>() {
-                let after = &error_msg[colon_pos + 1..];
-                if let Some(col_end) = after.find(|c: char| !c.is_numeric())
-                    && let Ok(col) = after[..col_end].parse::<u32>()
-                {
-                    return (line.saturating_sub(1), col.saturating_sub(1));
-                }
-            }
-        }
-    }
-
-    // If we can't parse position, try to find likely error location by looking for common issues
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Check for missing commas between fields
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        // If a line ends with a value (not comma, not open brace) and next line starts with a field
-        if !trimmed.is_empty()
-            && !trimmed.ends_with(',')
-            && !trimmed.ends_with('(')
-            && !trimmed.ends_with('{')
-            && !trimmed.ends_with('[')
-            && !trimmed.starts_with("//")
-            && !trimmed.starts_with("/*")
-            && idx + 1 < lines.len()
-        {
-            let next_line = lines[idx + 1].trim();
-            // Next line looks like a field (word followed by colon)
-            if next_line.contains(':') && !next_line.starts_with("//") {
-                // Likely missing comma
-                return (idx as u32, line.chars().count().saturating_sub(1) as u32);
-            }
-        }
-    }
-
-    // Default to start of file
-    (0, 0)
-}
-
-/// Simplify RON error messages to be more user-friendly
-fn simplify_ron_error(error_msg: &str) -> String {
-    // Extract the core error without all the implementation details
-    if error_msg.contains("expected") {
-        if error_msg.contains("`,`") || error_msg.contains("comma") {
-            return "Expected comma between fields".to_string();
-        }
-        if error_msg.contains("`:`") || error_msg.contains("colon") {
-            return "Expected colon after field name".to_string();
-        }
-        if error_msg.contains("`)`") {
-            return "Expected closing parenthesis".to_string();
-        }
-        if error_msg.contains("`}`") {
-            return "Expected closing brace".to_string();
-        }
-        if error_msg.contains("`]`") {
-            return "Expected closing bracket".to_string();
-        }
-    }
-
-    if error_msg.contains("unexpected") {
-        return format!(
-            "Syntax error: {}",
-            error_msg
-                .split("unexpected")
-                .nth(1)
-                .unwrap_or(error_msg)
-                .trim()
-        );
-    }
-
-    // Return simplified version
-    format!("RON syntax error: {}", error_msg)
+    Position::new(line, ts_utils::utf16_column(text, byte_col))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+    /// A struct with two required fields, for tests that only care about where a
+    /// diagnostic lands rather than what it says.
+    fn two_field_config() -> TypeInfo {
+        TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }
+    }
+
+    async fn syntax_error(content: &str) -> Diagnostic {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &two_field_config(), analyzer).await;
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a document that doesn't parse gets exactly one diagnostic. Got: {:?}",
+            diagnostics
+        );
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String(codes::SYNTAX_ERROR.to_string())),
+            "Got: {:?}",
+            diagnostics[0]
+        );
+        diagnostics[0].clone()
+    }
+
+    /// A syntax error has to be reported where it is. RON hands back the span it
+    /// failed in, and anchoring every error at the start of the file instead
+    /// underlines the first character of a document whose mistake is twenty
+    /// lines down.
+    #[tokio::test]
+    async fn test_syntax_error_reported_at_the_offending_line() {
+        // The colon after `port` is missing.
+        let content = "Config(\n    host: \"localhost\",\n    port 8080,\n)";
+        let diagnostic = syntax_error(content).await;
+
+        assert_eq!(
+            diagnostic.range.start.line, 2,
+            "the error is on the `port` line. Got: {:?}",
+            diagnostic
+        );
+        assert!(
+            diagnostic.range.start.character >= 4,
+            "the error is at or past the start of `port`. Got: {:?}",
+            diagnostic
+        );
+    }
+
+    /// An unclosed container is reported at the end of the document, not at its
+    /// start.
+    #[tokio::test]
+    async fn test_syntax_error_at_end_of_document() {
+        let content = "Config(\n    host: \"localhost\",\n    port: 8080,\n";
+        let diagnostic = syntax_error(content).await;
+
+        assert!(
+            diagnostic.range.start.line >= 2,
+            "an unterminated struct is reported at the end. Got: {:?}",
+            diagnostic
+        );
+    }
+
+    /// The reported range is never empty: a zero-width diagnostic doesn't render
+    /// in most editors.
+    #[tokio::test]
+    async fn test_syntax_error_range_is_not_empty() {
+        for content in [
+            "Config(",
+            "Config(\n    host: \"localhost\"\n    port: 8080,\n)",
+            "Config(\n    host: ,\n)",
+            ")",
+            "Config(\n    host: \"unterminated,\n)",
+        ] {
+            let range = syntax_error(content).await.range;
+            let start = (range.start.line, range.start.character);
+            let end = (range.end.line, range.end.character);
+            assert!(
+                start < end,
+                "range should be non-empty for {content:?}. Got: {range:?}"
+            );
+        }
+    }
+
+    /// The message is RON's own description of what went wrong, without the
+    /// `3:6-4:1:` span prefix that `SpannedError` prints — the span is already
+    /// carried by the diagnostic's range, and repeating it as text is noise the
+    /// editor shows inline.
+    #[tokio::test]
+    async fn test_syntax_error_message_has_no_span_prefix() {
+        let content = "Config(\n    host: \"localhost\",\n    port 8080,\n)";
+        let diagnostic = syntax_error(content).await;
+
+        assert_eq!(
+            diagnostic.message, "RON syntax error: Expected colon",
+            "Got: {:?}",
+            diagnostic
+        );
+    }
+
+    /// Columns go out in UTF-16 code units, while RON counts them in characters.
+    /// A non-ASCII string earlier on the line is what tells the two apart.
+    #[tokio::test]
+    async fn test_syntax_error_column_is_utf16() {
+        // The comma after the string is missing, so the error lands on `port`.
+        let content = "Config(host: \"münchen 🚀\" port: 80)";
+        let diagnostic = syntax_error(content).await;
+
+        let expected = content
+            .split_once("port")
+            .map(|(before, _)| before.encode_utf16().count() as u32)
+            .unwrap();
+        assert_eq!(
+            diagnostic.range.start.line, 0,
+            "Got: {:?}",
+            diagnostic.range
+        );
+        assert_eq!(
+            diagnostic.range.start.character, expected,
+            "column should be the UTF-16 offset of `port` ({expected}). Got: {:?}",
+            diagnostic.range
+        );
+    }
 
     /// The fields of a struct variant used deep inside a document are checked
     /// against the variant's definition, which means resolving the type that
