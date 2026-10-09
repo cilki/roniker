@@ -660,7 +660,7 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            let node_pos = ts_utils::point_to_position(&content, node.start_position());
+            let node_pos = ts_utils::node_start_position(&node, &content);
             let owner = self.resolve_owner_type_at(&content, Some(&tree), node_pos);
             // When either side can't be resolved, fall back to matching by name
             if let (Some(target), Some(owner)) = (&target_type, &owner)

@@ -60,6 +60,14 @@ pub fn line_at(content: &str, row: usize) -> &str {
     content.split('\n').nth(row).unwrap_or("")
 }
 
+/// The length of `s` in UTF-16 code units, which is what LSP counts columns in.
+fn utf16_len(s: &str) -> u32 {
+    if s.is_ascii() {
+        return s.len() as u32;
+    }
+    s.encode_utf16().count() as u32
+}
+
 /// The UTF-16 column that a byte column on `line` corresponds to.
 ///
 /// LSP counts `Position::character` in UTF-16 code units, while tree-sitter
@@ -68,14 +76,31 @@ pub fn line_at(content: &str, row: usize) -> &str {
 /// ranges land one position too far right for every extra byte earlier on the
 /// line.
 pub fn utf16_column(line: &str, byte_column: usize) -> u32 {
-    let mut end = byte_column.min(line.len());
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
+    utf16_len(&line[..floor_char_boundary(line, byte_column)])
+}
+
+/// `offset` clamped into `s` and back to the nearest character boundary at or
+/// before it, so that slicing `s` there cannot panic.
+fn floor_char_boundary(s: &str, offset: usize) -> usize {
+    let mut offset = offset.min(s.len());
+    while offset > 0 && !s.is_char_boundary(offset) {
+        offset -= 1;
     }
-    if line.as_bytes()[..end].is_ascii() {
-        return end as u32;
-    }
-    line[..end].encode_utf16().count() as u32
+    offset
+}
+
+/// The byte offset at which the row containing `byte_offset` begins.
+///
+/// Rows are counted the way tree-sitter counts them: one per `\n`. Finding the
+/// row's start by scanning *backwards* from the offset costs one line, where
+/// counting rows forwards from the start of the document costs everything that
+/// precedes it — the difference between answering a request in time
+/// proportional to the node and in time proportional to the whole file.
+fn line_start(content: &str, byte_offset: usize) -> usize {
+    content[..byte_offset]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .unwrap_or(0)
 }
 
 /// The byte column on `line` that a UTF-16 column corresponds to, clamped to the
@@ -95,19 +120,44 @@ pub fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
 }
 
 /// The width of row `row` in UTF-16 code units, i.e. the column just past its
-/// last character.
+/// last character. Counts rows from the start of `content`; prefer
+/// [`line_end_column`] where a byte offset on the row is already to hand.
 pub fn line_width(content: &str, row: usize) -> u32 {
     let line = line_at(content, row);
     utf16_column(line, line.len())
 }
 
-/// Convert a tree-sitter `Point` (row + byte column) to an LSP `Position`
-/// (line + UTF-16 column).
-pub fn point_to_position(content: &str, point: tree_sitter::Point) -> Position {
+/// The column just past the last character of the row that `byte_offset` falls
+/// on, in UTF-16 code units.
+pub fn line_end_column(content: &str, byte_offset: usize) -> u32 {
+    let start = line_start(content, floor_char_boundary(content, byte_offset));
+    let end = content[start..]
+        .find('\n')
+        .map(|newline| start + newline)
+        .unwrap_or(content.len());
+    utf16_len(&content[start..end])
+}
+
+/// Convert a byte offset into `content` to an LSP `Position` (line + UTF-16
+/// column). `row` is the row the offset falls on, which every caller already
+/// knows: tree-sitter reports it alongside the byte offset, and deriving it
+/// here instead would mean counting newlines from the start of the document.
+pub fn byte_offset_to_position(content: &str, byte_offset: usize, row: usize) -> Position {
+    let offset = floor_char_boundary(content, byte_offset);
     Position {
-        line: point.row as u32,
-        character: utf16_column(line_at(content, point.row), point.column),
+        line: row as u32,
+        character: utf16_len(&content[line_start(content, offset)..offset]),
     }
+}
+
+/// The LSP position of a node's first byte.
+pub fn node_start_position(node: &Node, content: &str) -> Position {
+    byte_offset_to_position(content, node.start_byte(), node.start_position().row)
+}
+
+/// The LSP position just past a node's last byte.
+pub fn node_end_position(node: &Node, content: &str) -> Position {
+    byte_offset_to_position(content, node.end_byte(), node.end_position().row)
 }
 
 /// Convert LSP Position to byte offset in content
@@ -127,8 +177,8 @@ pub fn position_to_byte_offset(content: &str, position: Position) -> usize {
 /// Convert a node's byte range to an LSP Range
 pub fn node_to_lsp_range(node: &Node, content: &str) -> Range {
     Range {
-        start: point_to_position(content, node.start_position()),
-        end: point_to_position(content, node.end_position()),
+        start: node_start_position(node, content),
+        end: node_end_position(node, content),
     }
 }
 
@@ -516,7 +566,7 @@ mod tests {
 
         for field in descendants_by_kind(&tree, "field") {
             let name = field.child(0).unwrap();
-            let position = point_to_position(content, name.start_position());
+            let position = node_start_position(&name, content);
             assert_eq!(
                 position_to_byte_offset(content, position),
                 name.start_byte(),
@@ -541,6 +591,68 @@ mod tests {
         assert_eq!(line_width(content, 0), 1);
         assert_eq!(line_width(content, 1), 4, "`ab` plus a surrogate pair");
         assert_eq!(line_width(content, 2), 0);
+    }
+
+    /// `line_end_column` has to answer for whichever row the byte offset lands
+    /// on, and agree with `line_width`'s count of that row.
+    #[test]
+    fn test_line_end_column_matches_line_width() {
+        let content = "ü\nab🚀\nxy";
+
+        // An offset anywhere on a row, including in the middle of it, answers
+        // for that row.
+        assert_eq!(line_end_column(content, 0), line_width(content, 0));
+        assert_eq!(line_end_column(content, 3), line_width(content, 1));
+        assert_eq!(
+            line_end_column(content, content.len()),
+            line_width(content, 2)
+        );
+
+        assert_eq!(line_end_column(content, 3), 4, "`ab` plus a surrogate pair");
+        assert_eq!(line_end_column(content, content.len()), 2);
+    }
+
+    /// Node positions are derived from the node's byte offset, scanning back to
+    /// the start of its own line, rather than by counting rows forward from the
+    /// start of the document. The two have to answer identically for every node
+    /// — including on lines carrying multi-byte and astral characters, where a
+    /// byte offset and a UTF-16 column come apart.
+    #[test]
+    fn test_node_ranges_agree_with_row_scan() {
+        let content =
+            "Config(\n    city: \"münchen\",\n    rockets: \"🚀🚀\",\n    tag: \"ü🚀x\",\n)";
+        let tree = parse(content).unwrap();
+
+        let mut walked = 0;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let range = node_to_lsp_range(&node, content);
+            let (start, end) = (node.start_position(), node.end_position());
+
+            assert_eq!(
+                range.start,
+                Position::new(
+                    start.row as u32,
+                    utf16_column(line_at(content, start.row), start.column)
+                ),
+                "start of `{}`",
+                node.kind()
+            );
+            assert_eq!(
+                range.end,
+                Position::new(
+                    end.row as u32,
+                    utf16_column(line_at(content, end.row), end.column)
+                ),
+                "end of `{}`",
+                node.kind()
+            );
+
+            walked += 1;
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        assert!(walked > 10, "expected a non-trivial tree, walked {walked}");
     }
 
     #[test]

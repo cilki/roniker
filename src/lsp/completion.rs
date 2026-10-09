@@ -64,7 +64,7 @@ fn inside_struct_body(struct_node: &tree_sitter::Node, content: &str, position: 
         // node as its body, which is what the cursor is editing.
         return true;
     };
-    let open_end = ts_utils::point_to_position(content, open_paren.end_position());
+    let open_end = ts_utils::node_end_position(&open_paren, content);
     position.line > open_end.line
         || (position.line == open_end.line && position.character >= open_end.character)
 }
@@ -116,7 +116,7 @@ fn field_completion_context(
         (field_name_node, ts_utils::field_value(field_node))
     {
         // If cursor is after the field name, we're completing a value
-        let name_end = ts_utils::point_to_position(content, field_name.end_position());
+        let name_end = ts_utils::node_end_position(&field_name, content);
         if position.line > name_end.line
             || (position.line == name_end.line && position.character > name_end.character)
         {
