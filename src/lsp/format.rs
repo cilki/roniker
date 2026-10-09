@@ -265,6 +265,12 @@ pub fn format_ron(content: &str) -> String {
         }
     };
 
+    // Laying the document out is recursive, so a tree too deep to walk is left
+    // alone, exactly as an unparseable one is.
+    if ts_utils::exceeds_max_depth(&tree.root_node()) {
+        return content.to_string();
+    }
+
     // Build the formatted output
     let mut result = String::new();
 
@@ -761,5 +767,19 @@ Post(
         assert!(formatted.contains("// Post configuration"));
         assert!(formatted.contains("    // Author information"));
         assert!(formatted.contains("        // The author's ID"));
+    }
+
+    /// Laying out a document is recursive, so a document nested far enough
+    /// used to exhaust the stack — aborting the whole language server process,
+    /// which no amount of error handling in the editor can survive. A document
+    /// that deep is left as it is instead.
+    ///
+    /// If the depth guard regresses this test does not fail, it kills the test
+    /// binary with a stack overflow, which is the point.
+    #[test]
+    fn test_deeply_nested_document_is_left_alone() {
+        let depth = ts_utils::MAX_TREE_DEPTH * 20;
+        let input = format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth));
+        assert_eq!(format_ron(&input), input);
     }
 }
