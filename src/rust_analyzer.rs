@@ -202,6 +202,9 @@ pub struct TypeInfo {
     pub source_file: Option<PathBuf>,
     pub line: Option<usize>,
     pub column: Option<usize>,
+    /// Container-level `#[serde(default)]`: serde fills in every absent field,
+    /// so none of them are required. A bare `#[derive(Default)]` does not set
+    /// this — it has no bearing on what serde will accept.
     pub has_default: bool,
     /// `#[serde(rename_all = "...")]` on the container (e.g. "camelCase")
     #[serde(default)]

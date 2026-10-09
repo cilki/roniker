@@ -46,7 +46,8 @@ struct ExpectedStruct<'a> {
     /// A `flatten` target the analyzer can't resolve (e.g. a `HashMap`) makes
     /// serde accept arbitrary extra keys, so unknown fields aren't reported.
     allow_unknown_fields: bool,
-    /// The container derives `Default`, so an absent field is not an error.
+    /// The container carries `#[serde(default)]`, so an absent field is not an
+    /// error. Note that a bare `#[derive(Default)]` does *not* do this.
     has_default: bool,
     /// The enum variant this value spells out, when it is one. Only affects the
     /// wording of the diagnostics.
@@ -2626,6 +2627,95 @@ mod tests {
                 "'{content}' is valid and should raise nothing. Got: {diagnostics:?}"
             );
         }
+    }
+
+    /// End to end from Rust source: `#[derive(Default)]` on a config struct must
+    /// not suppress the missing-field diagnostic. `#[derive(Debug, Clone,
+    /// Default, Serialize, Deserialize)]` is the standard shape of a config
+    /// type — the README's own example and this repository's example types both
+    /// use it — so folding the derive into "has a default" meant
+    /// `missing-required-field` never fired for anybody, while serde went on
+    /// refusing to deserialize the file.
+    #[cfg(feature = "analyze")]
+    #[tokio::test]
+    async fn test_derive_default_still_requires_fields() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+                pub struct AppConfig {
+                    #[serde(default)]
+                    pub debug: bool,
+                    pub port: u16,
+                    pub server: ServerConfig,
+                }
+
+                #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+                pub struct ServerConfig {
+                    pub host: String,
+                    #[serde(default)]
+                    pub mode: String,
+                }
+
+                #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+                #[serde(default)]
+                pub struct Tunables {
+                    pub retries: u32,
+                }
+                "#,
+            )
+            .unwrap();
+
+        let root = analyzer
+            .get_type_info("crate::AppConfig")
+            .expect("AppConfig")
+            .clone();
+        let analyzer = Arc::new(analyzer);
+
+        // `port` is absent at the root and `host` is absent in the nested
+        // struct. Both are required, at both depths.
+        let missing = |content: &'static str| {
+            let analyzer = analyzer.clone();
+            let root = root.clone();
+            async move {
+                validate_ron_with_analyzer(content, None, &root, analyzer)
+                    .await
+                    .into_iter()
+                    .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let no_port = "AppConfig(\n    debug: true,\n    server: ServerConfig(host: \"x\"),\n)";
+        let no_host = "AppConfig(\n    port: 80,\n    server: ServerConfig(mode: \"fast\"),\n)";
+        let complete = "AppConfig(\n    port: 80,\n    server: ServerConfig(host: \"x\"),\n)";
+
+        assert_eq!(
+            missing(no_port).await,
+            vec!["Required fields: port".to_string()],
+            "a root struct that merely derives Default still requires its fields"
+        );
+        assert_eq!(
+            missing(no_host).await,
+            vec!["Required fields: host".to_string()],
+            "a nested struct that merely derives Default still requires its fields"
+        );
+
+        // The fully specified document is still clean.
+        assert!(missing(complete).await.is_empty());
+
+        // A container `#[serde(default)]` does still excuse everything.
+        let tunables = analyzer.get_type_info("crate::Tunables").expect("Tunables");
+        assert!(
+            validate_ron_with_analyzer("Tunables()", None, tunables, analyzer.clone())
+                .await
+                .iter()
+                .all(|d| d.code != code(codes::MISSING_REQUIRED_FIELD)),
+            "container #[serde(default)] still makes every field optional"
+        );
     }
 
     /// A tuple variant's payload is matched to its positional fields in order
