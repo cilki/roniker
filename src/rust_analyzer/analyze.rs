@@ -202,11 +202,13 @@ impl RustAnalyzer {
         let line = Some(start.line);
         let column = Some(start.column);
         let serde_attrs = serde_attributes::extract_serde_attributes(&struct_item.attrs);
-        // A struct's fields are all optional when it can be filled from a
-        // default: either `#[derive(Default)]` or a container `#[serde(default)]`
-        // (the latter often paired with a hand-written `Default` impl, so the
-        // derive check alone would miss it).
-        let has_default = has_default_derive(&struct_item.attrs) || serde_attrs.has_default;
+        // Only a container `#[serde(default)]` makes the fields optional. A bare
+        // `#[derive(Default)]` says nothing about deserialization: serde still
+        // demands every field that has no default of its own, so counting the
+        // derive here would suppress the missing-field diagnostic on exactly the
+        // structs that need it most (`#[derive(Default, Deserialize)]` being the
+        // usual shape of a config type).
+        let has_default = serde_attrs.has_default;
         let rename_all = serde_attrs.rename_all;
 
         Some(TypeInfo {
@@ -252,8 +254,14 @@ impl RustAnalyzer {
         let start = enum_item.ident.span().start();
         let line = Some(start.line);
         let column = Some(start.column);
-        let has_default = has_default_derive(&enum_item.attrs);
-        let rename_all = serde_attributes::extract_serde_attributes(&enum_item.attrs).rename_all;
+        let serde_attrs = serde_attributes::extract_serde_attributes(&enum_item.attrs);
+        // As for structs, only a container `#[serde(default)]` counts — and serde
+        // rejects that on an enum, so in practice this is always false. A
+        // `#[derive(Default)]` with a `#[default]` variant picks the variant when
+        // the field is absent entirely; it does not excuse the chosen variant's
+        // own fields from being spelled out.
+        let has_default = serde_attrs.has_default;
+        let rename_all = serde_attrs.rename_all;
 
         Some(TypeInfo {
             name: full_path,
@@ -370,23 +378,6 @@ fn extract_docs(attrs: &[syn::Attribute]) -> Option<String> {
     } else {
         Some(docs.join("\n"))
     }
-}
-
-fn has_default_derive(attrs: &[syn::Attribute]) -> bool {
-    use syn::punctuated::Punctuated;
-    use syn::{Path, Token};
-
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("derive")
-            && attr
-                .parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .any(|p| p.segments.last().is_some_and(|s| s.ident == "Default"))
-                })
-                .unwrap_or(false)
-    })
 }
 
 fn type_to_string(ty: &syn::Type) -> String {
@@ -624,6 +615,66 @@ mod tests {
         assert!(
             info.has_default,
             "container #[serde(default)] should mark the struct as having a default"
+        );
+    }
+
+    /// `#[derive(Default)]` is about constructing a value in Rust, not about
+    /// deserializing one: serde still refuses a document that leaves out a field
+    /// with no default of its own. Treating the derive as a container
+    /// `#[serde(default)]` silently switched off missing-field reporting for the
+    /// most common config-struct shape there is.
+    #[test]
+    fn test_derive_default_alone_does_not_mark_struct_optional() {
+        let mut analyzer = RustAnalyzer::new();
+
+        let source = r#"
+            #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+            pub struct ServerConfig {
+                pub host: String,
+                #[serde(default)]
+                pub port: u16,
+            }
+        "#;
+
+        analyzer.add_source_with_prefix("crate", source).unwrap();
+
+        let info = analyzer
+            .get_type_info("crate::ServerConfig")
+            .expect("ServerConfig should exist");
+        assert!(
+            !info.has_default,
+            "#[derive(Default)] without #[serde(default)] leaves fields required"
+        );
+
+        // The field-level attribute is still honored.
+        let fields = info.fields().expect("struct fields");
+        assert!(!fields[0].is_optional(), "host is required");
+        assert!(fields[1].is_optional(), "port has #[serde(default)]");
+    }
+
+    /// An enum deriving `Default` chooses a variant when the field is absent
+    /// altogether, which says nothing about that variant's own fields.
+    #[test]
+    fn test_derive_default_alone_does_not_mark_enum_optional() {
+        let mut analyzer = RustAnalyzer::new();
+
+        let source = r#"
+            #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+            pub enum Mode {
+                #[default]
+                Dev,
+                Prod { replicas: u32 },
+            }
+        "#;
+
+        analyzer.add_source_with_prefix("crate", source).unwrap();
+
+        let info = analyzer
+            .get_type_info("crate::Mode")
+            .expect("Mode should exist");
+        assert!(
+            !info.has_default,
+            "#[derive(Default)] on an enum leaves variant fields required"
         );
     }
 

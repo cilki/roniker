@@ -179,8 +179,11 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
   reporting is switched off for that struct, because serde would accept any
   extra key there.
 - A field stops counting as required if it is an `Option<T>`, carries
-  `#[serde(default)]` or `#[serde(default = "path")]`, or its container derives
-  `Default` or carries a container-level `#[serde(default)]`.
+  `#[serde(default)]` or `#[serde(default = "path")]`, or its container carries a
+  container-level `#[serde(default)]`. A bare `#[derive(Default)]` is *not*
+  enough: it decides what `Default::default()` builds, not what serde will
+  accept, so a field with no default of its own is still required and leaving it
+  out is still reported.
 
 ### Runnable examples
 

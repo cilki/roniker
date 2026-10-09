@@ -265,7 +265,8 @@ fn generate_missing_field_actions(
         .filter(|(name, field)| !present(name) && !present(&field.name))
         .cloned()
         .collect();
-    // A type that derives Default needs none of its fields spelled out.
+    // A container `#[serde(default)]` fills in whatever is absent, so none of
+    // its fields need spelling out.
     let required_missing = if type_info.has_default {
         Vec::new()
     } else {
