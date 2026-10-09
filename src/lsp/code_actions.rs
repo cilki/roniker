@@ -80,11 +80,14 @@ pub fn generate_remove_field_actions(
 
         // Delete through the trailing comma if present
         let start = field_node.start_position();
+        let start_byte = field_node.start_byte();
         let mut end = field_node.end_position();
+        let mut end_byte = field_node.end_byte();
         if let Some(next) = field_node.next_sibling()
             && next.kind() == ","
         {
             end = next.end_position();
+            end_byte = next.end_byte();
         }
 
         // If the field occupies its line(s) alone, remove the whole lines
@@ -103,8 +106,8 @@ pub fn generate_remove_field_actions(
             )
         } else {
             Range::new(
-                ts_utils::point_to_position(content, start),
-                ts_utils::point_to_position(content, end),
+                ts_utils::byte_offset_to_position(content, start_byte, start.row),
+                ts_utils::byte_offset_to_position(content, end_byte, end.row),
             )
         };
 
@@ -350,7 +353,7 @@ fn create_explicit_root_type_action(
 
     if main_value.kind() == "struct" && ts_utils::struct_name(&main_value, content).is_none() {
         let type_name = super::type_utils::short_name(&type_info.name);
-        let pos = ts_utils::point_to_position(content, main_value.start_position());
+        let pos = ts_utils::node_start_position(&main_value, content);
 
         return Some(single_file_action(
             url,
@@ -396,7 +399,7 @@ fn create_explicit_field_type_action(
                 let clean_type = super::type_utils::extract_inner_type(&type_name, "Option<")
                     .unwrap_or(&type_name);
 
-                let pos = ts_utils::point_to_position(content, value_node.start_position());
+                let pos = ts_utils::node_start_position(&value_node, content);
                 return Some(single_file_action(
                     url,
                     format!("Make field type explicit: {} {}", field.name, clean_type),
@@ -474,7 +477,7 @@ fn generate_field_insertions(
         .contains('\n');
 
     let anchor_pos = anchor.end_position();
-    let separator_pos = ts_utils::point_to_position(content, anchor_pos);
+    let separator_pos = ts_utils::node_end_position(&anchor, content);
 
     let mut body = String::new();
     if on_one_line {
@@ -511,13 +514,8 @@ fn generate_field_insertions(
             body_byte += 1;
         }
     }
-    let body_pos = ts_utils::point_to_position(
-        content,
-        tree_sitter::Point {
-            row: anchor_pos.row,
-            column: anchor_pos.column + (body_byte - anchor_end),
-        },
-    );
+    // `body_byte` never crosses a newline, so it is still on the anchor's row.
+    let body_pos = ts_utils::byte_offset_to_position(content, body_byte, anchor_pos.row);
 
     let separator = if needs_separator { "," } else { "" };
     if body_pos == separator_pos {

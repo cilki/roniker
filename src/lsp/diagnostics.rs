@@ -318,17 +318,13 @@ async fn validate_typed_value(
 fn first_line_range(node: &tree_sitter::Node, content: &str) -> Range {
     use super::ts_utils;
 
-    let start = node.start_position();
-    let end = node.end_position();
-    let end_col = if end.row > start.row {
-        ts_utils::line_width(content, start.row)
+    let start = ts_utils::node_start_position(node, content);
+    let end_col = if node.end_position().row > node.start_position().row {
+        ts_utils::line_end_column(content, node.start_byte())
     } else {
-        ts_utils::point_to_position(content, end).character
+        ts_utils::node_end_position(node, content).character
     };
-    Range::new(
-        ts_utils::point_to_position(content, start),
-        Position::new(start.row as u32, end_col),
-    )
+    Range::new(start, Position::new(start.line, end_col))
 }
 
 /// The range to report a whole-struct diagnostic at: the struct's name, or a
@@ -339,7 +335,7 @@ fn struct_name_range(node: &tree_sitter::Node, content: &str) -> Range {
             super::ts_utils::node_to_lsp_range(&name, content)
         }
         _ => {
-            let pos = super::ts_utils::point_to_position(content, node.start_position());
+            let pos = super::ts_utils::node_start_position(node, content);
             Range::new(pos, pos)
         }
     }
