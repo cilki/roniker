@@ -280,13 +280,13 @@ fn generate_field_completions(
                     let documentation = Some(markdown_docs(value));
 
                     let insert_text = if variant.fields.is_empty() {
-                        name.clone()
+                        name.to_string()
                     } else {
                         format!("{}($0)", name)
                     };
 
                     CompletionItem {
-                        label: name,
+                        label: name.into_owned(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: Some(format!("Variant of {}", type_info.name)),
                         documentation,
@@ -355,7 +355,7 @@ fn enum_variant_value_completions(
     variants
         .iter()
         .map(|variant| {
-            let name = variant.serialized_name(rename_all);
+            let name = variant.serialized_name(rename_all).into_owned();
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),

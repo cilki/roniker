@@ -112,14 +112,14 @@ impl RustAnalyzer {
                     if let Some(type_info) =
                         self.extract_struct_info(struct_item, module_prefix, file_path)
                     {
-                        self.type_cache.insert(type_info.name.clone(), type_info);
+                        self.add_type(type_info);
                     }
                 }
                 Item::Enum(enum_item) => {
                     if let Some(type_info) =
                         self.extract_enum_info(enum_item, module_prefix, file_path)
                     {
-                        self.type_cache.insert(type_info.name.clone(), type_info);
+                        self.add_type(type_info);
                     }
                 }
                 Item::Type(type_item) => {

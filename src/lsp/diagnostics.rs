@@ -103,12 +103,13 @@ pub async fn validate_ron_with_analyzer(
         },
     };
 
-    // Parse RON once and check for syntax errors from the result
-    // Try to parse the RON content
-    let parsed_value = ron::from_str::<Value>(content);
-
-    // If parsing failed, return syntax error
-    if let Err(e) = &parsed_value {
+    // Whether the document parses as RON at all. `IgnoredAny` makes `ron` run
+    // its parser over the whole document and throw the result away, which is
+    // all this needs: the only thing read from it is the error. Deserializing
+    // into a `Value` instead would build a copy of the entire document as an
+    // owned tree, which on a large file costs more than the rest of validation
+    // put together.
+    if let Err(e) = ron::from_str::<serde::de::IgnoredAny>(content) {
         diagnostics.push(Diagnostic {
             range: parse_error_range(&e.span, content),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -384,7 +385,7 @@ async fn validate_nested_value<'a>(
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
         if is_custom_type(inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
+            if let Some(inner_type_info) = analyzer.get_type_info(inner_type) {
                 if value_node.kind() == "array" {
                     let mut cursor = value_node.walk();
                     for elem_node in value_node.children(&mut cursor) {
@@ -395,7 +396,7 @@ async fn validate_nested_value<'a>(
                             let elem_diags = Box::pin(validate_node_with_type_info(
                                 &elem_node,
                                 content,
-                                &inner_type_info,
+                                inner_type_info,
                                 analyzer,
                                 false,
                             ))
@@ -414,7 +415,7 @@ async fn validate_nested_value<'a>(
     {
         // Single-element wrapper — check the inner type is known
         if is_custom_type(inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
+            if let Some(inner_type_info) = analyzer.get_type_info(inner_type) {
                 // An `Option` field is usually written `Some(value)`. Validate
                 // the wrapped value rather than the `Some` wrapper, or the
                 // inner type's own fields go unchecked.
@@ -422,7 +423,7 @@ async fn validate_nested_value<'a>(
                 let nested_diags = Box::pin(validate_node_with_type_info(
                     &inner_node,
                     content,
-                    &inner_type_info,
+                    inner_type_info,
                     analyzer,
                     false,
                 ))
@@ -434,11 +435,11 @@ async fn validate_nested_value<'a>(
         }
     } else if is_custom_type(&field_type_normalized) {
         // Plain custom struct/enum — validate the node directly
-        if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized).cloned() {
+        if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
             let nested_diags = Box::pin(validate_node_with_type_info(
                 value_node,
                 content,
-                &nested_type_info,
+                nested_type_info,
                 analyzer,
                 false,
             ))
@@ -467,7 +468,7 @@ fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Di
     let known: Vec<String> = match &type_info.kind {
         TypeKind::Enum(variants) => variants
             .iter()
-            .map(|v| v.serialized_name(rename_all))
+            .map(|v| v.serialized_name(rename_all).into_owned())
             .collect(),
         TypeKind::Struct(_) => Vec::new(),
     };
@@ -612,7 +613,7 @@ async fn check_type_mismatch_with_enum_validation(
         // Check if the expected type is a known enum first — if so, validate the variant name
         // regardless of case (serde rename_all can produce lowercase/snake_case variant names)
         if !type_in_ron.is_empty() && !is_primitive_type(type_in_ron) {
-            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
+            if let Some(type_info) = analyzer.get_type_info(expected_type) {
                 if matches!(type_info.kind, TypeKind::Enum(_)) {
                     return match type_info.find_variant(type_in_ron) {
                         Some(_) => None,
@@ -765,8 +766,8 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             ];
             let float_types = ["f32", "f64"];
 
-            let is_integer_type = integer_types.contains(&clean_type.as_str());
-            let is_float_type = float_types.contains(&clean_type.as_str());
+            let is_integer_type = integer_types.contains(&clean_type.as_ref());
+            let is_float_type = float_types.contains(&clean_type.as_ref());
 
             // Check if it's a float or integer based on the Number variant
             let is_float_value = matches!(n, ron::Number::F32(_) | ron::Number::F64(_));

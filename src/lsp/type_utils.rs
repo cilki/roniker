@@ -1,5 +1,6 @@
 //! Shared helpers for working with Rust type names extracted by the analyzer.
 use crate::rust_analyzer::FieldInfo;
+use std::borrow::Cow;
 
 /// Get the last path segment of a fully-qualified type name.
 /// For example: `crate::models::User` -> `User`
@@ -11,8 +12,12 @@ pub fn short_name(path: &str) -> &str {
 /// `Vec < Post >` and `Vec<Post>` are treated the same. Depending on the source
 /// formatting the analyzer extracts types with inconsistent internal spacing,
 /// so this is applied before any prefix/suffix or set-membership checks.
-pub fn normalize_type(type_name: &str) -> String {
-    type_name.replace(' ', "")
+///
+/// This is the same normalization [`crate::rust_analyzer::RustAnalyzer::get_type_info`]
+/// applies to a lookup key, so the two cannot disagree about what a type name
+/// means.
+pub fn normalize_type(type_name: &str) -> Cow<'_, str> {
+    crate::rust_analyzer::strip_type_whitespace(type_name)
 }
 
 /// Extract the inner type from a generic type when it starts with the given
@@ -31,7 +36,7 @@ pub fn strip_outer_generic(type_name: &str) -> String {
     let clean = normalize_type(type_name);
     match (clean.find('<'), clean.rfind('>')) {
         (Some(start), Some(end)) if start < end => clean[start + 1..end].to_string(),
-        _ => clean,
+        _ => clean.into_owned(),
     }
 }
 
@@ -44,7 +49,7 @@ pub fn is_primitive_type(type_name: &str) -> bool {
         "usize", "f32", "f64", "char", "String", "&str", "str",
     ];
 
-    primitives.contains(&clean.as_str())
+    primitives.contains(&clean.as_ref())
 }
 
 /// Standard-library generic wrappers the analyzer never resolves as a

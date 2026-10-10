@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Strip the spaces out of a type name so that `Vec < Post >` and `Vec<Post>`
+/// compare equal. Type names reach the analyzer through
+/// `quote!(#ty).to_string()`, which tokenizes with spaces around `::` and `<>`,
+/// while cache keys are stored space-free.
+///
+/// Borrows when there is nothing to strip, which is the overwhelmingly common
+/// case: a type name is normalized several times per value in a document, and
+/// allocating a copy of each one was a measurable share of the time spent
+/// validating a large file.
+pub(crate) fn strip_type_whitespace(type_name: &str) -> Cow<'_, str> {
+    match type_name.contains(' ') {
+        true => Cow::Owned(type_name.replace(' ', "")),
+        false => Cow::Borrowed(type_name),
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldInfo {
@@ -46,22 +64,27 @@ impl FieldInfo {
 
     /// The name serde expects for this field, honoring `#[serde(rename)]`
     /// and the container's `#[serde(rename_all)]` convention.
-    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> String {
+    ///
+    /// Borrows unless a `rename_all` convention actually has to be applied.
+    /// Matching a RON field name against a type's fields asks this of every
+    /// candidate, so a type with a dozen fields answered a single lookup with a
+    /// dozen throwaway copies of its own field names.
+    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> Cow<'_, str> {
         if let Some(rename) = &self.rename {
-            return rename.clone();
+            return Cow::Borrowed(rename);
         }
-        if let Some(convention) = container_rename_all {
-            return rename_all_field(&self.name, convention);
+        match container_rename_all {
+            Some(convention) => Cow::Owned(rename_all_field(&self.name, convention)),
+            None => Cow::Borrowed(&self.name),
         }
-        self.name.clone()
     }
 
     /// Whether serde would accept `name` for this field when deserializing:
     /// its serialized name (honoring rename/rename_all), its Rust name, or any
     /// `#[serde(alias = "...")]`.
     pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
-        self.serialized_name(container_rename_all) == name
-            || self.name == name
+        self.name == name
+            || self.serialized_name(container_rename_all) == name
             || self.aliases.iter().any(|a| a == name)
     }
 }
@@ -150,20 +173,21 @@ impl EnumVariant {
         self.fields
             .iter()
             .filter(|f| !f.skip)
-            .map(|f| (f.serialized_name(None), f.clone()))
+            .map(|f| (f.serialized_name(None).into_owned(), f.clone()))
             .collect()
     }
 
     /// The name serde expects for this variant, honoring `#[serde(rename)]`
-    /// and the enum's `#[serde(rename_all)]` convention.
-    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> String {
+    /// and the enum's `#[serde(rename_all)]` convention. Borrows unless a
+    /// `rename_all` convention actually has to be applied.
+    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> Cow<'_, str> {
         if let Some(rename) = &self.rename {
-            return rename.clone();
+            return Cow::Borrowed(rename);
         }
-        if let Some(convention) = container_rename_all {
-            return rename_all_variant(&self.name, convention);
+        match container_rename_all {
+            Some(convention) => Cow::Owned(rename_all_variant(&self.name, convention)),
+            None => Cow::Borrowed(&self.name),
         }
-        self.name.clone()
     }
 
     /// Whether a document naming `name` is naming this variant: its serialized
@@ -176,8 +200,8 @@ impl EnumVariant {
     /// false error is worse than a missed one. This is the one place that
     /// decides the question, so every feature answers it the same way.
     pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
-        self.serialized_name(container_rename_all) == name
-            || self.name == name
+        self.name == name
+            || self.serialized_name(container_rename_all) == name
             || self.name.eq_ignore_ascii_case(name)
     }
 }
@@ -289,10 +313,8 @@ impl TypeInfo {
                 }
                 continue;
             }
-            out.push((
-                field.serialized_name(self.rename_all.as_deref()),
-                field.clone(),
-            ));
+            let serialized = field.serialized_name(self.rename_all.as_deref());
+            out.push((serialized.into_owned(), field.clone()));
         }
         out
     }
@@ -314,6 +336,14 @@ pub struct RustAnalyzer {
     pub root_type: Option<String>,
     type_cache: HashMap<String, TypeInfo>,
     type_aliases: HashMap<String, String>,
+    /// Index from every `::`-delimited tail of a registered type path to that
+    /// path, so that resolving the bare name a field declaration uses
+    /// (`ServerConfig`) against the fully-qualified key the build script
+    /// registered (`crate::config::ServerConfig`) is a hash lookup instead of a
+    /// scan of every registered type. Built on first use and dropped whenever
+    /// the cache changes; never serialized, since it is derivable.
+    #[serde(skip)]
+    path_tails: OnceLock<HashMap<String, String>>,
 }
 
 impl Default for RustAnalyzer {
@@ -329,6 +359,7 @@ impl RustAnalyzer {
             root_type: None,
             type_cache: HashMap::new(),
             type_aliases: HashMap::new(),
+            path_tails: OnceLock::new(),
         }
     }
 
@@ -336,8 +367,7 @@ impl RustAnalyzer {
     pub fn with_root_type(root_type: impl Into<String>) -> Self {
         Self {
             root_type: Some(root_type.into()),
-            type_cache: HashMap::new(),
-            type_aliases: HashMap::new(),
+            ..Self::new()
         }
     }
 
@@ -353,6 +383,7 @@ impl RustAnalyzer {
     /// This is useful when you have pre-constructed TypeInfo objects.
     pub fn add_type(&mut self, type_info: TypeInfo) {
         self.type_cache.insert(type_info.name.clone(), type_info);
+        self.path_tails.take();
     }
 
     /// Register a type alias.
@@ -370,6 +401,7 @@ impl RustAnalyzer {
     /// # Returns
     /// The removed TypeInfo if it existed
     pub fn remove_type(&mut self, type_path: &str) -> Option<TypeInfo> {
+        self.path_tails.take();
         self.type_cache.remove(type_path)
     }
 
@@ -377,6 +409,29 @@ impl RustAnalyzer {
     pub fn clear(&mut self) {
         self.type_cache.clear();
         self.type_aliases.clear();
+        self.path_tails.take();
+    }
+
+    /// Every `::`-delimited tail of every registered type path, mapped to the
+    /// path it came from: `crate::config::Server` contributes `config::Server`
+    /// and `Server`. The full path itself is left out, since an exact lookup
+    /// finds that without help.
+    ///
+    /// When two types share a tail the first one encountered wins, which
+    /// matches what the scan this replaces did — it returned whichever
+    /// candidate the `HashMap` happened to iterate first.
+    fn path_tails(&self) -> &HashMap<String, String> {
+        self.path_tails.get_or_init(|| {
+            let mut tails = HashMap::new();
+            for key in self.type_cache.keys() {
+                for (offset, separator) in key.match_indices("::") {
+                    tails
+                        .entry(key[offset + separator.len()..].to_string())
+                        .or_insert_with(|| key.clone());
+                }
+            }
+            tails
+        })
     }
 
     pub fn get_type_info(&self, type_path: &str) -> Option<&TypeInfo> {
@@ -384,8 +439,8 @@ impl RustAnalyzer {
         // via `quote!(#ty).to_string()` are tokenized with spaces around `::`
         // and `<>`, but cache keys are stored space-free. Without this every
         // call site would have to remember to pre-normalize.
-        let normalized = type_path.replace(' ', "");
-        let lookup = normalized.as_str();
+        let normalized = strip_type_whitespace(type_path);
+        let lookup = normalized.as_ref();
 
         // Resolve type aliases first
         let resolved_type = self
@@ -405,15 +460,11 @@ impl RustAnalyzer {
 
         // If not found by exact match, try finding by simple name
         // e.g., "PostType" should match "crate::models::PostType"
-        let lookup_suffix = format!("::{}", lookup);
-        let resolved_suffix = format!("::{}", resolved_type);
-        for (key, value) in self.type_cache.iter() {
-            if key.ends_with(&lookup_suffix) || key.ends_with(&resolved_suffix) {
-                return Some(value);
-            }
-        }
-
-        None
+        let tails = self.path_tails();
+        tails
+            .get(resolved_type)
+            .or_else(|| tails.get(lookup))
+            .and_then(|key| self.type_cache.get(key))
     }
 
     /// Get all types registered with the analyzer
@@ -504,3 +555,88 @@ impl RustAnalyzer {
 
 #[cfg(feature = "analyze")]
 mod analyze;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registered(path: &str) -> RustAnalyzer {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: path.to_string(),
+            ..Default::default()
+        });
+        analyzer
+    }
+
+    /// A field declaration names a type the way the Rust source spells it,
+    /// which is rarely the fully-qualified path the build script registered it
+    /// under. Any `::`-delimited tail of that path has to resolve.
+    #[test]
+    fn test_get_type_info_resolves_any_path_tail() {
+        let analyzer = registered("crate::deeply::nested::MyStruct");
+
+        for lookup in [
+            "crate::deeply::nested::MyStruct",
+            "deeply::nested::MyStruct",
+            "nested::MyStruct",
+            "MyStruct",
+            "crate :: deeply :: nested :: MyStruct",
+        ] {
+            assert_eq!(
+                analyzer.get_type_info(lookup).map(|t| t.name.as_str()),
+                Some("crate::deeply::nested::MyStruct"),
+                "{lookup} should resolve"
+            );
+        }
+
+        // A tail has to start at a path segment, not in the middle of one.
+        assert!(analyzer.get_type_info("Struct").is_none());
+        assert!(analyzer.get_type_info("ested::MyStruct").is_none());
+    }
+
+    /// Tail lookups are answered from an index built on first use, so every way
+    /// of changing the registered types has to invalidate it. Looking a type up
+    /// before the change is what makes the stale index observable.
+    #[test]
+    fn test_get_type_info_sees_changes_after_a_lookup() {
+        let mut analyzer = registered("crate::config::First");
+        assert!(analyzer.get_type_info("First").is_some());
+
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Second".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            analyzer.get_type_info("Second").is_some(),
+            "a type added after a lookup is still found by its tail"
+        );
+
+        analyzer.remove_type("crate::config::Second");
+        assert!(
+            analyzer.get_type_info("Second").is_none(),
+            "a removed type is not found by its tail"
+        );
+
+        analyzer.clear();
+        assert!(
+            analyzer.get_type_info("First").is_none(),
+            "a cleared analyzer resolves nothing"
+        );
+    }
+
+    /// An alias is resolved before the type path is looked up, including when
+    /// what it resolves to is only a tail of a registered path.
+    #[test]
+    fn test_get_type_info_resolves_alias_by_tail() {
+        let mut analyzer = registered("crate::config::Target");
+        analyzer.add_type_alias("crate::Alias", "Target");
+
+        assert_eq!(
+            analyzer
+                .get_type_info("crate::Alias")
+                .map(|t| t.name.as_str()),
+            Some("crate::config::Target")
+        );
+    }
+}
