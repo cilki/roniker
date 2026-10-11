@@ -126,7 +126,14 @@ pub fn generate_remove_field_actions(
     actions
 }
 
-/// Generate code actions for adding missing fields in nested enum variants
+/// Code actions for the fields missing from an enum variant written as the
+/// value of one of the root struct's own fields — the `Prod(...)` of
+/// `Cfg(mode: Prod(...))`.
+///
+/// Deeper nesting is not handled: the field has to resolve on the root type for
+/// there to be an enum to look the variant up in, and a field further down
+/// resolves either to nothing or, if the root happens to carry the same name, to
+/// the wrong type.
 fn generate_missing_variant_field_actions(
     tree: &Tree,
     content: &str,
@@ -134,86 +141,61 @@ fn generate_missing_variant_field_actions(
     url: &Url,
     analyzer: &RustAnalyzer,
 ) -> Vec<CodeActionOrCommand> {
-    let mut actions = Vec::new();
-    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(tree, content);
+    use super::ts_utils;
 
-    // Group locations by (containing_field_name, variant_name) to find which fields are used
-    let mut variant_fields_map: std::collections::HashMap<
-        (String, String),
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    let Some(root) = root_struct_node(tree) else {
+        return Vec::new();
+    };
 
-    // Collect all fields used for each variant
-    for location in &variant_locations {
-        if let Some(ref field_at_pos) = location.field_at_position {
-            let key = (
-                location.containing_field_name.clone(),
-                location.variant_name.clone(),
-            );
-            variant_fields_map
-                .entry(key)
-                .or_default()
-                .insert(field_at_pos.clone());
-        }
-    }
+    ts_utils::struct_fields(&root)
+        .into_iter()
+        .filter_map(|field_node| {
+            let field_name = ts_utils::field_name(&field_node, content)?;
+            // A variant with fields is spelled `Variant(...)`, which parses as a
+            // `struct` node named after the variant.
+            let value = ts_utils::field_value(&field_node)?;
+            let variant_name = ts_utils::struct_name(&value, content)?;
 
-    // Now generate actions for each unique variant
-    let mut seen_variants = std::collections::HashSet::new();
-    for location in variant_locations {
-        let key = (
-            location.containing_field_name.clone(),
-            location.variant_name.clone(),
-        );
-        if seen_variants.contains(&key) {
-            continue;
-        }
-        seen_variants.insert(key.clone());
+            let field = type_info.find_field_serialized(field_name)?;
+            let enum_info = analyzer.get_type_info(&field.type_name)?;
+            // A container `#[serde(default)]` fills in whatever is absent.
+            if enum_info.has_default {
+                return None;
+            }
+            let variant = enum_info.find_variant(variant_name)?;
 
-        // Resolve the containing field directly on the root type; deeper nesting
-        // is not currently handled here
-        let Some(field) = type_info.find_field_serialized(&location.containing_field_name) else {
-            continue;
-        };
+            // Only the variant's own fields count as supplied. Descending into
+            // them would credit the variant with field names belonging to a
+            // nested type, which is how a required field could be considered
+            // present because something nested inside it happened to share its
+            // name.
+            let present: std::collections::HashSet<&str> = ts_utils::struct_fields(&value)
+                .iter()
+                .filter_map(|f| ts_utils::field_name(f, content))
+                .collect();
 
-        // Get the enum type for this field and find the variant definition
-        let Some(field_type_info) = analyzer.get_type_info(&field.type_name) else {
-            continue;
-        };
-        let Some(variant) = field_type_info.find_variant(&location.variant_name) else {
-            continue;
-        };
+            let missing =
+                super::type_utils::missing_required_fields(&variant.effective_fields(), |name| {
+                    present.contains(name)
+                });
+            if missing.is_empty() {
+                return None;
+            }
 
-        // Get fields used in this variant from our map
-        let used_fields = variant_fields_map.get(&key).cloned().unwrap_or_default();
-
-        let required_missing = if field_type_info.has_default {
-            Vec::new()
-        } else {
-            super::type_utils::missing_required_fields(&variant.effective_fields(), |name| {
-                used_fields.contains(name)
-            })
-        };
-
-        if !required_missing.is_empty()
-            && let Some(edits) = generate_field_insertions(tree, content, &required_missing)
-        {
-            actions.push(single_file_action(
+            Some(single_file_action(
                 url,
                 format!(
-                    "Add {} required field{} to {}::{}",
-                    required_missing.len(),
-                    plural(required_missing.len()),
-                    location.containing_field_name,
-                    location.variant_name
+                    "Add {} required field{} to {field_name}::{variant_name}",
+                    missing.len(),
+                    plural(missing.len())
                 ),
                 CodeActionKind::QUICKFIX,
-                edits,
+                // Into the variant's own parens, not the document root's.
+                generate_field_insertions(&value, content, &missing)?,
                 None,
-            ));
-        }
-    }
-
-    actions
+            ))
+        })
+        .collect()
 }
 
 /// Generate code actions for making implicit struct names explicit
@@ -259,6 +241,9 @@ fn generate_missing_field_actions(
     else {
         return Vec::new();
     };
+    let Some(root) = root_struct_node(tree) else {
+        return Vec::new();
+    };
 
     let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
     let present = |name: &str| ron_fields.iter().any(|f| f == name);
@@ -283,7 +268,7 @@ fn generate_missing_field_actions(
     .into_iter()
     .filter(|(_, _, fields)| !fields.is_empty())
     .filter_map(|(lead, kind, fields)| {
-        let edits = generate_field_insertions(tree, content, &fields)?;
+        let edits = generate_field_insertions(&root, content, &fields)?;
         Some(single_file_action(
             url,
             format!(
@@ -417,7 +402,27 @@ fn create_explicit_field_type_action(
     None
 }
 
-/// Generate text edits to insert missing fields using tree-sitter.
+/// The `struct` node holding the document's root value, i.e. the one whose
+/// fields are compared against the root type.
+///
+/// `find_main_value` returns the first named, non-annotation child of the root,
+/// which already includes any `struct` or `ERROR` node. A half-typed document
+/// parses as an `ERROR` with the struct as its *sibling* rather than its child,
+/// so that case looks one level up. `None` when the document's root value is
+/// not a struct at all.
+fn root_struct_node(tree: &Tree) -> Option<tree_sitter::Node<'_>> {
+    use super::ts_utils;
+
+    match ts_utils::find_main_value(tree)? {
+        main_value if main_value.kind() == "struct" => Some(main_value),
+        main_value if main_value.kind() == "ERROR" => {
+            ts_utils::child_by_kind(&tree.root_node(), "struct")
+        }
+        _ => None,
+    }
+}
+
+/// Generate text edits to insert missing fields into `struct_node`'s parens.
 /// Takes `(serialized_name, field)` pairs so inserted names match what serde expects.
 ///
 /// The edits are anchored on the last thing inside the struct's parens rather
@@ -427,35 +432,16 @@ fn create_explicit_field_type_action(
 /// carries a trailing comma — which is every document this server's own
 /// formatter emits.
 fn generate_field_insertions(
-    tree: &Tree,
+    struct_node: &tree_sitter::Node,
     content: &str,
     missing_fields: &[(String, FieldInfo)],
 ) -> Option<Vec<TextEdit>> {
     use super::ts_utils;
 
-    let root = tree.root_node();
-
-    // `find_main_value` returns the first named, non-annotation child of the
-    // root, which already includes any `struct` or `ERROR` node. If it finds
-    // nothing, there is no struct to insert into, so bail out.
-    let main_value = ts_utils::find_main_value(tree)?;
-
-    if main_value.kind() != "struct" && main_value.kind() != "ERROR" {
-        return None;
-    }
-
-    // For ERROR nodes, the struct is likely a SIBLING, not a child
-    let struct_node = if main_value.kind() == "ERROR" {
-        // Look for struct node among root's children
-        ts_utils::child_by_kind(&root, "struct")?
-    } else {
-        main_value
-    };
-
-    let open = ts_utils::child_by_kind(&struct_node, "(")?;
+    let open = ts_utils::child_by_kind(struct_node, "(")?;
     // Tree-sitter supplies a zero-width `MISSING ")"` node while the struct is
     // still unterminated, so this also resolves for a half-typed document.
-    let close = ts_utils::child_by_kind(&struct_node, ")")?;
+    let close = ts_utils::child_by_kind(struct_node, ")")?;
 
     // Anchor on the last node inside the parens, ignoring comments, so the edit
     // lands after the final field instead of on the closing paren's line.
@@ -490,7 +476,7 @@ fn generate_field_insertions(
             .collect();
         body.push_str(&rendered.join(", "));
     } else {
-        let indent = field_indent(content, &struct_node);
+        let indent = field_indent(content, struct_node);
         for (name, field) in missing_fields {
             body.push('\n');
             body.push_str(&indent);
@@ -1124,6 +1110,101 @@ mod tests {
         );
     }
 
+    /// A root type carrying one enum-typed field `mode: Mode`, where `Mode`'s
+    /// `Prod` variant requires both `a` and `b`.
+    fn nested_variant_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+        use crate::rust_analyzer::EnumVariant;
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Prod".to_string(),
+                fields: vec![
+                    FieldInfo {
+                        name: "a".to_string(),
+                        type_name: "u32".to_string(),
+                        ..Default::default()
+                    },
+                    FieldInfo {
+                        name: "b".to_string(),
+                        type_name: "String".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "mode".to_string(),
+                type_name: "Mode".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        (root, Arc::new(analyzer))
+    }
+
+    /// The titles and resulting documents of every missing-field action offered
+    /// for `content`.
+    fn missing_field_actions(
+        content: &str,
+        type_info: &TypeInfo,
+        analyzer: Arc<RustAnalyzer>,
+    ) -> Vec<(String, String)> {
+        let url = Url::parse("file:///test.ron").unwrap();
+        generate_code_actions(&parse(content), content, type_info, &url, analyzer, &[])
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) if a.title.contains("field") => {
+                    let edits = a.edit.as_ref()?.changes.as_ref()?.get(&url)?;
+                    Some((a.title.clone(), apply(content, edits)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fields missing from an enum variant nested under a root field have to be
+    /// inserted into that variant's own parens. They used to go through the
+    /// root-only insertion path, which appended them to the document root — so
+    /// the quick-fix left the variant still incomplete and added fields the root
+    /// type doesn't have.
+    #[test]
+    fn test_nested_variant_fields_are_inserted_into_the_variant() {
+        let (root, analyzer) = nested_variant_fixture();
+        let content = "Cfg(\n    mode: Prod(\n        a: 1,\n    ),\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, analyzer),
+            vec![(
+                "Add 1 required field to mode::Prod".to_string(),
+                "Cfg(\n    mode: Prod(\n        a: 1,\n        b: \"\",\n    ),\n)".to_string(),
+            )]
+        );
+    }
+
+    /// Only a variant's own fields count as supplied. The walk used to descend
+    /// through them, so a field of some nested type that happened to share a
+    /// name with a required one made the variant look complete.
+    #[test]
+    fn test_nested_variant_ignores_field_names_of_nested_values() {
+        let (root, analyzer) = nested_variant_fixture();
+        // `b` here belongs to `Inner`, not to `Prod`.
+        let content = "Cfg(\n    mode: Prod(\n        a: 1,\n        junk: Inner(b: 2),\n    ),\n)";
+
+        let actions = missing_field_actions(content, &root, analyzer);
+        assert_eq!(
+            actions.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["Add 1 required field to mode::Prod"],
+            "`b` is still missing from `Prod`"
+        );
+    }
+
     #[test]
     fn test_remove_unknown_field_action() {
         let content = "(\n    name: \"a\",\n    bogus: 1,\n)";
@@ -1250,12 +1331,18 @@ mod tests {
             .collect()
     }
 
-    /// Insert `fields` into `content` and return the resulting document,
-    /// asserting it still parses as RON.
+    /// The edits that insert `fields` into the root struct of `content`.
+    fn root_insertions(tree: &Tree, content: &str, fields: &[(&str, &str)]) -> Vec<TextEdit> {
+        let root = root_struct_node(tree).expect("expected a root struct");
+        generate_field_insertions(&root, content, &missing(fields))
+            .expect("expected an insertion edit")
+    }
+
+    /// Insert `fields` into the root struct of `content` and return the
+    /// resulting document, asserting it still parses as RON.
     fn insert(content: &str, fields: &[(&str, &str)]) -> String {
-        let edits = generate_field_insertions(&parse(content), content, &missing(fields))
-            .expect("expected an insertion edit");
-        let result = apply(content, &edits);
+        let tree = parse(content);
+        let result = apply(content, &root_insertions(&tree, content, fields));
         ron::from_str::<ron::Value>(&result)
             .unwrap_or_else(|e| panic!("insertion produced invalid RON ({e}):\n{result}"));
         result
@@ -1324,8 +1411,8 @@ mod tests {
         // Mid-edit documents have a zero-width MISSING ")" instead of a real
         // one; the insertion still belongs after the last field.
         let content = "Cfg(\n    a: 1,\n";
-        let edits = generate_field_insertions(&parse(content), content, &missing(&[("b", "u32")]))
-            .expect("expected an insertion edit");
+        let tree = parse(content);
+        let edits = root_insertions(&tree, content, &[("b", "u32")]);
         assert_eq!(apply(content, &edits), "Cfg(\n    a: 1,\n    b: 0,\n");
     }
 

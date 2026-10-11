@@ -1,6 +1,6 @@
 use super::ts_utils::{
-    self, ancestors, child_by_kind, field_name, node_at_position, node_text,
-    position_to_byte_offset, struct_name,
+    ancestors, child_by_kind, field_name, node_at_position, node_text, position_to_byte_offset,
+    struct_name,
 };
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
@@ -164,104 +164,6 @@ pub fn get_containing_field_context(
         .filter(|node| node.kind() == "field")
         .skip(1)
         .find_map(|node| field_name(&node, content).map(str::to_string))
-}
-
-/// Information about a variant field location in RON content
-#[derive(Debug, Clone)]
-pub struct VariantFieldLocation {
-    pub variant_name: String,
-    pub containing_field_name: String,
-    pub field_at_position: Option<String>,
-}
-
-/// Scan through content and find all variant field locations
-pub fn find_all_variant_field_locations(tree: &Tree, content: &str) -> Vec<VariantFieldLocation> {
-    let mut locations = Vec::new();
-    let root = tree.root_node();
-
-    // `visit_fields` recurses, so a tree too deep to walk yields nothing.
-    if ts_utils::exceeds_max_depth(&root) {
-        return locations;
-    }
-
-    // Walk the tree to find all field nodes that are inside struct variants
-    visit_fields(&root, content, &mut locations);
-
-    locations
-}
-
-/// Recursively visit nodes to find field locations inside variants
-fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLocation>) {
-    // Check if this is a struct (potential variant)
-    if node.kind() == "struct"
-        && let Some(variant_name) = struct_name(node, content)
-    {
-        // This is a named struct, check if it's a variant (uppercase start)
-        if variant_name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_uppercase())
-        {
-            // Look for the containing field by checking parent
-            let containing_field_name = find_parent_field_name(node, content);
-
-            // Now collect all fields inside this variant
-            collect_fields_in_node(
-                node,
-                content,
-                variant_name,
-                &containing_field_name,
-                locations,
-            );
-        }
-    }
-
-    // Recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_fields(&child, content, locations);
-    }
-}
-
-/// Find the parent field name of a node
-fn find_parent_field_name(node: &Node, content: &str) -> Option<String> {
-    ancestors(*node)
-        .skip(1)
-        .find_map(|n| field_name(&n, content).map(str::to_string))
-}
-
-/// Collect all fields in a node
-fn collect_fields_in_node(
-    node: &Node,
-    content: &str,
-    variant_name: &str,
-    containing_field_name: &Option<String>,
-    locations: &mut Vec<VariantFieldLocation>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "field" {
-            // Extract field name
-            let field_at_position = field_name(&child, content).map(|s| s.to_string());
-
-            if let Some(containing_field) = containing_field_name {
-                locations.push(VariantFieldLocation {
-                    variant_name: variant_name.to_string(),
-                    containing_field_name: containing_field.clone(),
-                    field_at_position,
-                });
-            }
-        }
-
-        // Recurse for nested structures
-        collect_fields_in_node(
-            &child,
-            content,
-            variant_name,
-            containing_field_name,
-            locations,
-        );
-    }
 }
 
 /// Parse RON structure to get all field names present at the top level
@@ -459,17 +361,5 @@ mod tests {
 
         let containing_field = get_containing_field_context(&tree, content, position);
         assert_eq!(containing_field, Some("post_type".to_string()));
-    }
-
-    /// `visit_fields` recurses, so a document nested far enough used to
-    /// exhaust the stack and abort the process.
-    ///
-    /// If the depth guard regresses this test does not fail, it kills the test
-    /// binary with a stack overflow, which is the point.
-    #[test]
-    fn test_deeply_nested_document_yields_no_variant_locations() {
-        let depth = ts_utils::MAX_TREE_DEPTH * 20;
-        let content = format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth));
-        assert!(find_all_variant_field_locations(&parse(&content), &content).is_empty());
     }
 }
