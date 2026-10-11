@@ -724,6 +724,51 @@ fn check_type_mismatch_deep(
     None
 }
 
+/// The inclusive range of integers the named Rust integer type accepts, or
+/// `None` when `type_name` is not an integer type.
+///
+/// `isize`/`usize` are sized after the host, which is the machine the
+/// configured application is built on in practice.
+fn integer_bounds(type_name: &str) -> Option<(i128, i128)> {
+    Some(match type_name {
+        "i8" => (i8::MIN as i128, i8::MAX as i128),
+        "i16" => (i16::MIN as i128, i16::MAX as i128),
+        "i32" => (i32::MIN as i128, i32::MAX as i128),
+        "i64" => (i64::MIN as i128, i64::MAX as i128),
+        "isize" => (isize::MIN as i128, isize::MAX as i128),
+        "u8" => (0, u8::MAX as i128),
+        "u16" => (0, u16::MAX as i128),
+        "u32" => (0, u32::MAX as i128),
+        "u64" => (0, u64::MAX as i128),
+        "usize" => (0, usize::MAX as i128),
+        // Everything `integer_value` can return fits in these, so there is
+        // nothing left to check — but they are still integer types, and saying
+        // so is what keeps a value in one from being reported as a non-numeric
+        // field.
+        "i128" | "u128" => (i128::MIN, i128::MAX),
+        _ => return None,
+    })
+}
+
+/// The exact value of an integer `ron::Number`, or `None` for a float.
+///
+/// `ron` parses an integer literal into the narrowest variant that holds it, so
+/// the variant says nothing about the field's declared type — only the value
+/// matters here, and every integer variant `ron` yields fits in an `i128`.
+fn integer_value(n: &ron::Number) -> Option<i128> {
+    Some(match n {
+        ron::Number::I8(v) => i128::from(*v),
+        ron::Number::I16(v) => i128::from(*v),
+        ron::Number::I32(v) => i128::from(*v),
+        ron::Number::I64(v) => i128::from(*v),
+        ron::Number::U8(v) => i128::from(*v),
+        ron::Number::U16(v) => i128::from(*v),
+        ron::Number::U32(v) => i128::from(*v),
+        ron::Number::U64(v) => i128::from(*v),
+        _ => return None,
+    })
+}
+
 /// Check if a RON value matches the expected Rust type
 fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     let clean_type = normalize_type(expected_type);
@@ -759,29 +804,29 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             return Some(format!("expected {}, got bool", display_type));
         }
         Value::Number(n) => {
-            // Check for integer types
-            let integer_types = [
-                "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
-                "usize",
-            ];
-            let float_types = ["f32", "f64"];
-
-            let is_integer_type = integer_types.contains(&clean_type.as_ref());
-            let is_float_type = float_types.contains(&clean_type.as_ref());
-
-            // Check if it's a float or integer based on the Number variant
             let is_float_value = matches!(n, ron::Number::F32(_) | ron::Number::F64(_));
-            let is_int_value = !is_float_value;
+            let is_float_type = matches!(clean_type.as_ref(), "f32" | "f64");
+            let bounds = integer_bounds(&clean_type);
 
-            if is_float_value && is_integer_type {
-                return Some(format!("expected {}, got float", display_type));
-            }
-            if is_int_value && is_float_type {
-                return Some(format!("expected {}, got integer", display_type));
-            }
-            // If not a numeric type at all, it's an error
-            if !is_integer_type && !is_float_type {
+            if is_float_value {
+                // A float literal only goes into a float field; `ron` will not
+                // truncate it into an integer one.
+                if !is_float_type {
+                    return Some(format!("expected {}, got float", display_type));
+                }
+            } else if bounds.is_none() && !is_float_type {
+                // Not a numeric field at all.
                 return Some(format!("expected {}, got number", display_type));
+            } else if let Some((min, max)) = bounds
+                && let Some(literal) = integer_value(n)
+                && (literal < min || literal > max)
+            {
+                // An integer literal the field's type cannot hold: `ron`
+                // refuses the document with "Integer is out of bounds", so the
+                // config looks fine in the editor and then fails to load. Note
+                // that an integer literal in a *float* field is fine — serde
+                // widens it — which is why that case falls through to `None`.
+                return Some(format!("{} is out of range for {}", literal, display_type));
             }
         }
         Value::String(_) => {
@@ -1540,6 +1585,162 @@ mod tests {
             "Should have type mismatch error. Got: {:?}",
             diagnostics
         );
+    }
+
+    /// A single-field struct whose field has the given declared type, for
+    /// driving the numeric checks below.
+    fn single_field_type(type_name: &str) -> TypeInfo {
+        TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "n".to_string(),
+                type_name: type_name.to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// The error messages validation produces for `Cfg(n: <literal>)` where `n`
+    /// is declared as `type_name`.
+    async fn numeric_errors(type_name: &str, literal: &str) -> Vec<String> {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = single_field_type(type_name);
+        let content = format!("Cfg(n: {literal})");
+        validate_ron_with_analyzer(&content, None, &type_info, analyzer)
+            .await
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// An integer literal the field's type cannot hold makes `ron` refuse the
+    /// whole document with "Integer is out of bounds". Letting it through means
+    /// the config looks clean in the editor and then fails to load, which is
+    /// the one thing this diagnostic exists to prevent.
+    #[tokio::test]
+    async fn test_integer_literal_out_of_range_is_reported() {
+        for (type_name, literal) in [
+            ("u16", "-1"),
+            ("u16", "99999"),
+            ("u8", "256"),
+            ("u32", "-1"),
+            ("usize", "-5"),
+            ("i8", "128"),
+            ("i8", "-129"),
+            ("i16", "32768"),
+            ("i32", "2147483648"),
+        ] {
+            let errors = numeric_errors(type_name, literal).await;
+            assert!(
+                errors.iter().any(|m| m.contains(literal)
+                    && m.contains("out of range")
+                    && m.contains(type_name)),
+                "{literal} should be out of range for {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// The boundary values themselves, and anything inside them, deserialize
+    /// fine and must not be reported.
+    #[tokio::test]
+    async fn test_integer_literal_in_range_is_accepted() {
+        for (type_name, literal) in [
+            ("u8", "0"),
+            ("u8", "255"),
+            ("u16", "65535"),
+            ("u32", "4294967295"),
+            ("u64", "18446744073709551615"),
+            ("i8", "-128"),
+            ("i8", "127"),
+            ("i16", "-32768"),
+            ("i32", "2147483647"),
+            ("i64", "-9223372036854775808"),
+            // Wide enough to hold every literal `ron` can hand back.
+            ("i128", "18446744073709551615"),
+            ("u128", "18446744073709551615"),
+        ] {
+            let errors = numeric_errors(type_name, literal).await;
+            assert!(
+                errors.is_empty(),
+                "{literal} is in range for {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// serde widens an integer literal into a float field, so `ratio: 1` for an
+    /// `f64` is a perfectly good document. Reporting it put a red squiggle on
+    /// config that loads without complaint.
+    #[tokio::test]
+    async fn test_integer_literal_accepted_for_float_field() {
+        for (type_name, literal) in [
+            ("f32", "0"),
+            ("f32", "1"),
+            ("f64", "1"),
+            ("f64", "-3"),
+            ("f64", "1.5"),
+        ] {
+            let errors = numeric_errors(type_name, literal).await;
+            assert!(
+                errors.is_empty(),
+                "{literal} is valid for {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// A float literal in an integer field is still wrong — `ron` will not
+    /// truncate it — and a number in a field that isn't numeric at all is still
+    /// wrong too.
+    #[tokio::test]
+    async fn test_float_literal_rejected_for_integer_field() {
+        let errors = numeric_errors("u16", "1.5").await;
+        assert!(
+            errors.iter().any(|m| m.contains("expected u16, got float")),
+            "got {errors:?}"
+        );
+
+        let errors = numeric_errors("String", "1").await;
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("expected String, got number")),
+            "got {errors:?}"
+        );
+    }
+
+    /// The range check has to reach through the generic wrappers, since that is
+    /// where the integer actually lands.
+    #[tokio::test]
+    async fn test_integer_range_checked_through_wrappers() {
+        for (type_name, literal) in [
+            ("Option<u8>", "Some(300)"),
+            ("Option<u8>", "300"),
+            ("Box<u8>", "300"),
+            ("Vec<u8>", "[1, 300]"),
+        ] {
+            let errors = numeric_errors(type_name, literal).await;
+            assert!(
+                errors
+                    .iter()
+                    .any(|m| m.contains("300") && m.contains("out of range") && m.contains("u8")),
+                "{literal} should be out of range for {type_name}, got {errors:?}"
+            );
+        }
+
+        // `None` and in-range payloads stay clean.
+        for (type_name, literal) in [
+            ("Option<u8>", "None"),
+            ("Option<u8>", "Some(200)"),
+            ("Box<u8>", "200"),
+            ("Vec<u8>", "[1, 200]"),
+        ] {
+            let errors = numeric_errors(type_name, literal).await;
+            assert!(
+                errors.is_empty(),
+                "{literal} is valid for {type_name}, got {errors:?}"
+            );
+        }
     }
 
     #[tokio::test]

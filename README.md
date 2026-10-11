@@ -149,7 +149,9 @@ Opening a RON file matched by the pattern above gets you:
   - `missing-required-field` - a field with no default was left out
   - `unknown-variant` - no such variant on the enum the field expects
   - `type-mismatch` - a primitive of the wrong shape, e.g. a string where a
-    `u16` is expected
+    `u16` is expected, or an integer the field's type can't hold (`port: -1`
+    for a `u16`), which `ron` refuses to deserialize. An integer literal in a
+    float field is fine — serde widens it — and is not reported.
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file
 - code actions:
