@@ -40,12 +40,18 @@ impl Document {
             return;
         };
 
-        let start_byte = ts_utils::position_to_byte_offset(&self.content, range.start);
-        let old_end_byte = ts_utils::position_to_byte_offset(&self.content, range.end);
+        // A range whose end precedes its start is not something the protocol
+        // allows, but splicing with a backwards range panics, and a panic here
+        // takes the whole server down along with every other open document. Put
+        // the two ends back in order instead.
+        let (range_start, range_end) = order(range.start, range.end);
+
+        let start_byte = ts_utils::position_to_byte_offset(&self.content, range_start);
+        let old_end_byte = ts_utils::position_to_byte_offset(&self.content, range_end);
 
         // tree-sitter Points use byte columns
-        let start_position = byte_point(&self.content, start_byte, range.start.line as usize);
-        let old_end_position = byte_point(&self.content, old_end_byte, range.end.line as usize);
+        let start_position = byte_point(&self.content, start_byte, range_start.line as usize);
+        let old_end_position = byte_point(&self.content, old_end_byte, range_end.line as usize);
 
         self.content
             .replace_range(start_byte..old_end_byte, &change.text);
@@ -73,6 +79,15 @@ impl Document {
             });
         }
         self.tree = ts_utils::parse_with(&self.content, self.tree.as_ref());
+    }
+}
+
+/// The two positions in document order, swapped if they arrive reversed.
+fn order(a: Position, b: Position) -> (Position, Position) {
+    if (a.line, a.character) <= (b.line, b.character) {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -517,7 +532,10 @@ impl LanguageServer for Backend {
         params: DocumentRangeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri.to_string();
-        let range = params.range;
+        // Put a reversed selection back in order: `end_line - start_line` below
+        // underflows on one, which panics and takes the server down.
+        let (range_start, range_end) = order(params.range.start, params.range.end);
+        let range = Range::new(range_start, range_end);
 
         let documents = self.documents.read().await;
         if let Some(doc) = documents.get(&uri) {
@@ -2086,6 +2104,95 @@ PostReference(
         let tree = doc.tree.as_ref().unwrap();
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
         assert_eq!(fields, vec!["title".to_string()]);
+    }
+
+    /// A change range whose end precedes its start is malformed, but the server
+    /// has to survive one: splicing the document with a backwards range panics,
+    /// and a panic in a notification handler tears down the whole server
+    /// process along with every other document the editor has open.
+    #[test]
+    fn test_incremental_change_with_reversed_range() {
+        let mut doc = Document::new("User(\n    id: 1,\n    name: \"Bob\",\n)".to_string());
+
+        // The same edit as `test_incremental_change_mid_document`, with the two
+        // ends of the range handed over the wrong way round.
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(2, 14), Position::new(2, 11))),
+            range_length: None,
+            text: "Alice".to_string(),
+        });
+
+        assert_eq!(doc.content, "User(\n    id: 1,\n    name: \"Alice\",\n)");
+
+        // ...and the reused tree has to agree with it, not just the content.
+        let tree = doc.tree.as_ref().unwrap();
+        assert_eq!(
+            tree.root_node().to_sexp(),
+            ts_utils::parse(&doc.content).unwrap().root_node().to_sexp()
+        );
+    }
+
+    /// Same for a reversed range spanning lines, which is the case that reaches
+    /// the multi-line branch of the splice.
+    #[test]
+    fn test_incremental_change_with_reversed_multiline_range() {
+        let mut doc = Document::new("User(\n    id: 1,\n    name: \"Bob\",\n)".to_string());
+
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(2, 4), Position::new(1, 4))),
+            range_length: None,
+            text: "age: 3,\n    ".to_string(),
+        });
+
+        assert_eq!(doc.content, "User(\n    age: 3,\n    name: \"Bob\",\n)");
+        let tree = doc.tree.as_ref().unwrap();
+        assert_eq!(
+            tree.root_node().to_sexp(),
+            ts_utils::parse(&doc.content).unwrap().root_node().to_sexp()
+        );
+    }
+
+    /// `textDocument/rangeFormatting` over a reversed selection used to compute
+    /// `end_line - start_line`, which underflows and panics. Formatting a
+    /// backwards range has to give the same answer as formatting the ordered
+    /// one.
+    #[tokio::test]
+    async fn test_range_formatting_with_reversed_range() {
+        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let url = Url::parse("file:///test.ron").unwrap();
+        let content = "User(\n   id:1,\n   name:\"Bob\",\n)";
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: url.clone(),
+                    language_id: "ron".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+
+        let format = async |range| {
+            backend
+                .range_formatting(DocumentRangeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: url.clone() },
+                    range,
+                    options: Default::default(),
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .expect("range formatting must not fail")
+        };
+
+        let forwards = format(Range::new(Position::new(0, 0), Position::new(3, 1))).await;
+        let backwards = format(Range::new(Position::new(3, 1), Position::new(0, 0))).await;
+
+        assert!(
+            forwards.is_some(),
+            "the fixture should have something to reformat"
+        );
+        assert_eq!(forwards, backwards);
     }
 
     #[test]
