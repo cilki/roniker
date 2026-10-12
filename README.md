@@ -173,13 +173,23 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
   `SCREAMING_SNAKE_CASE`, `kebab-case`, and `SCREAMING-KEBAB-CASE`. The
   `rename(deserialize = "...")` form is read too, since that's the direction a
   config file travels.
-- `#[serde(alias = "...")]` names are accepted alongside the primary one.
+- `#[serde(alias = "...")]` names are accepted alongside the primary one — on a
+  struct field. An alias on an *enum variant* is dropped by the analyzer, so the
+  `mode: production` serde accepts for an aliased `Prod` is reported as
+  `unknown-variant` and completion never offers it.
 - `#[serde(skip)]` and `#[serde(skip_deserializing)]` fields are left out of
-  completions and reported as unknown if written.
+  completions and reported as unknown if written. That holds for a struct's
+  fields and for a variant's fields; on the *variant itself* the two are
+  ignored, so a skipped variant is still completed and still accepted.
 - `#[serde(flatten)]` expands the inner struct's fields into the outer one. When
   the flattened type can't be resolved - a `HashMap`, say - unknown-field
   reporting is switched off for that struct, because serde would accept any
-  extra key there.
+  extra key there. Neither applies inside an enum's struct variant, whose fields
+  are never flattened: the inner names serde requires come back as
+  `unknown-field`, the flattened field itself as `missing-required-field`, and
+  the offered *Add 1 required field* inserts that field name — which serde will
+  reject. Keep `flatten` out of struct variants until
+  [#90](https://git.cilki.net/cilki/roniker/issues/90) is fixed.
 - A field stops counting as required if it is an `Option<T>`, carries
   `#[serde(default)]` or `#[serde(default = "path")]`, or its container carries a
   container-level `#[serde(default)]`. A bare `#[derive(Default)]` is *not*
