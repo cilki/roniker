@@ -698,6 +698,66 @@ mod tests {
         assert!(config.is_some(), "Config should be at inferred path");
     }
 
+    /// The module prefix derived from a file path is what a build script's root
+    /// type has to line up with, so the rules are documented in the README and
+    /// pinned here. The crate root is the *first* component named `src`, which
+    /// an absolute path can just as well find above the crate itself.
+    #[test]
+    fn test_file_path_to_module_path() {
+        let analyzer = RustAnalyzer::new();
+
+        for (path, expected) in [
+            ("src/config.rs", "crate::config"),
+            ("src/config/mod.rs", "crate::config"),
+            ("src/lib.rs", "crate"),
+            ("src/main.rs", "crate"),
+            ("src", "crate"),
+            ("/home/you/code/app/src/config.rs", "crate::config"),
+            // A `src` directory above the crate is taken for the crate root.
+            ("/home/you/src/app/src/config.rs", "crate::app::src::config"),
+            // No `src` component at all: types keep their bare names.
+            ("examples/data/config_types.rs", ""),
+        ] {
+            assert_eq!(
+                analyzer.file_path_to_module_path(&PathBuf::from(path)),
+                expected,
+                "module path for {path}"
+            );
+        }
+    }
+
+    /// Because a lookup accepts any `::`-delimited tail of a registered path,
+    /// naming the root type by its bare name works whatever prefix the file
+    /// path happened to produce — which is what the README recommends. Spelling
+    /// out a prefix that doesn't match, on the other hand, resolves to nothing.
+    #[test]
+    fn test_root_type_resolves_by_bare_name_whatever_the_prefix() {
+        let source = "pub struct Configuration { pub ephemeral: bool }";
+
+        for path in [
+            "/home/you/code/app/src/config.rs",
+            "/home/you/code/app/src/main.rs",
+            "/home/you/src/app/src/config.rs",
+        ] {
+            let mut analyzer = RustAnalyzer::with_root_type("Configuration");
+            analyzer.add_source(&PathBuf::from(path), source).unwrap();
+            assert!(
+                analyzer.root_type_info().is_some(),
+                "bare root type name should resolve for {path}"
+            );
+        }
+
+        let mut analyzer = RustAnalyzer::with_root_type("crate::config::Configuration");
+        analyzer
+            .add_source(&PathBuf::from("/home/you/src/app/src/config.rs"), source)
+            .unwrap();
+        assert!(
+            analyzer.root_type_info().is_none(),
+            "an ancestor `src` registers crate::app::src::config::Configuration, \
+             which crate::config::Configuration is not a tail of"
+        );
+    }
+
     #[test]
     fn test_add_type_directly() {
         let mut analyzer = RustAnalyzer::new();
