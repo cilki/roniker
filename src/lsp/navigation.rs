@@ -14,23 +14,37 @@ pub fn navigate_type_contexts(
     let mut current_type_info = start;
 
     for context in contexts.iter().skip(1) {
-        let info = match current_type_info {
-            Some(ref info) => info.clone(),
-            None => break,
+        // Once a step fails there is nothing left to navigate from, and `take`
+        // has already left the answer as `None`.
+        let Some(info) = current_type_info.take() else {
+            break;
         };
-
-        current_type_info = match &context.type_name {
-            Some(type_name) => step_by_type_name(analyzer, &info, type_name),
-            // The value omitted its struct name, so there is no name to look
-            // the type up by. The field it is the value of declares it.
-            None => context
-                .field_name
-                .as_deref()
-                .and_then(|field| step_by_field_name(analyzer, &info, field)),
-        };
+        current_type_info = step_type_context(analyzer, &info, context);
     }
 
     current_type_info
+}
+
+/// Resolve one step of the nesting path: the type of the struct value that
+/// `context` describes, nested directly inside `info`.
+///
+/// Callers that already know the enclosing struct's type — a walk down the
+/// document, say — can step with this instead of navigating the whole path from
+/// the root again.
+pub fn step_type_context(
+    analyzer: &RustAnalyzer,
+    info: &TypeInfo,
+    context: &TypeContext,
+) -> Option<TypeInfo> {
+    match &context.type_name {
+        Some(type_name) => step_by_type_name(analyzer, info, type_name),
+        // The value omitted its struct name, so there is no name to look the
+        // type up by. The field it is the value of declares it.
+        None => context
+            .field_name
+            .as_deref()
+            .and_then(|field| step_by_field_name(analyzer, info, field)),
+    }
 }
 
 /// Resolve the type of a named struct value nested in `info`.

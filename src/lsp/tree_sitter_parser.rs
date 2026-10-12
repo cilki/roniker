@@ -37,10 +37,7 @@ pub fn find_type_context_at_position(
         // Walk up the tree to collect all struct contexts
         for node in ancestors(current) {
             if node.kind() == "struct" {
-                contexts.push(TypeContext {
-                    type_name: struct_name(&node, content).map(str::to_string),
-                    field_name: owning_field_name(&node, content).map(str::to_string),
-                });
+                contexts.push(struct_type_context(&node, content));
             }
         }
     }
@@ -48,6 +45,15 @@ pub fn find_type_context_at_position(
     // Reverse to get outermost to innermost
     contexts.reverse();
     contexts
+}
+
+/// The type context a `struct` node contributes: the type name the value writes
+/// out, when it writes one, and the field it is the value of.
+pub fn struct_type_context(node: &Node, content: &str) -> TypeContext {
+    TypeContext {
+        type_name: struct_name(node, content).map(str::to_string),
+        field_name: owning_field_name(node, content).map(str::to_string),
+    }
 }
 
 /// The name of the field whose value `node` is, if any.

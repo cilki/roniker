@@ -670,16 +670,7 @@ impl LanguageServer for Backend {
 
         // Collect the exact name-node ranges of matching fields
         let mut changes = Vec::new();
-        for field_node in ts_utils::descendants_by_kind(&tree, "field") {
-            let Some(node) = field_node.child(0) else {
-                continue;
-            };
-            if ts_utils::node_text(&node, &content) != Some(&field_name) {
-                continue;
-            }
-
-            let node_pos = ts_utils::node_start_position(&node, &content);
-            let owner = self.resolve_owner_type_at(&content, Some(&tree), node_pos);
+        for (node, owner) in self.fields_named(&tree, &content, &field_name) {
             // When either side can't be resolved, fall back to matching by name
             if let (Some(target), Some(owner)) = (&target_type, &owner)
                 && target.name != owner.name
@@ -882,6 +873,77 @@ impl Backend {
             .map(|t| tree_sitter_parser::find_type_context_at_position(t, content, position))
             .unwrap_or_default();
         navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
+    }
+
+    /// Every field in the document whose name is spelled `field_name`, as
+    /// `(name node, the type that owns it)` pairs in document order. A `None`
+    /// type means the value the field belongs to could not be resolved.
+    ///
+    /// This is [`Backend::resolve_owner_type_at`] for a whole document at once,
+    /// and is what a caller wanting more than one position should use.
+    /// Resolving positions one at a time re-walks the nesting path up to the
+    /// root and re-resolves every step of it for each of them, so a pass over
+    /// the document costs time proportional to its size *squared*. The type of
+    /// a struct value follows from the type of the value it sits in, so walking
+    /// the document downwards instead resolves each of them exactly once.
+    fn fields_named<'a>(
+        &self,
+        tree: &'a tree_sitter::Tree,
+        content: &str,
+        field_name: &str,
+    ) -> Vec<(tree_sitter::Node<'a>, Option<rust_analyzer::TypeInfo>)> {
+        let root = self.resolve_root_type_info(content, Some(tree));
+        // The type owning each struct value's fields, by node id, filled in as
+        // the walk descends. Nodes carry the id of the struct value enclosing
+        // them rather than the type itself, which keeps what the walk passes
+        // around to one `usize`.
+        let mut owners: HashMap<usize, Option<rust_analyzer::TypeInfo>> = HashMap::new();
+        let mut found = Vec::new();
+        // Children are pushed in reverse so that they pop in document order.
+        let mut stack = vec![(tree.root_node(), None)];
+
+        while let Some((node, enclosing)) = stack.pop() {
+            let enclosing = if node.kind() == "struct" {
+                let owner = match enclosing
+                    .and_then(|id| owners.get(&id))
+                    .and_then(Option::as_ref)
+                {
+                    // One step down from the value this one sits in.
+                    Some(outer) => navigation::step_type_context(
+                        &self.rust_analyzer,
+                        outer,
+                        &tree_sitter_parser::struct_type_context(&node, content),
+                    ),
+                    // Nothing encloses it, so it is the document's root value.
+                    None if enclosing.is_none() => root.clone(),
+                    // The value it sits in didn't resolve, so neither can it.
+                    None => None,
+                };
+                owners.insert(node.id(), owner);
+                Some(node.id())
+            } else {
+                enclosing
+            };
+
+            if node.kind() == "field"
+                && let Some(name) = node.child(0)
+                && ts_utils::node_text(&name, content) == Some(field_name)
+            {
+                let owner = enclosing
+                    .and_then(|id| owners.get(&id))
+                    .and_then(Option::as_ref)
+                    .cloned();
+                found.push((name, owner));
+            }
+
+            for i in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(i) {
+                    stack.push((child, enclosing));
+                }
+            }
+        }
+
+        found
     }
 
     fn format_type_hover(&self, type_info: &rust_analyzer::TypeInfo) -> String {
@@ -2284,6 +2346,151 @@ PostReference(
         );
         assert_eq!(edits[0].range.start.line, 3);
         assert_eq!(edits[0].new_text, "username");
+    }
+
+    /// A self-nesting type, for the rename tests that care about how the cost
+    /// of a rename grows with the document.
+    fn self_nesting_analyzer() -> RustAnalyzer {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Server");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "inner".to_string(),
+                    type_name: "Server".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        analyzer
+    }
+
+    /// Renaming has to know which type owns each field spelled the way the one
+    /// under the cursor is. Resolving that from each candidate's position
+    /// re-walks the nesting path to the root and re-resolves every step of it
+    /// once per candidate, so the work grew with the square of the document:
+    /// renaming one field in a 19 KB document nested 800 values deep took 79
+    /// seconds in a release build, and the editor that asked for it waits that
+    /// long for an answer. Resolving each struct value's type once, on a single
+    /// walk down the document, is linear.
+    ///
+    /// The bound below is deliberately loose. What it is testing is the
+    /// complexity class, not the constant: the walk answers this in a few
+    /// milliseconds, while re-resolving per candidate took 48 seconds at this
+    /// depth in the unoptimized build the tests run in.
+    #[tokio::test]
+    async fn test_rename_cost_does_not_grow_with_the_square_of_the_document() {
+        let backend = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+
+        let depth = 400;
+        let content = format!(
+            "{}Server(host: \"innermost\"){}",
+            "Server(host: \"x\", inner: ".repeat(depth),
+            ")".repeat(depth)
+        );
+        let uri = "file:///deep.ron";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content));
+
+        let started = std::time::Instant::now();
+        let result = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::parse(uri).unwrap(),
+                    },
+                    // the outermost `host`
+                    position: Position::new(0, 7),
+                },
+                new_name: "hostname".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let changes = result
+            .expect("rename should produce edits")
+            .changes
+            .unwrap();
+        let edits = &changes[&Url::parse(uri).unwrap()];
+        assert_eq!(
+            edits.len(),
+            depth + 1,
+            "every nested Server owns a 'host', so all of them are renamed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "renaming in a {depth}-deep document took {elapsed:?}"
+        );
+    }
+
+    /// The owner of a field is resolved on a walk down the document, so sibling
+    /// values have to be resolved independently of each other: every entry of a
+    /// list owns its own copy of the field, and renaming one renames all of
+    /// them.
+    #[tokio::test]
+    async fn test_rename_covers_every_entry_of_a_list() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "servers".to_string(),
+                type_name: "Vec<Server>".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+
+        let content = "Config(\n    servers: [\n        Server(host: \"a\"),\n        Server(host: \"b\"),\n        Server(host: \"c\"),\n    ],\n)";
+        let uri = "file:///list.ron";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+
+        let result = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::parse(uri).unwrap(),
+                    },
+                    // the `host` of the middle entry
+                    position: Position::new(3, 16),
+                },
+                new_name: "hostname".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let changes = result
+            .expect("rename should produce edits")
+            .changes
+            .unwrap();
+        let edits = &changes[&Url::parse(uri).unwrap()];
+        let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+        assert_eq!(lines, vec![2, 3, 4], "all three entries: {edits:?}");
     }
 
     #[tokio::test]

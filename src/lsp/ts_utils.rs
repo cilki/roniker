@@ -248,23 +248,6 @@ pub fn find_ancestor_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     ancestors(node).skip(1).find(|n| n.kind() == kind)
 }
 
-/// Collect all descendant nodes of a given kind, depth-first
-pub fn descendants_by_kind<'a>(tree: &'a Tree, kind: &str) -> Vec<Node<'a>> {
-    let mut results = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == kind {
-            results.push(node);
-        }
-        for i in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(i) {
-                stack.push(child);
-            }
-        }
-    }
-    results
-}
-
 /// Get all children of a node with a specific kind
 pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
     let mut results = Vec::new();
@@ -443,6 +426,23 @@ pub fn extract_enum_variant(node: &Node, content: &str) -> Option<ParsedEnumVari
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collect all descendant nodes of a given kind, depth-first.
+    fn descendants_by_kind<'a>(tree: &'a Tree, kind: &str) -> Vec<Node<'a>> {
+        let mut results = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                results.push(node);
+            }
+            for i in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(i) {
+                    stack.push(child);
+                }
+            }
+        }
+        results
+    }
 
     /// A RON document nesting `depth` structs inside each other.
     fn nested(depth: usize) -> String {
