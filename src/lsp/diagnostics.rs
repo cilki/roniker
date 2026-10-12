@@ -294,13 +294,8 @@ async fn validate_typed_value(
         false => value_text.and_then(|text| ron::from_str::<Value>(text).ok()),
     };
 
-    let Some(error_msg) = check_type_mismatch_with_enum_validation(
-        parsed_value.as_ref(),
-        declared_type,
-        value_text,
-        analyzer,
-    )
-    .await
+    let Some(error_msg) =
+        check_declared_type(parsed_value.as_ref(), declared_type, value_text, analyzer)
     else {
         return Vec::new();
     };
@@ -594,134 +589,101 @@ async fn validate_enum_node(
     Box::pin(validate_struct_node(node, content, &expected, analyzer)).await
 }
 
-/// Type checking with enum variant validation (async, uses analyzer)
-async fn check_type_mismatch_with_enum_validation(
-    value: Option<&Value>,
-    expected_type: &str,
-    value_text: Option<&str>,
-    analyzer: &Arc<RustAnalyzer>,
-) -> Option<String> {
-    // If the expected type is custom (not primitive), we need special handling
-    if is_custom_type(expected_type)
-        && let Some(field_value_text) = value_text
-    {
-        let trimmed = field_value_text.trim();
-
-        // Extract the type/variant name from the RON text
-        let type_in_ron = trimmed.split('(').next().unwrap_or(trimmed).trim();
-
-        // Check if the expected type is a known enum first — if so, validate the variant name
-        // regardless of case (serde rename_all can produce lowercase/snake_case variant names)
-        if !type_in_ron.is_empty() && !is_primitive_type(type_in_ron) {
-            if let Some(type_info) = analyzer.get_type_info(expected_type) {
-                if matches!(type_info.kind, TypeKind::Enum(_)) {
-                    return match type_info.find_variant(type_in_ron) {
-                        Some(_) => None,
-                        None => Some(format!(
-                            "unknown variant '{}' for enum {}",
-                            type_in_ron, expected_type
-                        )),
-                    };
-                } else if type_in_ron
-                    .chars()
-                    .next()
-                    .map(|c| c.is_uppercase())
-                    .unwrap_or(false)
-                {
-                    // Expected type is a struct - the name in RON should match or be unnamed
-                    let expected_simple = short_name(expected_type);
-                    if type_in_ron != expected_simple {
-                        // Different type name - check if it's a known type or unknown
-                        if analyzer.get_type_info(type_in_ron).is_none() {
-                            return Some(format!("unknown type '{}'", type_in_ron));
-                        }
-                        // Known but different type - fall through to basic check
-                    } else {
-                        // Type names match - no type mismatch
-                        return None;
-                    }
-                }
-            } else {
-                // Expected type is not registered in analyzer
-                // If the RON type matches the expected type name, that's fine
-                let expected_simple = short_name(expected_type);
-                if type_in_ron == expected_simple {
-                    return None;
-                }
-                // Different type - check if it's known
-                if trimmed.contains('(') && analyzer.get_type_info(type_in_ron).is_none() {
-                    return Some(format!("unknown type '{}'", type_in_ron));
-                }
-                // RON type is known or no parens - fall through
-            }
-        }
-    }
-
-    // Do basic type checking for remaining cases
-    check_type_mismatch_deep(value, expected_type, value_text)
-}
-
-/// Deep type checking that also validates custom types by looking at raw text.
+/// What is wrong with a value declared to be `expected_type`, worded as the
+/// tail of a "Type mismatch: ..." message, or `None` when nothing is.
 ///
-/// `value` is the field's value parsed as RON, needed only to check primitives
-/// and standard library generic types; callers may leave it out for custom
-/// types, which are judged from `value_text` alone.
-fn check_type_mismatch_deep(
+/// A primitive or a standard-library generic is judged from `value`, the value
+/// parsed as RON. A custom struct or enum cannot be: `ron::Value` keeps a
+/// struct's shape but not the type it named, so those are judged from
+/// `value_text`, the value's own source text — which is why callers who know
+/// the declared type is custom may leave `value` out entirely.
+fn check_declared_type(
     value: Option<&Value>,
     expected_type: &str,
     value_text: Option<&str>,
+    analyzer: &RustAnalyzer,
 ) -> Option<String> {
-    let clean_type = normalize_type(expected_type);
-
-    // First check if it's a primitive type or standard library generic type
     if !is_custom_type(expected_type) {
         return check_type_mismatch(value?, expected_type);
     }
 
-    // For custom types (structs/enums), we need to check the raw text
-    // because Value loses the type information
+    let expected = normalize_type(expected_type);
     let trimmed = value_text?.trim();
+    // `Name(..)` and a bare `Name` both name a type or variant. RON's unnamed
+    // struct syntax (`(..)`) leaves nothing before the paren and so names
+    // nothing, which never contradicts the declared type.
+    let named = trimmed.split('(').next().unwrap_or("").trim();
 
-    // Check if expected type is a custom struct/enum (starts with uppercase)
-    if clean_type
-        .chars()
-        .next()
-        .map(|c| c.is_uppercase())
-        .unwrap_or(false)
-    {
-        // Expected a struct/enum
-        // The value should start with TypeName( or be a variant name
+    // A name that could be a type or a variant is resolved against the
+    // analyzer; anything else (`42`, `"x"`) is judged by its shape below.
+    if !named.is_empty() && !is_primitive_type(named) {
+        // The declared type resolves here: [`validate_nested_value`] runs
+        // first and reports an unresolvable one itself, which stops this check
+        // from running at all.
+        if let Some(type_info) = analyzer.get_type_info(&expected)
+            && matches!(type_info.kind, TypeKind::Enum(_))
+        {
+            // An enum's value spells out one of its variants. Which spellings
+            // are accepted is serde's business — `rename_all` can lower-case
+            // them — so `find_variant` has the last word.
+            return match type_info.find_variant(named) {
+                Some(_) => None,
+                None => Some(format!(
+                    "unknown variant '{}' for enum {}",
+                    named, expected_type
+                )),
+            };
+        }
 
-        // Check if it looks like a struct instantiation TypeName(...) or unnamed (...)
-        if trimmed.contains('(') {
-            // Extract the type name before the paren
-            let type_in_text = trimmed.split('(').next().unwrap_or("").trim();
-            let expected_simple = short_name(&clean_type);
-
-            // Allow unnamed struct syntax - empty type_in_text means type is inferred
-            if !type_in_text.is_empty() && type_in_text != expected_simple {
-                return Some(format!("expected {}, got {}", expected_type, type_in_text));
-            }
-        } else {
-            // It's a bare value - could be an enum variant or a primitive
-            // If it's a number, string literal, or bool, that's wrong
-            if trimmed.parse::<i64>().is_ok() {
-                return Some(format!("expected {}, got integer", expected_type));
-            }
-            if trimmed.parse::<f64>().is_ok() {
-                return Some(format!("expected {}, got float", expected_type));
-            }
-            if trimmed.starts_with('"') {
-                return Some(format!("expected {}, got string", expected_type));
-            }
-            if trimmed == "true" || trimmed == "false" {
-                return Some(format!("expected {}, got bool", expected_type));
-            }
-            // Otherwise assume it's an enum variant (we'd need more context to validate)
+        // Otherwise a struct, whose value names the struct itself.
+        if named == short_name(&expected) {
+            return None;
+        }
+        // A different name that nothing in the workspace defines is a
+        // misspelled or missing type, which is worth saying instead of just
+        // reporting it as the wrong one. Only an uppercase name is read as a
+        // type at all.
+        if named.starts_with(char::is_uppercase) && analyzer.get_type_info(named).is_none() {
+            return Some(format!("unknown type '{}'", named));
         }
     }
 
-    None
+    // Nothing named the declared type, so the value's own shape is what is
+    // left to report — and only when the declared type is something a RON
+    // value could have named in the first place, which a tuple type is not.
+    if !expected.starts_with(char::is_uppercase) {
+        return None;
+    }
+    if trimmed.contains('(') {
+        if named.is_empty() {
+            // Unnamed struct syntax infers the type, so it always fits.
+            return None;
+        }
+        return Some(format!("expected {}, got {}", expected_type, named));
+    }
+    // A bare value. Anything that is not a literal is most likely an enum
+    // variant, which there is no enum definition here to check it against.
+    Some(format!(
+        "expected {}, got {}",
+        expected_type,
+        literal_kind(trimmed)?
+    ))
+}
+
+/// What a bare RON literal is, named the way a "got ..." message wants it.
+/// `None` when the text is not a literal at all.
+fn literal_kind(trimmed: &str) -> Option<&'static str> {
+    if trimmed.parse::<i64>().is_ok() {
+        Some("integer")
+    } else if trimmed.parse::<f64>().is_ok() {
+        Some("float")
+    } else if trimmed.starts_with('"') {
+        Some("string")
+    } else if trimmed == "true" || trimmed == "false" {
+        Some("bool")
+    } else {
+        None
+    }
 }
 
 /// The inclusive range of integers the named Rust integer type accepts, or
@@ -3080,5 +3042,130 @@ mod tests {
         )
         .unwrap();
         assert_eq!(under, "\"nope\"");
+    }
+
+    /// `Config(mode: Mode, server: Server)`, with a second struct `Other` that
+    /// happens to have the same field as `Server` — so that a value naming the
+    /// wrong type still passes the field checks and gets as far as the
+    /// surface-level type check.
+    fn named_value_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Ephemeral".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Persistent".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        for name in ["Server", "Other"] {
+            analyzer.add_type(TypeInfo {
+                name: name.to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+        }
+        let config = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "mode".to_string(),
+                    type_name: "Mode".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "server".to_string(),
+                    type_name: "Server".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        (config, Arc::new(analyzer))
+    }
+
+    /// The type-mismatch messages for a document, in order.
+    async fn type_mismatches(content: &str) -> Vec<String> {
+        let (config, analyzer) = named_value_fixture();
+        validate_ron_with_analyzer(content, None, &config, analyzer)
+            .await
+            .into_iter()
+            .filter(|d| d.code == code(codes::TYPE_MISMATCH))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// What a value *names* is checked against the type the field is declared
+    /// as, once the field-by-field checks have found nothing to say. Each of
+    /// these spellings is wrong in a different way and the message has to name
+    /// which: a bare value in an enum field is not one of its variants, a
+    /// struct value naming a type that doesn't exist is a different mistake
+    /// from one naming a type that does, and a literal where a struct belongs
+    /// is reported by what the literal is.
+    #[tokio::test]
+    async fn test_named_type_is_checked_against_the_declared_type() {
+        for (content, expected) in [
+            // A value that names no variant of the enum it is declared as.
+            (
+                r#"Config(mode: 42, server: Server(host: "x"))"#,
+                "Type mismatch: unknown variant '42' for enum Mode",
+            ),
+            // A struct value naming a type that is registered, but not the one
+            // the field is declared as.
+            (
+                r#"Config(mode: Ephemeral, server: Other(host: "x"))"#,
+                "Type mismatch: expected Server, got Other",
+            ),
+            // A struct value naming a type nothing in the workspace defines.
+            (
+                r#"Config(mode: Ephemeral, server: Bogus(host: "x"))"#,
+                "Type mismatch: unknown type 'Bogus'",
+            ),
+            // A literal where a struct belongs, reported by what it is.
+            (
+                r#"Config(mode: Ephemeral, server: 7)"#,
+                "Type mismatch: expected Server, got integer",
+            ),
+            (
+                r#"Config(mode: Ephemeral, server: "x")"#,
+                "Type mismatch: expected Server, got string",
+            ),
+            (
+                r#"Config(mode: Ephemeral, server: true)"#,
+                "Type mismatch: expected Server, got bool",
+            ),
+        ] {
+            assert_eq!(
+                type_mismatches(content).await,
+                vec![expected.to_string()],
+                "for {content}"
+            );
+        }
+    }
+
+    /// RON lets a struct value omit its type name, which leaves nothing to
+    /// disagree with the declared type — at the root and nested alike.
+    #[tokio::test]
+    async fn test_unnamed_value_never_mismatches_its_declared_type() {
+        for content in [
+            r#"Config(mode: Ephemeral, server: (host: "x"))"#,
+            r#"(mode: Ephemeral, server: (host: "x"))"#,
+        ] {
+            assert_eq!(
+                type_mismatches(content).await,
+                Vec::<String>::new(),
+                "for {content}"
+            );
+        }
     }
 }
