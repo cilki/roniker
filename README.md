@@ -102,9 +102,12 @@ pub async fn run_lsp() -> Result<()> {
 
 The second argument to `serve` decides whether informational diagnostics are
 published alongside the warnings and errors. These are inline type annotations
-(`ephemeral: bool`) attached to the fields of the root value — only those whose
-value doesn't already name its type, and only at the top level, so fields of
-nested structs don't get one. Pass `false` to publish only real problems.
+(`ephemeral: bool`) attached to the fields of the root value, and to those
+alone: a nested struct's fields never get one, and neither do the fields of a
+root value that is an enum variant. Within the root value, a field is annotated
+only when its value names nothing itself — which excludes a named struct
+(`server: ServerConfig(...)`) and a bare name such as an enum variant
+(`log_level: Info`). Pass `false` to publish only real problems.
 
 Now you should be able to run `<app> lsp` and it will start reading stdin and
 writing LSP messages to stdout.
@@ -161,15 +164,23 @@ Opening a RON file matched by the pattern above gets you:
     analyzer, which usually means the build script is missing a source file
 - code actions:
   - *Add N required fields* and *Add all N missing fields* on the root value,
-    for structs and for enum variants alike
+    for structs and for enum variants alike. An enum root's titles name the
+    variant the fields belong to: *Add all 2 missing fields to Prod*
   - *Add N required fields to `path`* for any value nested below it — a struct,
     an enum variant, an element of a `Vec`, or the contents of a `Some(...)` —
     naming it the way the file spells it (`server.tls`, `mode::Prod`,
-    `certs[1]`). The fields go into that value's own parentheses
+    `certs[1]`). The fields go into that value's own parentheses. Only the
+    required-field form is offered here; there is no *Add all* counterpart below
+    the root
   - *Remove field '...'*, offered as a quick-fix on `unknown-field` and
-    `duplicate-field`
-  - *Make struct name explicit* and *Make field type explicit*, which turn
-    `server: (host: "localhost")` into `server: ServerConfig(host: "localhost")`
+    `duplicate-field`, at whatever depth the diagnostic was reported
+  - *Make struct name explicit: Configuration* and *Make field type explicit:
+    server ServerConfig*, which turn `server: (host: "localhost")` into
+    `server: ServerConfig(host: "localhost")`. Each title spells out what it
+    will insert. Unlike the missing-field actions these two don't descend: they
+    reach the root value and its own fields only, so an unnamed struct nested
+    deeper gets neither, and a document whose root value is an enum variant gets
+    neither at all
 
 ### Formatting
 
