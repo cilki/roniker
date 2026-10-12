@@ -356,6 +356,19 @@ pub fn struct_values<'a>(node: &Node<'a>, content: &str) -> Vec<Node<'a>> {
     values
 }
 
+/// The element values of an `array` node, with punctuation and comments left
+/// out. Empty for any other node kind.
+pub fn array_elements<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    if node.kind() != "array" {
+        return Vec::new();
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !is_comment(child))
+        .collect()
+}
+
 /// Find the main value node (the actual RON data, skipping annotation and comments)
 pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
     let root = tree.root_node();

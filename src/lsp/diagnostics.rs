@@ -277,8 +277,8 @@ async fn validate_typed_value(
         analyzer,
     ))
     .await;
-    if !deep.is_empty() {
-        return deep;
+    if !deep.diagnostics.is_empty() {
+        return deep.diagnostics;
     }
 
     // Primitive / surface-level type check. The value's own source text carries
@@ -289,9 +289,16 @@ async fn validate_typed_value(
     // source text alone. Parsing lazily keeps a nested struct's whole subtree
     // from being re-parsed once per level.
     let value_text = super::ts_utils::node_text(value_node, content);
-    let parsed_value = match is_custom_type(declared_type) {
-        true => None,
-        false => value_text.and_then(|text| ron::from_str::<Value>(text).ok()),
+    let parsed_value = if is_custom_type(declared_type) {
+        None
+    } else if let Some(shape) = deep.shape {
+        // The walk above went through the value itself and left behind what it
+        // found there, so there is nothing left to learn from deserializing it
+        // — which for the long array of structs that a large config file mostly
+        // consists of would mean parsing the whole document a second time.
+        Some(shape)
+    } else {
+        value_text.and_then(|text| ron::from_str::<Value>(text).ok())
     };
 
     let Some(error_msg) =
@@ -352,6 +359,21 @@ fn unwrap_some<'a>(node: &tree_sitter::Node<'a>, content: &str) -> Option<tree_s
     }
 }
 
+/// What recursing into a value turned up.
+struct Nested {
+    diagnostics: Vec<Diagnostic>,
+    /// The value's shape, filled in when the walk descended into the value
+    /// itself and so already knows what that shape is. The surface check in
+    /// [`validate_typed_value`] can then work from this instead of
+    /// deserializing the value to find out — which for a long array of structs
+    /// means copying the whole subtree.
+    ///
+    /// Only the shape matters: the contents are left empty, because whatever
+    /// the surface check would have made of them the walk has just reported
+    /// for itself, value by value and at each value's own position.
+    shape: Option<Value>,
+}
+
 /// Recurse into a value whose declared type is a custom struct/enum, or a
 /// generic wrapper around one.
 ///
@@ -364,8 +386,9 @@ async fn validate_nested_value<'a>(
     content: &str,
     field_type: &str,
     analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
+) -> Nested {
     let mut diagnostics = Vec::new();
+    let mut shape = None;
     let field_type_normalized = normalize_type(field_type);
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
@@ -378,30 +401,28 @@ async fn validate_nested_value<'a>(
     };
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
-        // Vec<CustomType> — validate every array element against the inner type
+        // Vec<CustomType> — every element is validated against the inner type
+        // exactly the way a field's value is validated against the field's
+        // type, so an element of the wrong shape is reported where it is
+        // written rather than at the array as a whole. Having been through the
+        // array, we also know it is one, which is all the surface check in
+        // [`validate_typed_value`] still wants from it.
+        //
+        // A `Vec` of primitives is left to that check instead: its elements
+        // carry no fields to recurse into, and deserializing them together
+        // costs less than visiting them one at a time.
         if is_custom_type(inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(inner_type) {
-                if value_node.kind() == "array" {
-                    let mut cursor = value_node.walk();
-                    for elem_node in value_node.children(&mut cursor) {
-                        if elem_node.kind() != "["
-                            && elem_node.kind() != "]"
-                            && elem_node.kind() != ","
-                        {
-                            let elem_diags = Box::pin(validate_node_with_type_info(
-                                &elem_node,
-                                content,
-                                inner_type_info,
-                                analyzer,
-                                false,
-                            ))
-                            .await;
-                            diagnostics.extend(elem_diags);
-                        }
-                    }
-                }
-            } else {
+            if analyzer.get_type_info(inner_type).is_none() {
                 diagnostics.push(unknown_type_diag(inner_type));
+            } else if value_node.kind() == "array" {
+                for element in super::ts_utils::array_elements(value_node) {
+                    let elem_diags = Box::pin(validate_typed_value(
+                        &element, content, inner_type, analyzer,
+                    ))
+                    .await;
+                    diagnostics.extend(elem_diags);
+                }
+                shape = Some(Value::Seq(Vec::new()));
             }
         }
     } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
@@ -452,7 +473,7 @@ async fn validate_nested_value<'a>(
         }
     }
 
-    diagnostics
+    Nested { diagnostics, shape }
 }
 
 /// The "unknown variant" diagnostic for a name the enum `type_info` does not
@@ -2583,6 +2604,91 @@ mod tests {
                 diagnostics
             );
         }
+    }
+
+    /// Every element of a `Vec<CustomType>` is checked against the element
+    /// type, and an element that isn't even the right kind of value is reported
+    /// where it is written — the array's own shape, meanwhile, is still checked
+    /// against the field's type.
+    #[tokio::test]
+    async fn test_vec_element_shape_is_checked_per_element() {
+        let leaf = TypeInfo {
+            name: "Leaf".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                has_default: true,
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "leaves".to_string(),
+                type_name: "Vec<Leaf>".to_string(),
+                has_default: true,
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(leaf);
+        let analyzer = Arc::new(analyzer);
+
+        // Line 3 holds the one element that is not a struct at all.
+        let content = "(\n    leaves: [\n        (port: 80),\n        42,\n    ],\n)";
+        let diagnostics = validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+        let mismatches: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string())))
+            .collect();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "only the bad element is a mismatch. Got: {:?}",
+            diagnostics
+        );
+        assert!(
+            mismatches[0].message.contains("expected Leaf, got integer"),
+            "Got: {:?}",
+            mismatches[0]
+        );
+        assert_eq!(
+            mismatches[0].range.start.line, 3,
+            "reported at the element, not at the array. Got: {:?}",
+            mismatches[0]
+        );
+
+        // The array itself still has to be an array.
+        let diagnostics =
+            validate_ron_with_analyzer("(leaves: 42)", None, &root, analyzer.clone()).await;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
+                    && d.message.contains("expected Vec<Leaf>, got number")
+            }),
+            "a non-array where a Vec belongs is a mismatch. Got: {:?}",
+            diagnostics
+        );
+
+        // ...and a well-typed array raises nothing.
+        let diagnostics = validate_ron_with_analyzer(
+            "(leaves: [(port: 80), Leaf(port: 81)])",
+            None,
+            &root,
+            analyzer,
+        )
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "Got: {:?}",
+            diagnostics
+        );
     }
 
     #[tokio::test]
