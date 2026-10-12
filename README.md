@@ -155,8 +155,12 @@ Opening a RON file matched by the pattern above gets you:
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file
 - code actions:
-  - *Add N required fields* and *Add all N missing fields*, for structs and for
-    enum variants
+  - *Add N required fields* and *Add all N missing fields* on the root value,
+    for structs and for enum variants alike
+  - *Add N required fields to `path`* for any value nested below it — a struct,
+    an enum variant, an element of a `Vec`, or the contents of a `Some(...)` —
+    naming it the way the file spells it (`server.tls`, `mode::Prod`,
+    `certs[1]`). The fields go into that value's own parentheses
   - *Remove field '...'*, offered as a quick-fix on `unknown-field` and
     `duplicate-field`
   - *Make struct name explicit* and *Make field type explicit*, which turn

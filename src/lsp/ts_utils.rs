@@ -391,6 +391,19 @@ pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
     None
 }
 
+/// The single value inside an explicit `Some(...)`, which is how RON spells an
+/// inhabited `Option`. `None` for every other shape, including the bare `value`
+/// form that RON also accepts and a struct that happens to be named `Some`.
+pub fn unwrap_some<'a>(node: &Node<'a>, content: &str) -> Option<Node<'a>> {
+    if struct_name(node, content) != Some("Some") {
+        return None;
+    }
+    match struct_values(node, content).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
 /// Check if a node represents an empty structure (), [], or {}
 pub fn is_empty_structure(node: &Node) -> bool {
     match node.kind() {
