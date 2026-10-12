@@ -52,7 +52,7 @@ can be serialized and embedded into your application:
 ```rs
 let config = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("src/config.rs");
 
-let mut analyzer = roniker::RustAnalyzer::with_root_type("crate::config::Configuration");
+let mut analyzer = roniker::RustAnalyzer::with_root_type("Configuration");
 analyzer.add_file(&config)?;
 
 let json = serde_json::to_string(&analyzer)?;
@@ -67,15 +67,40 @@ yielded and is what go-to-definition jumps to later; a relative path can't be
 turned into a `file://` URL, so `Path::new("src/config.rs")` analyzes your types
 perfectly well and then leaves every go-to-definition request unanswered.
 
-The type paths come from the file path as well: `add_file` treats the first
-`src` component as the crate root and builds the module path from what follows
-it, so types in `src/config.rs` are registered under `crate::config::`
-regardless of where the crate sits on disk — which is why
-`with_root_type("crate::config::Configuration")` matches above. A file with no
-`src` component in its path gets no prefix at all and its types are registered
-under their bare names (`Configuration`), in which case a root type of
-`crate::config::Configuration` resolves to nothing and the server starts up but
-answers nothing.
+The type paths come from the file path as well: `add_file` takes the **first**
+path component named `src` as the crate root and builds the module path out of
+what follows it, dropping a trailing `lib.rs`, `main.rs` or `mod.rs` the way
+Rust itself does.
+
+- `src/config.rs` and `src/config/mod.rs` both register the struct of step 0 as
+  `crate::config::Configuration`.
+- `src/lib.rs` and `src/main.rs` register under `crate::`, so a config type that
+  lives next to `fn main` is `crate::Configuration`, not
+  `crate::main::Configuration`.
+- A path with no `src` component at all gets no prefix, and its types are
+  registered under their bare names (`Configuration`).
+
+And "first component named `src`" is not always the crate's own: the absolute
+path you were just told to pass is equally happy to match a `src` directory
+*above* the crate, so the same `src/config.rs` in a crate at `/home/you/src/app`
+registers `crate::app::src::config::Configuration`.
+
+None of which the build script above has to work out, which is why it asks for
+`Configuration` and not for a full path: a root type is looked up by any
+`::`-delimited tail of a registered path, so the bare type name finds all four
+of those spellings. Spell out as much of the path as it takes to be unambiguous
+— two registered types sharing a final segment resolve to whichever one was
+registered first — and no more. Both examples in this repository name their root
+type that way.
+
+A root type that resolves to nothing is not fatal on its own: the server falls
+back to the type named at the top of the document, so a file written
+`Configuration(...)` still gets everything. It's a file whose root value leaves
+its name out — `(ephemeral: true)` — that has nothing left to resolve, and then
+every type-directed feature goes quiet: no completions, no hover, no
+go-to-definition, no rename, no code actions, and no diagnostics at all, not
+even the syntax check. Formatting and document symbols carry on working, which
+is what makes it look like the server is healthy.
 
 ### Step 3: serve LSP
 
