@@ -31,8 +31,8 @@ pub fn generate_code_actions(
         tree, content, type_info, url, &analyzer,
     ));
 
-    // Also check for nested enum variant fields
-    actions.extend(generate_missing_variant_field_actions(
+    // Same again for every value nested below the root
+    actions.extend(generate_nested_missing_field_actions(
         tree, content, type_info, url, &analyzer,
     ));
 
@@ -126,76 +126,250 @@ pub fn generate_remove_field_actions(
     actions
 }
 
-/// Code actions for the fields missing from an enum variant written as the
-/// value of one of the root struct's own fields — the `Prod(...)` of
+/// Code actions for the required fields missing from any value nested *below*
+/// the document root — the `ServerConfig(...)` of
+/// `AppConfig(server: ServerConfig(...))` as much as the `Prod(...)` of
 /// `Cfg(mode: Prod(...))`.
 ///
-/// Deeper nesting is not handled: the field has to resolve on the root type for
-/// there to be an enum to look the variant up in, and a field further down
-/// resolves either to nothing or, if the root happens to carry the same name, to
-/// the wrong type.
-fn generate_missing_variant_field_actions(
+/// The root itself is [`generate_missing_field_actions`]'s job; this walks down
+/// from it, resolving every value against the type the field it belongs to
+/// declares, the way the validator does. The validator reports
+/// `missing-required-field` at every depth, so anything this walk doesn't reach
+/// is a diagnostic naming fields the user then has to type out by hand.
+fn generate_nested_missing_field_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
     url: &Url,
     analyzer: &RustAnalyzer,
 ) -> Vec<CodeActionOrCommand> {
-    use super::ts_utils;
-
     let Some(root) = root_struct_node(tree) else {
         return Vec::new();
     };
+    let Some((root_fields, _)) = expected_root_fields(tree, content, type_info, analyzer) else {
+        return Vec::new();
+    };
 
-    ts_utils::struct_fields(&root)
-        .into_iter()
-        .filter_map(|field_node| {
-            let field_name = ts_utils::field_name(&field_node, content)?;
-            // A variant with fields is spelled `Variant(...)`, which parses as a
-            // `struct` node named after the variant.
-            let value = ts_utils::field_value(&field_node)?;
-            let variant_name = ts_utils::struct_name(&value, content)?;
+    let mut actions = Vec::new();
+    let walk = NestedWalk {
+        content,
+        url,
+        analyzer,
+    };
+    walk.walk_struct(&root, &root_fields, "", MAX_NESTING, &mut actions);
+    actions
+}
 
-            let field = type_info.find_field_serialized(field_name)?;
-            let enum_info = analyzer.get_type_info(&field.type_name)?;
-            // A container `#[serde(default)]` fills in whatever is absent.
-            if enum_info.has_default {
-                return None;
+/// How many levels below the root the nested walk descends. The walk is
+/// recursive, and [`super::ts_utils::MAX_TREE_DEPTH`] alone is too generous a
+/// bound to lean on here; nothing a configuration file legitimately contains
+/// comes anywhere near this.
+const MAX_NESTING: usize = 32;
+
+/// The nested walk's immutable context: everything it needs that doesn't change
+/// as it descends.
+struct NestedWalk<'a> {
+    content: &'a str,
+    url: &'a Url,
+    analyzer: &'a RustAnalyzer,
+}
+
+/// What a nested value is expected to contain, once the type its field declares
+/// has been resolved.
+struct NestedTarget {
+    /// The names serde accepts, as `(serialized_name, field)` pairs — the same
+    /// shape the root is compared against.
+    fields: Vec<(String, FieldInfo)>,
+    /// The container carries `#[serde(default)]`, so nothing is required of it.
+    has_default: bool,
+    /// How an action title names this value: a dotted field path, with `::` in
+    /// front of an enum variant (`server.tls`, `mode::Prod`).
+    path: String,
+}
+
+impl NestedWalk<'_> {
+    /// Visit each named field of `node` — a value expected to contain
+    /// `expected` — and descend into the field's value. `path` names `node`
+    /// itself, and is empty for the document root.
+    fn walk_struct(
+        &self,
+        node: &tree_sitter::Node,
+        expected: &[(String, FieldInfo)],
+        path: &str,
+        depth: usize,
+        actions: &mut Vec<CodeActionOrCommand>,
+    ) {
+        use super::ts_utils;
+
+        if depth == 0 {
+            return;
+        }
+
+        for field_node in ts_utils::struct_fields(node) {
+            let Some(field_name) = ts_utils::field_name(&field_node, self.content) else {
+                continue;
+            };
+            let Some(value) = ts_utils::field_value(&field_node) else {
+                continue;
+            };
+            // A field the containing type doesn't have is already reported as
+            // unknown; there is no type to validate its value against.
+            let Some(field) = matching_field(expected, field_name) else {
+                continue;
+            };
+
+            let child_path = match path.is_empty() {
+                true => field_name.to_string(),
+                false => format!("{path}.{field_name}"),
+            };
+            self.walk_value(&value, &field.type_name, &child_path, depth - 1, actions);
+        }
+    }
+
+    /// Offer the required fields `value` is missing, then descend into it.
+    ///
+    /// `declared_type` is the type the field holding `value` declares. Array
+    /// elements and the contents of a `Some(...)` are visited as values in their
+    /// own right, so `Vec<T>` and `Option<T>` are walked the same as a plain
+    /// `T`.
+    fn walk_value(
+        &self,
+        value: &tree_sitter::Node,
+        declared_type: &str,
+        path: &str,
+        depth: usize,
+        actions: &mut Vec<CodeActionOrCommand>,
+    ) {
+        use super::ts_utils;
+
+        if depth == 0 {
+            return;
+        }
+
+        if value.kind() == "array" {
+            let element_type = super::type_utils::strip_outer_generic(declared_type);
+            for (index, element) in ts_utils::array_elements(value).iter().enumerate() {
+                self.walk_value(
+                    element,
+                    &element_type,
+                    &format!("{path}[{index}]"),
+                    depth - 1,
+                    actions,
+                );
             }
-            let variant = enum_info.find_variant(variant_name)?;
+            return;
+        }
 
-            // Only the variant's own fields count as supplied. Descending into
-            // them would credit the variant with field names belonging to a
-            // nested type, which is how a required field could be considered
-            // present because something nested inside it happened to share its
-            // name.
-            let present: std::collections::HashSet<&str> = ts_utils::struct_fields(&value)
-                .iter()
-                .filter_map(|f| ts_utils::field_name(f, content))
-                .collect();
+        // RON spells an inhabited `Option` as `Some(value)`. The field's type
+        // describes the value inside, not the `Some` wrapper.
+        if let Some(inner) = ts_utils::unwrap_some(value, self.content) {
+            self.walk_value(&inner, declared_type, path, depth - 1, actions);
+            return;
+        }
 
-            let missing =
-                super::type_utils::missing_required_fields(&variant.effective_fields(), |name| {
-                    present.contains(name)
-                });
-            if missing.is_empty() {
-                return None;
+        if value.kind() != "struct" {
+            return;
+        }
+        // A bare `None`, or any other unit variant, parses as a `struct` node
+        // with nothing but its name. It supplies no fields and has nowhere to
+        // insert any, so the type its field declares says nothing about it.
+        if ts_utils::child_by_kind(value, "(").is_none() {
+            return;
+        }
+        let Some(target) = self.resolve(value, declared_type, path) else {
+            return;
+        };
+        // Tuple structs and tuple variants have positional fields ("0", "1",
+        // ...), which have no name that could be inserted.
+        if target.fields.iter().any(|(_, field)| field.is_positional()) {
+            return;
+        }
+
+        // Only the value's own fields count as supplied. Descending into them
+        // would credit it with field names belonging to a nested type, which is
+        // how a required field could be considered present because something
+        // nested inside it happened to share its name.
+        let present: std::collections::HashSet<&str> = ts_utils::struct_fields(value)
+            .iter()
+            .filter_map(|field| ts_utils::field_name(field, self.content))
+            .collect();
+
+        if !target.has_default {
+            let missing = super::type_utils::missing_required_fields(&target.fields, |name| {
+                present.contains(name)
+            });
+            if !missing.is_empty()
+                // Into this value's own parens, not the document root's.
+                && let Some(edits) = generate_field_insertions(value, self.content, &missing)
+            {
+                actions.push(single_file_action(
+                    self.url,
+                    format!(
+                        "Add {} required field{} to {}",
+                        missing.len(),
+                        plural(missing.len()),
+                        target.path
+                    ),
+                    CodeActionKind::QUICKFIX,
+                    edits,
+                    None,
+                ));
             }
+        }
 
-            Some(single_file_action(
-                url,
-                format!(
-                    "Add {} required field{} to {field_name}::{variant_name}",
-                    missing.len(),
-                    plural(missing.len())
-                ),
-                CodeActionKind::QUICKFIX,
-                // Into the variant's own parens, not the document root's.
-                generate_field_insertions(&value, content, &missing)?,
-                None,
-            ))
-        })
-        .collect()
+        self.walk_struct(value, &target.fields, &target.path, depth - 1, actions);
+    }
+
+    /// What `value` is expected to contain, given the type its field declares.
+    ///
+    /// `None` when there is nothing to compare it against: a type the analyzer
+    /// doesn't know (a `HashMap`, say), or an enum value that names no known
+    /// variant — an unknown-variant error rather than a set of absent fields.
+    fn resolve(
+        &self,
+        value: &tree_sitter::Node,
+        declared_type: &str,
+        path: &str,
+    ) -> Option<NestedTarget> {
+        // One generic layer is stripped so `Option<Server>` and `Vec<Server>`
+        // resolve to `Server`, matching how the validator recurses.
+        let info = self.analyzer.get_type_info(declared_type).or_else(|| {
+            self.analyzer
+                .get_type_info(&super::type_utils::strip_outer_generic(declared_type))
+        })?;
+
+        match &info.kind {
+            TypeKind::Struct(_) => Some(NestedTarget {
+                fields: info.effective_fields(self.analyzer),
+                has_default: info.has_default,
+                path: path.to_string(),
+            }),
+            TypeKind::Enum(_) => {
+                // A variant with fields is spelled `Variant(...)`, which parses
+                // as a `struct` node named after the variant.
+                let variant_name = super::ts_utils::struct_name(value, self.content)?;
+                let variant = info.find_variant(variant_name)?;
+                Some(NestedTarget {
+                    fields: variant.effective_fields(),
+                    has_default: info.has_default,
+                    path: format!("{path}::{variant_name}"),
+                })
+            }
+        }
+    }
+}
+
+/// The field of `expected` that serde would fill from a RON field named
+/// `field_name`: the one whose serialized name — as the *containing* type spells
+/// it — matches, or that accepts the name itself (its Rust name, an alias).
+fn matching_field<'a>(
+    expected: &'a [(String, FieldInfo)],
+    field_name: &str,
+) -> Option<&'a FieldInfo> {
+    expected
+        .iter()
+        .find(|(name, field)| name == field_name || field.accepts_name(field_name, None))
+        .map(|(_, field)| field)
 }
 
 /// Generate code actions for making implicit struct names explicit
@@ -1203,6 +1377,131 @@ mod tests {
             ["Add 1 required field to mode::Prod"],
             "`b` is still missing from `Prod`"
         );
+    }
+
+    /// A root type `Cfg(server, certs, extra)` over nested *structs*:
+    /// `Server` requires `host` and `port` and carries an optional
+    /// `tls: Option<Tls>`, `Tls` requires `cert`, `certs` is a `Vec<Tls>` with a
+    /// default, and `extra: Option<Defaults>` resolves to a type carrying a
+    /// container-level `#[serde(default)]`.
+    ///
+    /// Every test below spells out all three root fields, so the only actions
+    /// left are the nested ones under test.
+    fn nested_struct_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("host", "String"),
+                field("port", "u16"),
+                field("tls", "Option<Tls>"),
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Tls".to_string(),
+            kind: TypeKind::Struct(vec![field("cert", "String")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Defaults".to_string(),
+            kind: TypeKind::Struct(vec![field("anything", "String")]),
+            has_default: true,
+            ..Default::default()
+        });
+
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("server", "Server"),
+                FieldInfo {
+                    has_default: true,
+                    ..field("certs", "Vec<Tls>")
+                },
+                field("extra", "Option<Defaults>"),
+            ]),
+            ..Default::default()
+        };
+        (root, Arc::new(analyzer))
+    }
+
+    /// The fields a nested *struct* value is missing used to get no quick-fix at
+    /// all: only the document root and an enum variant one level under it were
+    /// walked, so the `missing-required-field` diagnostic the validator reports
+    /// for `server` named a field the user then had to type out by hand.
+    #[test]
+    fn test_nested_struct_fields_are_inserted_into_the_struct() {
+        let (root, analyzer) = nested_struct_fixture();
+        let content = "Cfg(\n    server: Server(\n        port: 1,\n    ),\n    certs: [],\n    extra: None,\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, analyzer),
+            vec![(
+                "Add 1 required field to server".to_string(),
+                "Cfg(\n    server: Server(\n        port: 1,\n        host: \"\",\n    ),\n    certs: [],\n    extra: None,\n)".to_string(),
+            )]
+        );
+    }
+
+    /// The walk keeps going below the first nested value, and sees through the
+    /// `Some(...)` that RON spells an inhabited `Option` with — so `Tls` is
+    /// recognized as the value of `tls`, rather than `Some` being mistaken for
+    /// it.
+    #[test]
+    fn test_nested_struct_walk_descends_through_option() {
+        let (root, analyzer) = nested_struct_fixture();
+        let content = "Cfg(\n    server: Server(host: \"h\", port: 1, tls: Some(Tls())),\n    certs: [],\n    extra: None,\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, analyzer),
+            vec![(
+                "Add 1 required field to server.tls".to_string(),
+                "Cfg(\n    server: Server(host: \"h\", port: 1, tls: Some(Tls(cert: \"\"))),\n    certs: [],\n    extra: None,\n)".to_string(),
+            )]
+        );
+    }
+
+    /// Each element of a `Vec<T>` is a value of `T` in its own right, and the
+    /// action has to name which one it fills in.
+    #[test]
+    fn test_nested_struct_walk_visits_array_elements() {
+        let (root, analyzer) = nested_struct_fixture();
+        let content = "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls()],\n    extra: None,\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, analyzer),
+            vec![(
+                "Add 1 required field to certs[1]".to_string(),
+                "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls(cert: \"\")],\n    extra: None,\n)".to_string(),
+            )]
+        );
+    }
+
+    /// An absent `Option` is written as the bare `None`, which parses as a
+    /// `struct` node named `None`. Taking it for a value of the field's own type
+    /// would offer to fill in fields of a value that isn't there.
+    #[test]
+    fn test_no_nested_action_for_absent_option() {
+        let (root, analyzer) = nested_struct_fixture();
+        let content = "Cfg(\n    server: Server(host: \"h\", port: 1, tls: None),\n    certs: [],\n    extra: None,\n)";
+
+        assert_eq!(missing_field_actions(content, &root, analyzer), vec![]);
+    }
+
+    /// A container-level `#[serde(default)]` fills in whatever is absent, so
+    /// nothing nested under it is required.
+    #[test]
+    fn test_no_nested_action_for_container_default() {
+        let (root, analyzer) = nested_struct_fixture();
+        let content = "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [],\n    extra: Defaults(),\n)";
+
+        assert_eq!(missing_field_actions(content, &root, analyzer), vec![]);
     }
 
     #[test]

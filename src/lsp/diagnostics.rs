@@ -344,21 +344,6 @@ fn struct_name_range(node: &tree_sitter::Node, content: &str) -> Range {
     }
 }
 
-/// The single value inside an explicit `Some(...)`, which is how RON spells an
-/// inhabited `Option`. `None` for every other shape, including the bare `value`
-/// form that RON also accepts and a struct that happens to be named `Some`.
-fn unwrap_some<'a>(node: &tree_sitter::Node<'a>, content: &str) -> Option<tree_sitter::Node<'a>> {
-    use super::ts_utils;
-
-    if ts_utils::struct_name(node, content) != Some("Some") {
-        return None;
-    }
-    match ts_utils::struct_values(node, content).as_slice() {
-        [only] => Some(*only),
-        _ => None,
-    }
-}
-
 /// What recursing into a value turned up.
 struct Nested {
     diagnostics: Vec<Diagnostic>,
@@ -435,7 +420,8 @@ async fn validate_nested_value<'a>(
                 // An `Option` field is usually written `Some(value)`. Validate
                 // the wrapped value rather than the `Some` wrapper, or the
                 // inner type's own fields go unchecked.
-                let inner_node = unwrap_some(value_node, content).unwrap_or(*value_node);
+                let inner_node =
+                    super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
                 let nested_diags = Box::pin(validate_node_with_type_info(
                     &inner_node,
                     content,
