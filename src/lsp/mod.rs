@@ -2493,6 +2493,269 @@ PostReference(
         assert_eq!(lines, vec![2, 3, 4], "all three entries: {edits:?}");
     }
 
+    /// A workspace with a struct whose field is an enum, both carrying source
+    /// positions, so that hover and go-to-definition can be checked against the
+    /// same document.
+    fn post_analyzer() -> RustAnalyzer {
+        let source = std::path::PathBuf::from("/test/src/models.rs");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::models::Post");
+        analyzer.add_type(TypeInfo {
+            name: "crate::models::Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u64".to_string(),
+                    docs: Some("The post's identifier".to_string()),
+                    line: Some(10),
+                    column: Some(4),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "post_type".to_string(),
+                    type_name: "crate::models::PostType".to_string(),
+                    line: Some(12),
+                    column: Some(4),
+                    ..Default::default()
+                },
+            ]),
+            docs: Some("A post in the system".to_string()),
+            source_file: Some(source.clone()),
+            line: Some(8),
+            column: Some(0),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::models::PostType".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Short".to_string(),
+                    docs: Some("A short post".to_string()),
+                    line: Some(20),
+                    column: Some(4),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Detailed".to_string(),
+                    fields: vec![FieldInfo {
+                        name: "length".to_string(),
+                        type_name: "usize".to_string(),
+                        docs: Some("How long the post is".to_string()),
+                        line: Some(24),
+                        column: Some(8),
+                        ..Default::default()
+                    }],
+                    docs: Some("A detailed post".to_string()),
+                    line: Some(23),
+                    column: Some(4),
+                    ..Default::default()
+                },
+            ]),
+            docs: Some("How a post is laid out".to_string()),
+            source_file: Some(source),
+            line: Some(18),
+            column: Some(0),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::models::Tag".to_string(),
+            docs: Some("A label on a post".to_string()),
+            ..Default::default()
+        });
+        analyzer
+    }
+
+    /// Hover and go-to-definition answer the same question — what does the word
+    /// under the cursor refer to? — so every kind of word a document can hold
+    /// has to resolve the same way for both. These are all five kinds: a
+    /// struct's own field, a field of the enum variant being spelled out, the
+    /// variant name itself, a variant written as a bare field value, and a type
+    /// named nowhere in particular.
+    #[tokio::test]
+    async fn test_hover_and_definition_resolve_the_same_words() {
+        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let uri: Url = "file:///test/post.ron".parse().unwrap();
+
+        // Line/column pairs below are 0-based; the analyzer's are 1-based lines.
+        let cases = [
+            // `id` on the root struct: Post::id, declared at 10:4.
+            ("struct field", 1, 6, (9, 4), "The post's identifier"),
+            // `length` inside the `Detailed(...)` variant: declared at 24:8.
+            ("variant field", 3, 10, (23, 8), "How long the post is"),
+            // The variant name itself: declared at 23:4.
+            ("variant name", 2, 18, (22, 4), "A detailed post"),
+            // The root struct's own name: declared at 8:0.
+            ("type name", 0, 2, (7, 0), "A post in the system"),
+        ];
+
+        for (label, line, character, expected, expected_docs) in cases {
+            let content = "Post(\n    id: 42,\n    post_type: Detailed(\n        length: 1,\n    ),\n)";
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content.to_string()));
+            let position = Position::new(line, character);
+
+            let definition = backend
+                .goto_definition(GotoDefinitionParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .unwrap();
+            let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+                panic!("goto_definition on the {label} returned nothing");
+            };
+            assert_eq!(
+                (location.range.start.line, location.range.start.character),
+                expected,
+                "definition of the {label}"
+            );
+
+            let hover = backend
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            let Some(Hover {
+                contents: HoverContents::Markup(markup),
+                ..
+            }) = hover
+            else {
+                panic!("hover on the {label} returned nothing");
+            };
+            assert!(
+                markup.value.contains(expected_docs),
+                "hover on the {label} should document it. Got: {}",
+                markup.value
+            );
+        }
+    }
+
+    /// A variant written as a bare field value (`post_type: Short`) is resolved
+    /// through the field's declared type, which is a different lookup from the
+    /// variant of the type the cursor is already in.
+    #[tokio::test]
+    async fn test_hover_and_definition_on_a_bare_variant_value() {
+        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let content = "Post(\n    id: 42,\n    post_type: Short,\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+        let position = Position::new(2, 17);
+
+        let definition = backend
+            .goto_definition(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .unwrap();
+        let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+            panic!("goto_definition on a bare variant value returned nothing");
+        };
+        assert_eq!(
+            (location.range.start.line, location.range.start.character),
+            (19, 4),
+            "definition should land on PostType::Short"
+        );
+
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap();
+        let Some(Hover {
+            contents: HoverContents::Markup(markup),
+            ..
+        }) = hover
+        else {
+            panic!("hover on a bare variant value returned nothing");
+        };
+        assert!(
+            markup.value.contains("A short post"),
+            "hover should document PostType::Short. Got: {}",
+            markup.value
+        );
+    }
+
+    /// A word that names a registered type but nothing in the document's own
+    /// type — here one mentioned in a comment — still resolves to that type.
+    #[tokio::test]
+    async fn test_hover_and_definition_fall_back_to_a_named_type() {
+        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let content = "// see Tag\nPost(\n    id: 42,\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+        let position = Position::new(0, 8);
+
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap();
+        let Some(Hover {
+            contents: HoverContents::Markup(markup),
+            ..
+        }) = hover
+        else {
+            panic!("hover on a type named in a comment returned nothing");
+        };
+        assert!(
+            markup.value.contains("A label on a post"),
+            "hover should document Tag. Got: {}",
+            markup.value
+        );
+
+        // Tag carries no source file, so there is no location to jump to — but
+        // the word still has to resolve to it rather than to anything else.
+        let definition = backend
+            .goto_definition(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            definition.is_none(),
+            "a type with no source file has no definition to jump to"
+        );
+    }
+
     #[tokio::test]
     async fn test_rename_rejects_invalid_identifier() {
         let analyzer = RustAnalyzer::with_root_type("crate::Post");
