@@ -155,23 +155,6 @@ pub fn find_current_variant_context(
     })
 }
 
-/// Get the containing field context by finding the parent field
-/// For example: "post_type: Detailed(\n    length: 1" - when on "length" line, returns "post_type"
-pub fn get_containing_field_context(
-    tree: &Tree,
-    content: &str,
-    position: Position,
-) -> Option<String> {
-    // Walk up the tree to find the parent field that contains a struct which
-    // contains our current field. The first field ancestor is the one we're in;
-    // the next named field ancestor is the containing field.
-    let current = node_at_position(tree, content, position)?;
-    ancestors(current)
-        .filter(|node| node.kind() == "field")
-        .skip(1)
-        .find_map(|node| field_name(&node, content).map(str::to_string))
-}
-
 /// Parse RON structure to get all field names present at the top level
 pub fn extract_fields_from_ron(tree: &Tree, content: &str) -> Vec<String> {
     let mut fields = std::collections::HashSet::new();
@@ -361,11 +344,7 @@ mod tests {
 )"#;
         let position = Position::new(3, 16);
 
-        let tree = parse(content);
-        let variant = find_current_variant_context(&tree, content, position);
+        let variant = find_current_variant_context(&parse(content), content, position);
         assert_eq!(variant, Some("Detailed".to_string()));
-
-        let containing_field = get_containing_field_context(&tree, content, position);
-        assert_eq!(containing_field, Some("post_type".to_string()));
     }
 }

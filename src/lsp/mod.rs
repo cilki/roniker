@@ -263,54 +263,21 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
+        let owner = self.resolve_owner_type_at(&content, tree.as_ref(), position);
+        let Some(symbol) =
+            self.resolve_symbol(owner.as_ref(), tree.as_ref(), &content, position, &word)
+        else {
+            return Ok(None);
+        };
 
-        // Check if the word is a valid field name in the current context type
-        if let (Some(info), Some(tree)) = (current_type_info.as_ref(), tree.as_ref()) {
-            // The cursor may be on a field inside an enum variant
-            if let Some(response) =
-                self.resolve_variant_field_definition(info, tree, &content, position, &word)
-            {
-                return response;
+        let (source_file, line, column) = match symbol {
+            Symbol::Field { owner, field } => (&owner.source_file, field.line, field.column),
+            Symbol::Variant { owner, variant } => {
+                (&owner.source_file, variant.line, variant.column)
             }
-
-            // Check if the word is a struct field name
-            if let Some(field) = info.find_field(&word) {
-                return create_location_response(&info.source_file, field.line, field.column);
-            }
-
-            // Check if the word is a valid enum variant in this type
-            if let Some(variant) = info.find_variant(&word) {
-                return create_location_response(&info.source_file, variant.line, variant.column);
-            }
-
-            // Check if the word matches the type name itself
-            if info.name.ends_with(&format!("::{}", word)) || info.name == word {
-                return create_location_response(&info.source_file, info.line, info.column);
-            }
-
-            // Check if we're on a field, and if the word is a variant of that field's type
-            // e.g., in "post_type: Short", if cursor is near Short, check if it's a variant of PostType
-            if let Some(field_name) =
-                tree_sitter_parser::get_field_at_position(tree, &content, position)
-                && let Some(field) = info.find_field(&field_name)
-                && let Some(field_type_info) = self.rust_analyzer.get_type_info(&field.type_name)
-                && let Some(variant) = field_type_info.find_variant(&word)
-            {
-                return create_location_response(
-                    &field_type_info.source_file,
-                    variant.line,
-                    variant.column,
-                );
-            }
-        }
-
-        // If no type annotation, or word doesn't match a field, try to find as a type
-        if let Some(info) = self.rust_analyzer.get_type_info(&word).cloned() {
-            return create_location_response(&info.source_file, info.line, info.column);
-        }
-
-        Ok(None)
+            Symbol::Type(info) => (&info.source_file, info.line, info.column),
+        };
+        create_location_response(source_file, line, column)
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -336,107 +303,31 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        {
-            let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
+        let owner = self.resolve_owner_type_at(&content, tree.as_ref(), position);
+        let Some(symbol) =
+            self.resolve_symbol(owner.as_ref(), tree.as_ref(), &content, position, &word)
+        else {
+            return Ok(None);
+        };
 
-            // Now check what the word at cursor is
-            if let (Some(type_info), Some(tree)) = (current_type_info, tree.as_ref()) {
-                // Case 1: Hovering over a field name, which is either a field of
-                // the enum variant being spelled out or one of the struct's own.
-                if let Some(field_name) =
-                    tree_sitter_parser::get_field_at_position(tree, &content, position)
-                    && field_name == word
-                {
-                    let field =
-                        tree_sitter_parser::find_current_variant_context(tree, &content, position)
-                            .and_then(|variant_name| type_info.find_variant(&variant_name))
-                            .and_then(|variant| {
-                                variant.fields.iter().find(|f| f.name == field_name)
-                            })
-                            .or_else(|| {
-                                type_info
-                                    .fields()
-                                    .and_then(|fields| fields.iter().find(|f| f.name == field_name))
-                            });
+        let value = match symbol {
+            Symbol::Field { field, .. } => format!(
+                "```rust\n{}: {}\n```\n\n{}",
+                field.name,
+                field.type_name,
+                field.docs.as_deref().unwrap_or("")
+            ),
+            Symbol::Variant { owner, variant } => format_variant_hover(&owner.name, variant),
+            Symbol::Type(info) => self.format_type_hover(info),
+        };
 
-                    if let Some(field) = field {
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!(
-                                    "```rust\n{}: {}\n```\n\n{}",
-                                    field.name,
-                                    field.type_name,
-                                    field.docs.as_deref().unwrap_or("")
-                                ),
-                            }),
-                            range: None,
-                        }));
-                    }
-                }
-
-                // Case 2: Hovering over a variant name
-                if let Some(variant) = type_info.find_variant(&word) {
-                    let hover_text = format_variant_hover(&type_info.name, variant);
-
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: hover_text,
-                        }),
-                        range: None,
-                    }));
-                }
-
-                // Case 3: Hovering over the type name itself (or check if word matches the current type)
-                if type_info.name.ends_with(&format!("::{}", word)) || type_info.name == word {
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: self.format_type_hover(&type_info),
-                        }),
-                        range: None,
-                    }));
-                }
-
-                // Case 4: Check if hovering over a field value that's a variant (like "Short" in "post_type: Short")
-                if let Some(field_name) =
-                    tree_sitter_parser::get_field_at_position(tree, &content, position)
-                    && let Some(field) = type_info.find_field(&field_name)
-                {
-                    // Get the type of this field
-                    if let Some(field_type_info) =
-                        self.rust_analyzer.get_type_info(&field.type_name).cloned()
-                    {
-                        // Check if word is a variant of this field's type
-                        if let Some(variant) = field_type_info.find_variant(&word) {
-                            let hover_text = format_variant_hover(&field_type_info.name, variant);
-
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: hover_text,
-                                }),
-                                range: None,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Case 5: No type annotation - try to find type by name
-        if let Some(info) = self.rust_analyzer.get_type_info(&word).cloned() {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: self.format_type_hover(&info),
-                }),
-                range: None,
-            }));
-        }
-
-        Ok(None)
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        }))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -697,6 +588,29 @@ impl LanguageServer for Backend {
     }
 }
 
+/// What an identifier in a RON document refers to, together with the type that
+/// declares it.
+///
+/// Hover and go-to-definition ask the same question of a word under the cursor
+/// and differ only in what they report about the answer — a Markdown
+/// description or a source location — so the lookup lives in one place
+/// ([`Backend::resolve_symbol`]) and they each render what it returns.
+enum Symbol<'a> {
+    /// A field of a struct, or of one of `owner`'s enum variants. Both are
+    /// declared in `owner`'s source file.
+    Field {
+        owner: &'a rust_analyzer::TypeInfo,
+        field: &'a rust_analyzer::FieldInfo,
+    },
+    /// A variant of the enum `owner`.
+    Variant {
+        owner: &'a rust_analyzer::TypeInfo,
+        variant: &'a rust_analyzer::EnumVariant,
+    },
+    /// A struct or enum named by the document.
+    Type(&'a rust_analyzer::TypeInfo),
+}
+
 /// The identifier node of the field whose *name* contains `position`, if any.
 fn field_name_node_at<'a>(
     tree: &'a tree_sitter::Tree,
@@ -818,45 +732,63 @@ impl Backend {
         })
     }
 
-    /// The variant-field cases of goto_definition: the cursor is inside an enum
-    /// variant and `word` may name one of the variant's fields.
-    /// Returns `Some(response)` when a definition was found.
-    fn resolve_variant_field_definition(
-        &self,
-        info: &rust_analyzer::TypeInfo,
-        tree: &tree_sitter::Tree,
+    /// What the word at `position` refers to, resolved against `owner` — the
+    /// type that owns the value the cursor is in, as returned by
+    /// [`Backend::resolve_owner_type_at`].
+    ///
+    /// `None` when the word names nothing the analyzer knows about.
+    fn resolve_symbol<'a>(
+        &'a self,
+        owner: Option<&'a rust_analyzer::TypeInfo>,
+        tree: Option<&tree_sitter::Tree>,
         content: &str,
         position: Position,
         word: &str,
-    ) -> Option<Result<Option<GotoDefinitionResponse>>> {
-        let variant_name =
-            tree_sitter_parser::find_current_variant_context(tree, content, position)?;
+    ) -> Option<Symbol<'a>> {
+        if let (Some(owner), Some(tree)) = (owner, tree) {
+            let cursor_field = tree_sitter_parser::get_field_at_position(tree, content, position);
 
-        // We might be in a variant of the current type OR a variant of a field's type.
-        // Try the current type first.
-        if let Some(variant) = info.find_variant(&variant_name)
-            && let Some(field) = variant.fields.iter().find(|f| f.name == word)
-        {
-            return Some(create_location_response(
-                &info.source_file,
-                field.line,
-                field.column,
-            ));
+            // The field the cursor is on, when the word is its name: a field of
+            // the enum variant being spelled out, or one of the type's own.
+            if cursor_field.as_deref() == Some(word) {
+                let in_variant =
+                    tree_sitter_parser::find_current_variant_context(tree, content, position)
+                        .and_then(|variant_name| owner.find_variant(&variant_name))
+                        .and_then(|variant| variant.fields.iter().find(|f| f.name == word));
+                if let Some(field) = in_variant.or_else(|| owner.find_field(word)) {
+                    return Some(Symbol::Field { owner, field });
+                }
+            }
+
+            // A variant of the enum the cursor is in — the `Detailed` of
+            // `Detailed(length: 1)`.
+            if let Some(variant) = owner.find_variant(word) {
+                return Some(Symbol::Variant { owner, variant });
+            }
+
+            // The name of the type itself.
+            if owner.name == word || owner.name.ends_with(&format!("::{}", word)) {
+                return Some(Symbol::Type(owner));
+            }
+
+            // A variant of the type the field under the cursor is declared as —
+            // the `Short` of `post_type: Short`, which `owner` is not the enum
+            // for because the value names no variant to navigate into.
+            if let Some(field_name) = cursor_field
+                && let Some(field) = owner.find_field(&field_name)
+                && let Some(field_type) = self.rust_analyzer.get_type_info(&field.type_name)
+                && let Some(variant) = field_type.find_variant(word)
+            {
+                return Some(Symbol::Variant {
+                    owner: field_type,
+                    variant,
+                });
+            }
         }
 
-        // Otherwise check if we're in a field that contains the variant,
-        // e.g. on "length" inside "post_type: Detailed(length: 1)"
-        let field_name =
-            tree_sitter_parser::get_containing_field_context(tree, content, position)?;
-        let field = info.find_field(&field_name)?;
-        let field_type_info = self.rust_analyzer.get_type_info(&field.type_name)?;
-        let variant = field_type_info.find_variant(&variant_name)?;
-        let variant_field = variant.fields.iter().find(|f| f.name == word)?;
-        Some(create_location_response(
-            &field_type_info.source_file,
-            variant_field.line,
-            variant_field.column,
-        ))
+        // Nothing in the surrounding type accounts for the word, so it may name
+        // a type outright.
+        self.rust_analyzer.get_type_info(word).map(Symbol::Type)
     }
 
     /// Resolve the TypeInfo that owns the fields at `position`: the document's
@@ -2039,7 +1971,6 @@ PostReference(
 
         // Test what we detect
         let word = get_word_at_position(content, position);
-        println!("Word at position: {:?}", word);
         assert_eq!(
             word,
             Some("length".to_string()),
@@ -2048,24 +1979,11 @@ PostReference(
 
         let tree = ts_utils::RonParser::new().parse(content).unwrap();
         let variant = tree_sitter_parser::find_current_variant_context(&tree, content, position);
-        println!("Variant context: {:?}", variant);
         assert_eq!(
             variant,
             Some("Detailed".to_string()),
             "Should detect Detailed variant"
         );
-
-        let containing_field =
-            tree_sitter_parser::get_containing_field_context(&tree, content, position);
-        println!("Containing field: {:?}", containing_field);
-        assert_eq!(
-            containing_field,
-            Some("post_type".to_string()),
-            "Should detect post_type field"
-        );
-
-        // This test shows that all the building blocks work!
-        // The problem must be in how goto_definition uses them
     }
 
     #[test]
@@ -2574,6 +2492,12 @@ PostReference(
     async fn test_hover_and_definition_resolve_the_same_words() {
         let backend = create_test_backend_with_analyzer(post_analyzer()).await;
         let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let content = "Post(\n    id: 42,\n    post_type: Detailed(\n        length: 1,\n    ),\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
 
         // Line/column pairs below are 0-based; the analyzer's are 1-based lines.
         let cases = [
@@ -2588,12 +2512,6 @@ PostReference(
         ];
 
         for (label, line, character, expected, expected_docs) in cases {
-            let content = "Post(\n    id: 42,\n    post_type: Detailed(\n        length: 1,\n    ),\n)";
-            backend
-                .documents
-                .write()
-                .await
-                .insert(uri.to_string(), Document::new(content.to_string()));
             let position = Position::new(line, character);
 
             let definition = backend
