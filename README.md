@@ -150,18 +150,35 @@ Opening a RON file matched by the pattern above gets you:
 - go-to-definition back to the Rust source, document symbols, rename, and
   formatting — what the formatter lays out, and what it throws away, is spelled
   out under [Formatting](#formatting) below
-- diagnostics, each tagged with a stable code so your editor can filter them:
+- diagnostics, each error tagged with a stable code so your editor can filter
+  them:
   - `syntax-error` - the file doesn't parse as RON
   - `unknown-field` - the struct has no such field
-  - `duplicate-field` - the same field is given twice
-  - `missing-required-field` - a field with no default was left out
-  - `unknown-variant` - no such variant on the enum the field expects
-  - `type-mismatch` - a primitive of the wrong shape, e.g. a string where a
-    `u16` is expected, or an integer the field's type can't hold (`port: -1`
-    for a `u16`), which `ron` refuses to deserialize. An integer literal in a
-    float field is fine — serde widens it — and is not reported.
+  - `duplicate-field` - the same field is given twice, reported at the second
+    occurrence
+  - `missing-required-field` - a field with no default was left out. One
+    diagnostic per struct, listing every field that struct is missing, reported
+    on the struct's name — or at the value's first character when the struct is
+    written without one
+  - `unknown-variant` - the value names something the enum the field expects has
+    no variant for
+  - `type-mismatch` - the value doesn't fit the type the field is declared as.
+    That is a primitive of the wrong shape, e.g. a string where a `u16` is
+    expected, or an integer the field's type can't hold (`port: -1` for a
+    `u16`), which `ron` refuses to deserialize. An integer literal in a float
+    field is fine — serde widens it — and is not reported. It is also every way
+    a value can contradict a struct or enum it is written for: naming a
+    different type (`expected ServerConfig, got ServerMode`), naming a type
+    nothing in the workspace defines (`unknown type 'Bogus'`), a literal where
+    a struct belongs (`expected ServerConfig, got integer`), a value that names
+    no variant at all in an enum field (`unknown variant '42' for enum
+    ServerMode`), or data given to a unit variant. Those last two matter if you
+    filter by code: a message reading *unknown type* or *unknown variant* is
+    still tagged `type-mismatch`, not `unknown-type` or `unknown-variant`.
   - `unknown-type` - a field's declared type was never registered with the
-    analyzer, which usually means the build script is missing a source file
+    analyzer, which usually means the build script is missing a source file.
+    This is about the *declaration*; a value naming a type nobody registered is
+    a `type-mismatch`, as above.
 - code actions:
   - *Add N required fields* and *Add all N missing fields* on the root value,
     for structs and for enum variants alike. An enum root's titles name the
@@ -181,6 +198,17 @@ Opening a RON file matched by the pattern above gets you:
     reach the root value and its own fields only, so an unnamed struct nested
     deeper gets neither, and a document whose root value is an enum variant gets
     neither at all
+
+Only the errors carry a code. The informational type annotations of step 3 are
+published as diagnostics too and carry none, so their `Information` severity is
+all that tells them apart.
+
+Where a mismatch inside a `Vec` is reported depends on the element type. A
+`Vec` of structs or enums is walked element by element, so each bad element is
+marked where it is written; a `Vec` of primitives is checked as a whole, and the
+one message lands on the array (`in Vec: expected u16, got string`). Either way
+a non-array written where a `Vec` belongs is reported as the mismatch it is
+(`expected Vec<String>, got number`).
 
 ### Formatting
 

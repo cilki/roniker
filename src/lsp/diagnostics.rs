@@ -3301,6 +3301,78 @@ mod tests {
         }
     }
 
+    /// Every error carries one of the codes [`codes`] declares, which is the
+    /// whole point of having them: an editor filters on the code rather than on
+    /// the message. An error published without one, or under a code nobody
+    /// documents, is invisible to that filter.
+    #[tokio::test]
+    async fn test_every_error_carries_a_documented_code() {
+        let documented = [
+            codes::SYNTAX_ERROR,
+            codes::UNKNOWN_FIELD,
+            codes::DUPLICATE_FIELD,
+            codes::MISSING_REQUIRED_FIELD,
+            codes::UNKNOWN_VARIANT,
+            codes::UNKNOWN_TYPE,
+            codes::TYPE_MISMATCH,
+        ];
+
+        for content in [
+            // Doesn't parse as RON at all.
+            "Config(mode: ",
+            // An unknown field, a name no variant of `Mode` answers to, and a
+            // value naming a struct other than the declared one.
+            r#"Config(bogus: 1, mode: Nope, server: Other(host: "x"))"#,
+            // The same field twice, and a nested struct missing its own field.
+            r#"Config(mode: Ephemeral, mode: Ephemeral, server: ())"#,
+        ] {
+            let (config, analyzer) = named_value_fixture();
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, analyzer).await;
+            assert!(!diagnostics.is_empty(), "nothing reported for {content}");
+
+            for diagnostic in &diagnostics {
+                if diagnostic.severity != Some(DiagnosticSeverity::ERROR) {
+                    continue;
+                }
+                let Some(NumberOrString::String(found)) = &diagnostic.code else {
+                    panic!("an error with no code: {diagnostic:?} for {content}");
+                };
+                assert!(
+                    documented.contains(&found.as_str()),
+                    "undocumented code {found:?} for {content}"
+                );
+            }
+        }
+    }
+
+    /// The informational type hints are the one thing published without a code,
+    /// so their severity is all a client has to tell them apart by — which is
+    /// exactly what `Backend::publish_diagnostics` filters on when they are
+    /// switched off.
+    #[tokio::test]
+    async fn test_informational_hint_is_identified_by_severity_alone() {
+        let (config, analyzer) = named_value_fixture();
+        let diagnostics = validate_ron_with_analyzer(
+            r#"Config(mode: Ephemeral, server: (host: "x"))"#,
+            None,
+            &config,
+            analyzer,
+        )
+        .await;
+
+        let hints: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .collect();
+        assert_eq!(
+            hints.len(),
+            1,
+            "the root field whose value names nothing is annotated. Got: {diagnostics:?}"
+        );
+        assert_eq!(hints[0].message, "server: Server");
+        assert_eq!(hints[0].code, None, "Got: {:?}", hints[0]);
+    }
+
     /// RON lets a struct value omit its type name, which leaves nothing to
     /// disagree with the declared type — at the root and nested alike.
     #[tokio::test]
