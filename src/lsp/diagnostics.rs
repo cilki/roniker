@@ -4,6 +4,7 @@ use super::type_utils::{
 };
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Tree;
@@ -41,8 +42,10 @@ fn did_you_mean<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>)
 /// that differs between the two lives here.
 struct ExpectedStruct<'a> {
     /// The names serde accepts, as `(serialized_name, field)` pairs: `skip`
-    /// excluded, `flatten` expanded.
-    fields: Vec<(String, FieldInfo)>,
+    /// excluded, `flatten` expanded. Borrowed from the analyzer's memo for a
+    /// registered struct, which is every struct a document walk reaches; owned
+    /// only for an enum variant, whose fields are not indexed separately.
+    fields: Cow<'a, [(String, FieldInfo)]>,
     /// A `flatten` target the analyzer can't resolve (e.g. a `HashMap`) makes
     /// serde accept arbitrary extra keys, so unknown fields aren't reported.
     allow_unknown_fields: bool,
@@ -159,19 +162,26 @@ async fn validate_struct_node(
         return diagnostics;
     }
 
-    let mut present_fields: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // The field names the document writes out, in the order it writes them.
+    // A list rather than a set: a struct has a handful of fields, few enough
+    // that scanning them costs less than hashing each name into a table — and
+    // this is built once per struct value in the document, not once per
+    // document.
+    let mut present_fields: Vec<&str> = Vec::new();
 
     for field_node in ts_utils::struct_fields(node) {
         let Some(field_name) = ts_utils::field_name(&field_node, content) else {
             continue;
         };
+        // Only ever needed by a diagnostic, and almost no field has one, so it
+        // is derived where it is reported rather than for every field walked.
         let name_range =
-            ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node), content);
+            || ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node), content);
 
         // Duplicate field — report at the second occurrence
-        if !present_fields.insert(field_name) {
+        if present_fields.contains(&field_name) {
             diagnostics.push(Diagnostic {
-                range: name_range,
+                range: name_range(),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!("Duplicate field '{}'", field_name),
                 code: code(codes::DUPLICATE_FIELD),
@@ -179,11 +189,12 @@ async fn validate_struct_node(
             });
             continue;
         }
+        present_fields.push(field_name);
 
         let Some(field_info) = expected.matching_field(field_name) else {
             if !expected.allow_unknown_fields {
                 diagnostics.push(Diagnostic {
-                    range: name_range,
+                    range: name_range(),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: format!(
                         "Unknown field '{}'{}{}",
@@ -211,7 +222,7 @@ async fn validate_struct_node(
             && value_node.kind() != "identifier"
         {
             diagnostics.push(Diagnostic {
-                range: name_range,
+                range: name_range(),
                 severity: Some(DiagnosticSeverity::INFORMATION),
                 message: format!("{}: {}", field_info.name, field_info.type_name),
                 ..Default::default()
@@ -232,7 +243,7 @@ async fn validate_struct_node(
     // Missing required fields: compare expected fields against those we saw above.
     if !expected.has_default {
         let missing =
-            missing_required_fields(&expected.fields, |name| present_fields.contains(name));
+            missing_required_fields(&expected.fields, |name| present_fields.contains(&name));
         if !missing.is_empty() {
             let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
             diagnostics.push(Diagnostic {
@@ -267,6 +278,14 @@ async fn validate_typed_value(
     declared_type: &str,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
+    // A literal written straight into a primitive field — most of what a
+    // configuration file is made of — needs none of the work below: the parse
+    // tree has already classified the literal, and a kind that satisfies the
+    // declared type settles the question on its own.
+    if literal_satisfies(value_node, content, declared_type) {
+        return Vec::new();
+    }
+
     // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
     // validate_nested_value handles all generic-wrapper cases uniformly, so
     // there are no per-container special cases here.
@@ -314,6 +333,43 @@ async fn validate_typed_value(
         code: code(codes::TYPE_MISMATCH),
         ..Default::default()
     }]
+}
+
+/// Whether the parse tree on its own settles that this value fits
+/// `declared_type`.
+///
+/// Tree-sitter has already classified every literal in the document, so a
+/// literal whose kind plainly satisfies the primitive it is written into needs
+/// nothing further: there is nothing to recurse into, and nothing to learn
+/// from deserializing a value whose shape its own node kind already names.
+/// That is what most of a configuration file consists of, and it was costing a
+/// separate `ron` parse per value.
+///
+/// Answering `false` is always safe: the value then goes through
+/// [`validate_nested_value`] and [`check_declared_type`] exactly as before, so
+/// this can only ever skip a check that would have found nothing.
+fn literal_satisfies(node: &tree_sitter::Node, content: &str, declared_type: &str) -> bool {
+    match (node.kind(), declared_type) {
+        ("boolean", "bool") | ("char", "char") => true,
+        ("string", "String" | "&str" | "str") => true,
+        // An integer literal in a float field is fine — serde widens it — and
+        // [`check_type_mismatch`] deliberately lets it through.
+        ("float" | "integer", "f32" | "f64") => true,
+        ("integer", _) => {
+            // The document has already been deserialized once, so the literal
+            // is one `ron` accepts; what is left to check is whether the
+            // field's type can hold it. Only a plain decimal literal is read
+            // here, and RON's hexadecimal, binary and digit-separated forms
+            // fall through to the full check.
+            let Some((min, max)) = integer_bounds(declared_type) else {
+                return false;
+            };
+            super::ts_utils::node_text(node, content)
+                .and_then(|text| text.parse::<i128>().ok())
+                .is_some_and(|literal| literal >= min && literal <= max)
+        }
+        _ => false,
+    }
 }
 
 /// The node's range, clipped to its first line. A multi-line node would
@@ -506,7 +562,7 @@ async fn validate_node_with_type_info<'a>(
             let expected = ExpectedStruct {
                 // The names serde accepts: serialized names, `skip` excluded,
                 // `flatten` expanded when the analyzer can resolve the target.
-                fields: type_info.effective_fields(analyzer),
+                fields: analyzer.effective_fields(type_info),
                 allow_unknown_fields: type_info.has_unresolved_flatten(analyzer),
                 has_default: type_info.has_default,
                 variant: None,
@@ -587,7 +643,7 @@ async fn validate_enum_node(
     }
 
     let expected = ExpectedStruct {
-        fields: expected,
+        fields: Cow::Owned(expected),
         allow_unknown_fields: false,
         has_default: type_info.has_default,
         variant: Some(&named.name),

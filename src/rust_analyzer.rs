@@ -344,6 +344,15 @@ pub struct RustAnalyzer {
     /// the cache changes; never serialized, since it is derivable.
     #[serde(skip)]
     path_tails: OnceLock<HashMap<String, String>>,
+    /// [`TypeInfo::effective_fields`] for every registered type, so that the
+    /// diagnostics walk does not re-derive — and re-allocate — a type's field
+    /// list once per value written against it. A document holding a thousand
+    /// elements of the same struct asked for the same answer a thousand times,
+    /// each one a fresh copy of every field's name, type and docs. Built on
+    /// first use and dropped whenever the cache changes, exactly like
+    /// `path_tails`; never serialized, since it is derivable.
+    #[serde(skip)]
+    effective_fields: OnceLock<HashMap<String, Vec<(String, FieldInfo)>>>,
 }
 
 impl Default for RustAnalyzer {
@@ -360,6 +369,7 @@ impl RustAnalyzer {
             type_cache: HashMap::new(),
             type_aliases: HashMap::new(),
             path_tails: OnceLock::new(),
+            effective_fields: OnceLock::new(),
         }
     }
 
@@ -383,7 +393,7 @@ impl RustAnalyzer {
     /// This is useful when you have pre-constructed TypeInfo objects.
     pub fn add_type(&mut self, type_info: TypeInfo) {
         self.type_cache.insert(type_info.name.clone(), type_info);
-        self.path_tails.take();
+        self.invalidate_derived();
     }
 
     /// Register a type alias.
@@ -401,7 +411,7 @@ impl RustAnalyzer {
     /// # Returns
     /// The removed TypeInfo if it existed
     pub fn remove_type(&mut self, type_path: &str) -> Option<TypeInfo> {
-        self.path_tails.take();
+        self.invalidate_derived();
         self.type_cache.remove(type_path)
     }
 
@@ -409,7 +419,16 @@ impl RustAnalyzer {
     pub fn clear(&mut self) {
         self.type_cache.clear();
         self.type_aliases.clear();
+        self.invalidate_derived();
+    }
+
+    /// Drop everything derived from the registered types, so that the next
+    /// lookup rebuilds it. Every path that changes `type_cache` has to come
+    /// through here, or an index outlives the types it was built from and
+    /// keeps answering for them.
+    fn invalidate_derived(&mut self) {
         self.path_tails.take();
+        self.effective_fields.take();
     }
 
     /// Every `::`-delimited tail of every registered type path, mapped to the
@@ -431,6 +450,36 @@ impl RustAnalyzer {
                 }
             }
             tails
+        })
+    }
+
+    /// The fields serde accepts for `type_info`, answered from a memo when the
+    /// type is one of the registered ones — which, in the walks over a
+    /// document, it always is.
+    ///
+    /// [`TypeInfo::effective_fields`] has to copy the field list it returns,
+    /// and the same type is asked for its fields once per value written
+    /// against it: a document with a long array of one struct paid for a fresh
+    /// copy of that struct's whole field list per element. The memo makes that
+    /// one copy for the whole document instead.
+    pub fn effective_fields(&self, type_info: &TypeInfo) -> Cow<'_, [(String, FieldInfo)]> {
+        match self.effective_fields_index().get(&type_info.name) {
+            Some(fields) => Cow::Borrowed(fields),
+            // A type that was never registered has no entry; it is still
+            // reachable, e.g. a root type handed straight to the validator.
+            None => Cow::Owned(type_info.effective_fields(self)),
+        }
+    }
+
+    /// [`TypeInfo::effective_fields`] for every registered type, keyed by the
+    /// path it is registered under. Derived once and dropped by
+    /// [`Self::invalidate_derived`], like [`Self::path_tails`].
+    fn effective_fields_index(&self) -> &HashMap<String, Vec<(String, FieldInfo)>> {
+        self.effective_fields.get_or_init(|| {
+            self.type_cache
+                .iter()
+                .map(|(name, info)| (name.clone(), info.effective_fields(self)))
+                .collect()
         })
     }
 
@@ -622,6 +671,92 @@ mod tests {
         assert!(
             analyzer.get_type_info("First").is_none(),
             "a cleared analyzer resolves nothing"
+        );
+    }
+
+    /// A type's effective fields are answered from an index built on first
+    /// use, so redefining the type has to invalidate it — otherwise the
+    /// validator keeps checking documents against the fields the type used to
+    /// have. Asking once before the change is what makes a stale index
+    /// observable.
+    #[test]
+    fn test_effective_fields_sees_changes_after_a_lookup() {
+        let mut analyzer = RustAnalyzer::new();
+        let with_fields = |fields: Vec<&str>| TypeInfo {
+            name: "crate::config::Config".to_string(),
+            kind: TypeKind::Struct(
+                fields
+                    .into_iter()
+                    .map(|name| FieldInfo {
+                        name: name.to_string(),
+                        type_name: "bool".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        analyzer.add_type(with_fields(vec!["host"]));
+        let config = analyzer.get_type_info("Config").unwrap().clone();
+        assert_eq!(
+            analyzer
+                .effective_fields(&config)
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["host"]
+        );
+
+        analyzer.add_type(with_fields(vec!["host", "port"]));
+        let config = analyzer.get_type_info("Config").unwrap().clone();
+        assert_eq!(
+            analyzer
+                .effective_fields(&config)
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["host", "port"],
+            "a redefined type's new fields are what the walk is given"
+        );
+
+        // Unregistering the type leaves the index with nothing to say about
+        // it, so the answer comes from the `TypeInfo` handed in rather than
+        // from a leftover entry under the same name.
+        analyzer.remove_type("crate::config::Config");
+        assert_eq!(
+            analyzer
+                .effective_fields(&with_fields(vec!["replacement"]))
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["replacement"],
+            "a removed type is not answered from the index it used to be in"
+        );
+    }
+
+    /// A type the analyzer never registered still has to answer for its
+    /// fields: the root type can be handed straight to the validator.
+    #[test]
+    fn test_effective_fields_of_an_unregistered_type() {
+        let analyzer = RustAnalyzer::new();
+        let config = TypeInfo {
+            name: "crate::config::Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            analyzer
+                .effective_fields(&config)
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["host"]
         );
     }
 
