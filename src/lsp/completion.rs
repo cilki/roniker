@@ -1006,6 +1006,81 @@ mod tests {
         }
     }
 
+    /// The "already written" filter is read off the document's root value at
+    /// every depth, while the fields being filtered come from the innermost
+    /// type. Below the root the two disagree, both ways at once: a nested field
+    /// whose name the root value also uses is filtered out, and a field this
+    /// value really has written survives. Documented in the README's
+    /// Completions section; see
+    /// <https://git.cilki.net/cilki/roniker/issues/101>.
+    #[test]
+    fn test_nested_field_filter_uses_the_root_values_field_names() {
+        let database = TypeInfo {
+            name: "DatabaseConfig".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "username".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        // The root value has a `port` of its own, as config roots routinely do.
+        let root = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "database".to_string(),
+                    type_name: "DatabaseConfig".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(root);
+        analyzer.add_type(database.clone());
+        let analyzer = Arc::new(analyzer);
+
+        let content = "Config(\n    port: 8080,\n    database: DatabaseConfig(\n        host: \"localhost\",\n        \n    ),\n)\n";
+        // The blank line inside DatabaseConfig's parentheses.
+        let labels = labels_at(content, Position::new(4, 8), &database, analyzer);
+
+        assert!(
+            labels.contains(&"username".to_string()),
+            "a field neither value has written should be offered: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"port".to_string()),
+            "the root value's `port` masks the nested one: {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"host".to_string()),
+            "a field this value has written is offered again, \
+             because the root value has no `host`: {:?}",
+            labels
+        );
+    }
+
     #[test]
     fn test_field_names_still_completed_at_top_level() {
         let (_, analyzer) = nested_fixture();

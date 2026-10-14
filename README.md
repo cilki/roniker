@@ -141,7 +141,8 @@ save. Read [Formatting](#formatting) below before you turn it on.
 
 Opening a RON file matched by the pattern above gets you:
 
-- completions for field names, enum variants, and nested struct types
+- completions for field names, enum variants, values, and nested struct types,
+  spelled out under [Completions](#completions) below
 - hover documentation pulled from the doc comments on your structs
 - go-to-definition back to the Rust source, document symbols, rename, and
   formatting — what the formatter lays out, and what it throws away, is spelled
@@ -235,6 +236,32 @@ identifiers, so the LSP accepts exactly what your application will deserialize:
   enough: it decides what `Default::default()` builds, not what serde will
   accept, so a field with no default of its own is still required and leaving it
   out is still reported.
+
+### Completions
+
+What gets offered depends on where in the value the cursor sits:
+
+- In a struct's parentheses: that struct's fields, labeled with the name serde
+  expects, inserted as `name: `, and documented with the field's declared type
+  and doc comment. Where an enum is expected the variants are offered instead,
+  and inside a variant's own parentheses, that variant's fields.
+- After a field's colon: values derived from the type the field is declared as.
+  `true`/`false` for a `bool`, `""` for a `String`, `0` for any integer or
+  float, `[]` and `[...]` for a `Vec` or array, `{}` and `{...}` for a
+  `HashMap` or `BTreeMap`, `Some(...)` and `None` for an `Option`, the variants
+  of an enum, and for a struct a snippet of the whole value with every field
+  laid out.
+- Every registered type, as a fallback, when the field's declared type yields
+  none of the above — a `PathBuf` field, say, or anything else the build script
+  was not given the source for.
+
+Fields the value has already written are left out of the field-name
+completions, with one caveat: the names consulted are always the *root* value's,
+whichever value the cursor is actually in. So inside a nested value, a field
+whose name the root value also uses is never offered — `DatabaseConfig`'s
+`port` goes missing as soon as the root value has a `port` of its own — and a
+field already written there is offered a second time. See
+[#101](https://git.cilki.net/cilki/roniker/issues/101).
 
 ### Runnable examples
 
