@@ -769,6 +769,59 @@ Post(
         assert!(formatted.contains("        // The author's ID"));
     }
 
+    /// RON's extension header is a node of the document rather than a comment
+    /// (`source_file: seq(optional($.extensions), ..., $._value)`), and the
+    /// layout writes out the root value and the comments above it and nothing
+    /// else — so the header is dropped. With `implicit_some` that turns a
+    /// document `ron` accepts into one it rejects, since every `Option` written
+    /// as a bare value depends on it.
+    ///
+    /// Pinned because the README documents it; see
+    /// https://git.cilki.net/cilki/roniker/issues/103. When that is fixed this
+    /// assertion inverts and the README changes with it.
+    #[test]
+    fn test_extension_header_is_dropped() {
+        let formatted = format_ron("#![enable(implicit_some)]\nConfig(\n    port: 8080,\n)");
+        assert!(
+            formatted.contains("port: 8080,"),
+            "the value itself survives: {formatted:?}"
+        );
+        assert!(
+            !formatted.contains("implicit_some"),
+            "the extension header does not: {formatted:?}"
+        );
+    }
+
+    /// Only the comments *before* the root value are collected
+    /// ([`collect_top_level_comments`] filters on `end_byte <= start_byte`), and
+    /// a comment after it is a sibling of the root value rather than a child, so
+    /// [`collect_inner_comments`] doesn't see it either. It is dropped. Pinned
+    /// alongside the case above; see
+    /// https://git.cilki.net/cilki/roniker/issues/103.
+    #[test]
+    fn test_comment_after_root_value_is_dropped() {
+        let formatted = format_ron("Config(\n    port: 8080,\n)\n// keep this in sync with nginx");
+        assert!(
+            formatted.contains("port: 8080,"),
+            "the value itself survives: {formatted:?}"
+        );
+        assert!(
+            !formatted.contains("nginx"),
+            "the trailing comment does not: {formatted:?}"
+        );
+    }
+
+    /// With no value in the document `find_main_value` returns `None` and the
+    /// whole layout — leading comments included, since they are emitted inside
+    /// that branch — is skipped, so the result is empty. The server turns that
+    /// into an edit spanning the document, which empties the file. Pinned
+    /// alongside the cases above; see
+    /// https://git.cilki.net/cilki/roniker/issues/103.
+    #[test]
+    fn test_document_with_no_value_formats_to_nothing() {
+        assert_eq!(format_ron("// TODO: fill this in\n"), "");
+    }
+
     /// Laying out a document is recursive, so a document nested far enough
     /// used to exhaust the stack — aborting the whole language server process,
     /// which no amount of error handling in the editor can survive. A document

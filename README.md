@@ -134,6 +134,9 @@ roots = ["Cargo.toml"]
 language-servers = ["custom-lsp"]
 ```
 
+`auto-format = true` hands the whole file to the server's formatter on every
+save. Read [Formatting](#formatting) below before you turn it on.
+
 ### Now open a file
 
 Opening a RON file matched by the pattern above gets you:
@@ -141,7 +144,8 @@ Opening a RON file matched by the pattern above gets you:
 - completions for field names, enum variants, and nested struct types
 - hover documentation pulled from the doc comments on your structs
 - go-to-definition back to the Rust source, document symbols, rename, and
-  formatting (whole document and range)
+  formatting — what the formatter lays out, and what it throws away, is spelled
+  out under [Formatting](#formatting) below
 - diagnostics, each tagged with a stable code so your editor can filter them:
   - `syntax-error` - the file doesn't parse as RON
   - `unknown-field` - the struct has no such field
@@ -165,6 +169,37 @@ Opening a RON file matched by the pattern above gets you:
     `duplicate-field`
   - *Make struct name explicit* and *Make field type explicit*, which turn
     `server: (host: "localhost")` into `server: ServerConfig(host: "localhost")`
+
+### Formatting
+
+Formatting the whole document lays the root value out again from the parse tree:
+four spaces per level of nesting, one field, element or entry per line, a
+trailing comma after each, `: ` after every field name, and `()`, `[]` and `{}`
+kept closed up when they're empty. A tuple struct holding a single value stays
+on one line (`max_connections: Some(16)`). Comments keep their place — above the
+field they describe, or on the same line as it, or at the top of the file — and
+laying out a document that is already in this shape changes nothing.
+
+Two things are not laid out again but **deleted**, which is why the Helix
+snippet's `auto-format = true` is worth a second thought if your config files
+hold either:
+
+- RON's extension header: `#![enable(implicit_some)]` and friends. It isn't a
+  comment, and the formatter only writes out the root value and the comments
+  above it, so it goes. With `implicit_some` gone every `Option` written as a
+  bare value stops deserializing, and nothing in the editor says so — the
+  server accepts that spelling whether the extension is enabled or not.
+- Any comment *after* the root value, such as a note at the end of the file.
+
+A document holding no value at all — one that is still only a comment, say — is
+emptied rather than left alone. All three are
+[#103](https://git.cilki.net/cilki/roniker/issues/103).
+
+Range formatting ("format selection") is advertised by the server but does not
+work: it replaces the selection with a shorter string, dropping everything after
+the first value in it, which usually leaves the file unparseable
+([#67](https://git.cilki.net/cilki/roniker/issues/67)). Format the whole
+document instead.
 
 ### Serde attributes
 
