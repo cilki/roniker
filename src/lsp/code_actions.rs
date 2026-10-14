@@ -300,7 +300,8 @@ impl NestedWalk<'_> {
             });
             if !missing.is_empty()
                 // Into this value's own parens, not the document root's.
-                && let Some(edits) = generate_field_insertions(value, self.content, &missing)
+                && let Some(edits) =
+                    generate_field_insertions(value, self.content, &missing, self.analyzer)
             {
                 actions.push(single_file_action(
                     self.url,
@@ -442,7 +443,7 @@ fn generate_missing_field_actions(
     .into_iter()
     .filter(|(_, _, fields)| !fields.is_empty())
     .filter_map(|(lead, kind, fields)| {
-        let edits = generate_field_insertions(&root, content, &fields)?;
+        let edits = generate_field_insertions(&root, content, &fields, analyzer)?;
         Some(single_file_action(
             url,
             format!(
@@ -609,6 +610,7 @@ fn generate_field_insertions(
     struct_node: &tree_sitter::Node,
     content: &str,
     missing_fields: &[(String, FieldInfo)],
+    analyzer: &RustAnalyzer,
 ) -> Option<Vec<TextEdit>> {
     use super::ts_utils;
 
@@ -646,7 +648,13 @@ fn generate_field_insertions(
         }
         let rendered: Vec<String> = missing_fields
             .iter()
-            .map(|(name, field)| format!("{}: {}", name, generate_default_value(&field.type_name)))
+            .map(|(name, field)| {
+                format!(
+                    "{}: {}",
+                    name,
+                    generate_default_value(&field.type_name, analyzer)
+                )
+            })
             .collect();
         body.push_str(&rendered.join(", "));
     } else {
@@ -656,7 +664,7 @@ fn generate_field_insertions(
             body.push_str(&indent);
             body.push_str(name);
             body.push_str(": ");
-            body.push_str(&generate_default_value(&field.type_name));
+            body.push_str(&generate_default_value(&field.type_name, analyzer));
             body.push(',');
         }
     }
@@ -725,27 +733,122 @@ fn field_indent(content: &str, struct_node: &tree_sitter::Node) -> String {
     }
 }
 
-/// Generate a default value for a given Rust type
-fn generate_default_value(type_name: &str) -> String {
+/// How many layers of user-defined type the placeholder generator descends
+/// through. A newtype wrapping a newtype is ordinary; a type that contains
+/// itself (`struct Node(Box<Node>)` with the `Box` written out) is not, and the
+/// recursion must not chase it forever.
+const MAX_DEFAULT_DEPTH: usize = 4;
+
+/// Generate a placeholder value for a field of the given Rust type.
+///
+/// The placeholder has to be something RON will actually parse, because the
+/// whole point of the action is to save the user from typing it. For a named
+/// struct `Server()` is enough — its own required fields come back as a
+/// `missing-required-field` diagnostic with a nested "add fields" action to
+/// finish the job. An enum and a tuple struct have no such follow-up, so they
+/// have to be emitted complete:
+///
+/// - an enum names one of its variants, preferring a unit variant since that is
+///   a whole value on its own. `Mode()` names no variant at all and came back as
+///   an `unknown-variant` error with no fix offered.
+/// - a tuple or newtype struct supplies its elements. `UserId()` is a `UserId`
+///   missing its one element, which no diagnostic covers — serde rejects the
+///   file the server called clean.
+fn generate_default_value(type_name: &str, analyzer: &RustAnalyzer) -> String {
+    generate_default_value_depth(type_name, analyzer, MAX_DEFAULT_DEPTH)
+}
+
+fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth: usize) -> String {
     let clean = super::type_utils::normalize_type(type_name);
 
     if clean.starts_with("Option") {
-        "None".to_string()
-    } else if clean == "bool" {
-        "false".to_string()
-    } else if clean.starts_with("Vec") || clean.starts_with("[") {
-        "[]".to_string()
-    } else if clean.starts_with("HashMap") || clean.starts_with("BTreeMap") {
-        "{}".to_string()
-    } else if clean == "String" || clean == "&str" || clean == "str" {
-        "\"\"".to_string()
-    } else if is_numeric_type(&clean) {
-        // Numeric types default to zero
-        "0".to_string()
-    } else {
-        // Custom type - use constructor notation with placeholder
-        format!("{}()", clean)
+        return "None".to_string();
     }
+    if clean == "bool" {
+        return "false".to_string();
+    }
+    if clean.starts_with("Vec") || clean.starts_with("[") {
+        return "[]".to_string();
+    }
+    if clean.starts_with("HashMap") || clean.starts_with("BTreeMap") {
+        return "{}".to_string();
+    }
+    if clean == "String" || clean == "&str" || clean == "str" {
+        return "\"\"".to_string();
+    }
+    if is_numeric_type(&clean) {
+        // Numeric types default to zero
+        return "0".to_string();
+    }
+
+    // A custom type is spelled by its last path segment: a field declared
+    // `config::Server` is written `Server(...)` in RON.
+    let short = super::type_utils::short_name(&clean).to_string();
+    // Constructor notation with no contents, for a type the analyzer doesn't
+    // know and so can't say anything more specific about.
+    let opaque = || format!("{short}()");
+
+    if depth == 0 {
+        return opaque();
+    }
+
+    // Serde sees straight through a smart pointer, and so does RON: a
+    // `Box<Server>` field is written exactly like a `Server` one.
+    for wrapper in ["Box<", "Rc<", "Arc<"] {
+        if let Some(inner) = super::type_utils::extract_inner_type(&clean, wrapper) {
+            return generate_default_value_depth(inner, analyzer, depth - 1);
+        }
+    }
+
+    let Some(info) = analyzer.get_type_info(&clean) else {
+        return opaque();
+    };
+
+    match &info.kind {
+        TypeKind::Enum(variants) => {
+            // A unit variant is a complete value by itself, so prefer one;
+            // failing that, the first variant with its own elements supplied.
+            let Some(variant) = variants
+                .iter()
+                .find(|variant| variant.fields.is_empty())
+                .or_else(|| variants.first())
+            else {
+                // An enum with no variants has no inhabitant to name.
+                return opaque();
+            };
+            let name = variant.serialized_name(info.rename_all.as_deref());
+            match positional_elements(&variant.fields, analyzer, depth) {
+                Some(elements) => format!("{name}({elements})"),
+                None if variant.fields.is_empty() => name.into_owned(),
+                // A struct variant's named fields are reported as missing and
+                // can be added from there, as for a named struct.
+                None => format!("{name}()"),
+            }
+        }
+        TypeKind::Struct(fields) => match positional_elements(fields, analyzer, depth) {
+            Some(elements) => format!("{short}({elements})"),
+            None => opaque(),
+        },
+    }
+}
+
+/// The comma-separated placeholders for a tuple or newtype's elements, or `None`
+/// when `fields` are named (or absent) and so aren't written positionally.
+fn positional_elements(
+    fields: &[FieldInfo],
+    analyzer: &RustAnalyzer,
+    depth: usize,
+) -> Option<String> {
+    if fields.is_empty() || !fields.iter().all(|field| field.is_positional()) {
+        return None;
+    }
+    Some(
+        fields
+            .iter()
+            .map(|field| generate_default_value_depth(&field.type_name, analyzer, depth - 1))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Whether a cleaned type name is a Rust numeric primitive.
@@ -809,15 +912,18 @@ mod tests {
             .parse(content)
             .unwrap()
     }
-    use crate::rust_analyzer::TypeKind;
+    use crate::rust_analyzer::{EnumVariant, TypeKind};
 
     #[test]
     fn test_generate_default_value() {
-        assert_eq!(generate_default_value("bool"), "false");
-        assert_eq!(generate_default_value("String"), "\"\"");
-        assert_eq!(generate_default_value("Option<u32>"), "None");
-        assert_eq!(generate_default_value("Vec<u8>"), "[]");
-        assert_eq!(generate_default_value("HashMap<String, u32>"), "{}");
+        let analyzer = RustAnalyzer::new();
+        let default_value = |type_name: &str| generate_default_value(type_name, &analyzer);
+
+        assert_eq!(default_value("bool"), "false");
+        assert_eq!(default_value("String"), "\"\"");
+        assert_eq!(default_value("Option<u32>"), "None");
+        assert_eq!(default_value("Vec<u8>"), "[]");
+        assert_eq!(default_value("HashMap<String, u32>"), "{}");
 
         // Every numeric primitive defaults to 0, including the pointer-sized
         // integers whose names contain non-`iuf` letters.
@@ -825,11 +931,137 @@ mod tests {
             "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
             "f32", "f64",
         ] {
-            assert_eq!(generate_default_value(numeric), "0", "type: {numeric}");
+            assert_eq!(default_value(numeric), "0", "type: {numeric}");
         }
 
-        // Unknown/custom types fall back to constructor notation.
-        assert_eq!(generate_default_value("Server"), "Server()");
+        // Unknown/custom types fall back to constructor notation, spelled the
+        // way RON spells a type: by its last path segment.
+        assert_eq!(default_value("Server"), "Server()");
+        assert_eq!(default_value("config::Server"), "Server()");
+    }
+
+    /// An enum field's placeholder has to name a variant. `Mode()` names none of
+    /// them, so the quick-fix used to hand back a document carrying an
+    /// `unknown-variant` error with no further fix on offer.
+    #[test]
+    fn test_generate_default_value_for_enum_names_a_variant() {
+        let variant = |name: &str, fields: Vec<FieldInfo>| EnumVariant {
+            name: name.to_string(),
+            fields,
+            ..Default::default()
+        };
+        let positional = |type_name: &str| FieldInfo {
+            name: "0".to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        // A unit variant is a whole value on its own, so it wins even though a
+        // tuple variant comes first.
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                variant("Wait", vec![positional("u64")]),
+                variant("Prod", vec![]),
+            ]),
+            ..Default::default()
+        });
+        // With no unit variant to pick, the first one is supplied in full.
+        analyzer.add_type(TypeInfo {
+            name: "Delay".to_string(),
+            kind: TypeKind::Enum(vec![variant("Wait", vec![positional("u64")])]),
+            ..Default::default()
+        });
+        // A struct variant's named fields come back as missing-required-field,
+        // with a nested action to add them — as for a named struct.
+        analyzer.add_type(TypeInfo {
+            name: "Send".to_string(),
+            kind: TypeKind::Enum(vec![variant(
+                "To",
+                vec![FieldInfo {
+                    name: "addr".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                }],
+            )]),
+            ..Default::default()
+        });
+        // `rename_all` decides the name serde expects, so it decides the name
+        // the placeholder spells.
+        analyzer.add_type(TypeInfo {
+            name: "Level".to_string(),
+            kind: TypeKind::Enum(vec![variant("VeryLoud", vec![])]),
+            rename_all: Some("snake_case".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(generate_default_value("Mode", &analyzer), "Prod");
+        assert_eq!(generate_default_value("Delay", &analyzer), "Wait(0)");
+        assert_eq!(generate_default_value("Send", &analyzer), "To()");
+        assert_eq!(generate_default_value("Level", &analyzer), "very_loud");
+        // Still reachable through the wrappers the validator strips.
+        assert_eq!(generate_default_value("Option<Mode>", &analyzer), "None");
+    }
+
+    /// A tuple or newtype struct has to be given its elements: `UserId()` is a
+    /// `UserId` short one element, which no diagnostic reports — the server
+    /// called the document clean and serde then refused to read it.
+    #[test]
+    fn test_generate_default_value_for_tuple_struct_supplies_elements() {
+        let positional = |index: usize, type_name: &str| FieldInfo {
+            name: index.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "UserId".to_string(),
+            kind: TypeKind::Struct(vec![positional(0, "u32")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Pair".to_string(),
+            kind: TypeKind::Struct(vec![positional(0, "String"), positional(1, "UserId")]),
+            ..Default::default()
+        });
+        // A named struct keeps the bare constructor: its own required fields are
+        // reported and can be added from there.
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        // A type that contains itself must not send the recursion spinning.
+        analyzer.add_type(TypeInfo {
+            name: "Node".to_string(),
+            kind: TypeKind::Struct(vec![positional(0, "Box<Node>")]),
+            ..Default::default()
+        });
+
+        assert_eq!(generate_default_value("UserId", &analyzer), "UserId(0)");
+        assert_eq!(
+            generate_default_value("Pair", &analyzer),
+            "Pair(\"\", UserId(0))"
+        );
+        assert_eq!(generate_default_value("Server", &analyzer), "Server()");
+        // A smart pointer is transparent to serde and to RON alike, so it is
+        // written as whatever it points at.
+        assert_eq!(
+            generate_default_value("Box<UserId>", &analyzer),
+            "UserId(0)"
+        );
+        assert_eq!(generate_default_value("Arc<Server>", &analyzer), "Server()");
+        assert_eq!(
+            generate_default_value("Node", &analyzer),
+            "Node(Node(Node()))",
+            "the recursion is cut off, not followed"
+        );
     }
 
     #[test]
@@ -1284,6 +1516,86 @@ mod tests {
         );
     }
 
+    /// Adding the root's missing fields has to leave a document the validator
+    /// then accepts — that is the whole value of the action. An enum field used
+    /// to be filled in as `Mode()`, which names no variant and so came back as
+    /// `unknown-variant`, and a newtype field as `UserId()`, which serde
+    /// refuses to read while no diagnostic says so.
+    #[tokio::test]
+    async fn test_added_fields_leave_a_document_the_validator_accepts() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Dev".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Prod".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "UserId".to_string(),
+            kind: TypeKind::Struct(vec![field("0", "u32")]),
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![field("mode", "Mode"), field("owner", "UserId")]),
+            ..Default::default()
+        };
+        analyzer.add_type(root.clone());
+        let analyzer = Arc::new(analyzer);
+
+        let content = "Cfg(\n)";
+        let actions = missing_field_actions(content, &root, analyzer.clone());
+        assert_eq!(
+            actions,
+            vec![
+                (
+                    "Add 2 required fields".to_string(),
+                    "Cfg(\n    mode: Dev,\n    owner: UserId(0),\n)".to_string(),
+                ),
+                (
+                    "Add all 2 missing fields".to_string(),
+                    "Cfg(\n    mode: Dev,\n    owner: UserId(0),\n)".to_string(),
+                ),
+            ]
+        );
+
+        for (title, fixed) in actions {
+            let errors: Vec<_> = super::super::diagnostics::validate_ron_with_analyzer(
+                &fixed,
+                None,
+                &root,
+                analyzer.clone(),
+            )
+            .await
+            .into_iter()
+            .filter(|d| d.severity != Some(DiagnosticSeverity::INFORMATION))
+            .map(|d| d.message)
+            .collect();
+            assert!(
+                errors.is_empty(),
+                "'{title}' left problems in:\n{fixed}\n{errors:?}"
+            );
+            assert!(
+                ron::from_str::<ron::Value>(&fixed).is_ok(),
+                "'{title}' left unparseable RON:\n{fixed}"
+            );
+        }
+    }
+
     /// A root type carrying one enum-typed field `mode: Mode`, where `Mode`'s
     /// `Prod` variant requires both `a` and `b`.
     fn nested_variant_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
@@ -1633,7 +1945,7 @@ mod tests {
     /// The edits that insert `fields` into the root struct of `content`.
     fn root_insertions(tree: &Tree, content: &str, fields: &[(&str, &str)]) -> Vec<TextEdit> {
         let root = root_struct_node(tree).expect("expected a root struct");
-        generate_field_insertions(&root, content, &missing(fields))
+        generate_field_insertions(&root, content, &missing(fields), &RustAnalyzer::new())
             .expect("expected an insertion edit")
     }
 
