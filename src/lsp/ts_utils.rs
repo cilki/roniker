@@ -306,20 +306,26 @@ pub fn field_value<'a>(node: &Node<'a>) -> Option<Node<'a>> {
         return None;
     }
 
-    // Field structure: identifier ":" value
-    // So value is typically the 3rd child (after identifier and colon)
+    // Field structure: identifier ":" value — so the value is the child just
+    // past the colon. Walked with a cursor rather than collected into a
+    // `Vec`: this is asked of every field of every struct in the document, and
+    // a vector of each field's children is a whole document's worth of
+    // throwaway allocations.
     let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).collect();
-
-    // Find the colon, then return the next node
-    for (i, child) in children.iter().enumerate() {
-        if child.kind() == ":" && i + 1 < children.len() {
-            return Some(children[i + 1]);
+    let mut children = node.children(&mut cursor);
+    while let Some(child) = children.next() {
+        if child.kind() == ":" {
+            // A trailing colon has no value after it; fall through to the
+            // fallback rather than reporting the colon itself.
+            if let Some(value) = children.next() {
+                return Some(value);
+            }
+            break;
         }
     }
 
-    // Fallback: last child that's not a comma
-    children.iter().rev().find(|c| c.is_named()).copied()
+    // Fallback: the last child that isn't punctuation.
+    node.named_child(node.named_child_count().checked_sub(1)?)
 }
 
 /// Find all fields in a struct node (non-recursive, only direct children)
