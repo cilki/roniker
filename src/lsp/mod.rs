@@ -11,12 +11,24 @@ mod type_utils;
 use crate::rust_analyzer::{self, RustAnalyzer};
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_service::Service;
+
+/// The JSON-RPC message types the server loop deals in, named out of the way of
+/// the `lsp_types` glob above.
+type RpcRequest = tower_lsp::jsonrpc::Request;
+type RpcResponse = tower_lsp::jsonrpc::Response;
 
 #[derive(Clone)]
 pub struct Document {
@@ -988,17 +1000,174 @@ impl Backend {
 
 /// Run the LSP server on stdin/stdout for the given analyzer.
 ///
+/// Returns once the client has sent the `exit` notification, or once the input
+/// stream ends, so the caller can let its process terminate.
+///
 /// `info_diagnostics` turns on the informational diagnostics that annotate a
 /// field with the type it is declared as (`port: u16`). They are only emitted
 /// for the root value's own fields, and only where the value doesn't already
 /// name its type; pass `false` to publish warnings and errors alone.
 pub async fn serve(analyzer: RustAnalyzer, info_diagnostics: bool) {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    serve_on(
+        stdin_stream(),
+        tokio::io::stdout(),
+        analyzer,
+        info_diagnostics,
+    )
+    .await
+}
 
+/// `stdin` as a stream the caller's runtime can walk away from.
+///
+/// [`tokio::io::stdin`] reads on the runtime's blocking pool, and a blocking
+/// read can't be cancelled: dropping the server loop leaves a `read(2)` on the
+/// pipe outstanding, and shutting the runtime down then waits for it to come
+/// back. Nothing but the editor closing the pipe ends that wait, so a process
+/// that returns from [`serve`] still hangs at the end of `main` — which is where
+/// a `#[tokio::main]` application drops its runtime. Reading on a plain OS
+/// thread leaves the shutdown nothing to join; the thread goes when the process
+/// does.
+fn stdin_stream() -> ThreadedStdin {
+    let (chunks_tx, chunks_rx) = mpsc::channel(4);
+
+    std::thread::spawn(move || {
+        use std::io::Read;
+
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            let mut chunk = vec![0; 8192];
+            match stdin.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    chunk.truncate(read);
+                    // The server is gone; so is any reason to keep reading.
+                    if chunks_tx.blocking_send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = chunks_tx.blocking_send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+
+    ThreadedStdin {
+        chunks: chunks_rx,
+        chunk: Vec::new(),
+        handed_out: 0,
+    }
+}
+
+/// The reading half of [`stdin_stream`]: the chunks that thread sends, handed to
+/// the server loop as an [`AsyncRead`].
+struct ThreadedStdin {
+    chunks: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    /// The chunk currently being handed out, and how much of it already was.
+    chunk: Vec<u8>,
+    handed_out: usize,
+}
+
+impl AsyncRead for ThreadedStdin {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.handed_out == this.chunk.len() {
+            match this.chunks.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.chunk = chunk;
+                    this.handed_out = 0;
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                // The reading thread is done, which is end of input.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let take = buf.remaining().min(this.chunk.len() - this.handed_out);
+        buf.put_slice(&this.chunk[this.handed_out..this.handed_out + take]);
+        this.handed_out += take;
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// [`serve`] over an arbitrary pair of streams, so the shutdown handshake can be
+/// driven from a test without taking over the process's stdio.
+async fn serve_on<I, O>(input: I, output: O, analyzer: RustAnalyzer, info_diagnostics: bool)
+where
+    I: AsyncRead + Unpin,
+    O: AsyncWrite,
+{
     let (service, socket) =
         LspService::new(|client| Backend::new(client, analyzer, info_diagnostics));
-    Server::new(stdin, stdout, socket).serve(service).await;
+
+    let (exited_tx, exited_rx) = oneshot::channel();
+    let service = ExitNotifier {
+        inner: service,
+        exited: Some(exited_tx),
+    };
+
+    // `tower_lsp`'s loop only learns that the service has exited when it tries
+    // to dispatch the *next* message, and after `exit` there is no next message:
+    // it parks on the input stream forever. A client that sends `exit` and then
+    // waits for the process to go away — which is what the protocol says `exit`
+    // means — waits until it gives up and kills us. Stop as soon as the
+    // notification has been handled instead.
+    tokio::select! {
+        _ = Server::new(input, output, socket).serve(service) => {}
+        _ = exited_rx => {}
+    }
+}
+
+/// Wraps the LSP service to signal `exited` once the client's `exit`
+/// notification has been handled.
+///
+/// `exit` is answered by `tower_lsp`'s own router rather than by [`Backend`],
+/// so this is the only place the request is visible to us.
+struct ExitNotifier<S> {
+    inner: S,
+    exited: Option<oneshot::Sender<()>>,
+}
+
+impl<S> Service<RpcRequest> for ExitNotifier<S>
+where
+    S: Service<RpcRequest, Response = Option<RpcResponse>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: RpcRequest) -> Self::Future {
+        // Claim the sender before handing the request on: `req` is moved into
+        // the inner service, and only one `exit` can be the one that stops us.
+        let exited = if req.method() == "exit" {
+            self.exited.take()
+        } else {
+            None
+        };
+
+        let response = self.inner.call(req);
+        Box::pin(async move {
+            let response = response.await;
+            if let Some(exited) = exited {
+                let _ = exited.send(());
+            }
+            response
+        })
+    }
 }
 
 /// Build the Markdown hover shown when the cursor is on an enum variant name,
@@ -1049,6 +1218,93 @@ mod tests {
                 info_diagnostics: self.info_diagnostics,
             }
         }
+    }
+
+    /// The `exit` notification means "stop the process", so a server that goes
+    /// on reading its input after one arrives leaves the editor waiting on a
+    /// process that never goes away. Drive the real handshake over a pipe and
+    /// check that `serve_on` returns by itself — with the client's write half
+    /// still open, so that nothing but `exit` can be what ended it.
+    #[tokio::test]
+    async fn serve_returns_after_exit_notification() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let serving = tokio::spawn(serve_on(
+            server_read,
+            server_write,
+            RustAnalyzer::new(),
+            false,
+        ));
+
+        // Drain the replies, so the server never parks on a full pipe instead.
+        let draining = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while client_read.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        for message in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+            r#"{"jsonrpc":"2.0","method":"exit"}"#,
+        ] {
+            client_write
+                .write_all(format!("Content-Length: {}\r\n\r\n{message}", message.len()).as_bytes())
+                .await
+                .unwrap();
+            client_write.flush().await.unwrap();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+            .await
+            .expect("serve kept running after the exit notification")
+            .unwrap();
+
+        drop(client_write);
+        draining.abort();
+    }
+
+    /// A JSON-RPC frame doesn't arrive in one `read(2)`, so the reader behind
+    /// [`stdin_stream`] has to hand a chunk out across as many `poll_read`s as
+    /// the caller's buffer needs, then go back for the next one. Read a pair of
+    /// chunks two bytes at a time and check nothing is lost or repeated at the
+    /// seam, that the error the thread reports surfaces, and that the thread
+    /// hanging up reads as end of input.
+    #[tokio::test]
+    async fn threaded_stdin_hands_out_chunks_in_order() {
+        use tokio::io::AsyncReadExt;
+
+        let (chunks_tx, chunks_rx) = mpsc::channel(4);
+        chunks_tx.send(Ok(b"Content-Len".to_vec())).await.unwrap();
+        chunks_tx.send(Ok(b"gth: 2".to_vec())).await.unwrap();
+
+        let mut stdin = ThreadedStdin {
+            chunks: chunks_rx,
+            chunk: Vec::new(),
+            handed_out: 0,
+        };
+
+        let mut read = Vec::new();
+        let mut buf = [0u8; 2];
+        for _ in 0.."Content-Length: 2".len().div_ceil(2) {
+            let n = stdin.read(&mut buf).await.unwrap();
+            read.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(read, b"Content-Length: 2");
+
+        chunks_tx
+            .send(Err(std::io::Error::other("pipe broke")))
+            .await
+            .unwrap();
+        let error = stdin.read(&mut buf).await.unwrap_err();
+        assert_eq!(error.to_string(), "pipe broke");
+
+        drop(chunks_tx);
+        assert_eq!(stdin.read(&mut buf).await.unwrap(), 0);
     }
 
     /// Test that hover returns documentation for struct fields

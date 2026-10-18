@@ -18,6 +18,10 @@ strsim = { version = "0.11", optional = true }
 
 # For LSP server
 tower-lsp = { version = "0.20", optional = true }
+# `tower-lsp` builds on `tower::Service` but doesn't re-export it, and `serve`
+# needs to name the trait to wrap the service it hands to the server loop.
+# `tower-service` is the crate that defines it, and is all of `tower` we need.
+tower-service = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tree-sitter = { version = "0.25.10", optional = true }
 ron-lsp-tree-sitter = { version = "0.1.0", optional = true }
@@ -54,6 +58,7 @@ analyze = ["dep:syn", "dep:quote", "dep:proc-macro2"]
 # Serve LSP
 lsp = [
   "dep:tower-lsp",
+  "dep:tower-service",
   "dep:tokio",
   "dep:tree-sitter",
   "dep:ron-lsp-tree-sitter",
