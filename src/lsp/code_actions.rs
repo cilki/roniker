@@ -267,13 +267,15 @@ impl NestedWalk<'_> {
             return;
         }
 
-        if value.kind() != "struct" {
+        // `unit` is the empty unnamed struct `()`: a value whose fields are all
+        // missing, and which has parens of its own to insert them into.
+        if !matches!(value.kind(), "struct" | "unit") {
             return;
         }
         // A bare `None`, or any other unit variant, parses as a `struct` node
         // with nothing but its name. It supplies no fields and has nowhere to
         // insert any, so the type its field declares says nothing about it.
-        if ts_utils::child_by_kind(value, "(").is_none() {
+        if value.kind() == "struct" && ts_utils::child_by_kind(value, "(").is_none() {
             return;
         }
         let Some(target) = self.resolve(value, declared_type, path) else {
@@ -583,13 +585,15 @@ fn create_explicit_field_type_action(
 /// `find_main_value` returns the first named, non-annotation child of the root,
 /// which already includes any `struct` or `ERROR` node. A half-typed document
 /// parses as an `ERROR` with the struct as its *sibling* rather than its child,
-/// so that case looks one level up. `None` when the document's root value is
-/// not a struct at all.
+/// so that case looks one level up. A document that is just `()` parses as a
+/// `unit`: an unnamed struct value with no field written, which is where the
+/// fields the root type requires most need adding. `None` when the document's
+/// root value is not a struct at all.
 fn root_struct_node(tree: &Tree) -> Option<tree_sitter::Node<'_>> {
     use super::ts_utils;
 
     match ts_utils::find_main_value(tree)? {
-        main_value if main_value.kind() == "struct" => Some(main_value),
+        main_value if matches!(main_value.kind(), "struct" | "unit") => Some(main_value),
         main_value if main_value.kind() == "ERROR" => {
             ts_utils::child_by_kind(&tree.root_node(), "struct")
         }
@@ -613,6 +617,22 @@ fn generate_field_insertions(
     analyzer: &RustAnalyzer,
 ) -> Option<Vec<TextEdit>> {
     use super::ts_utils;
+
+    // `()` — an unnamed struct with no field written — is a single leaf token,
+    // so there are no `(` and `)` children to anchor on. There is also nothing
+    // inside it to separate the new fields from, which leaves one insertion
+    // between its two characters, on the line it already occupies.
+    if struct_node.kind() == "unit" {
+        let inside = ts_utils::byte_offset_to_position(
+            content,
+            struct_node.start_byte() + 1,
+            struct_node.start_position().row,
+        );
+        return Some(vec![TextEdit {
+            range: Range::new(inside, inside),
+            new_text: one_line_fields(missing_fields, analyzer),
+        }]);
+    }
 
     let open = ts_utils::child_by_kind(struct_node, "(")?;
     // Tree-sitter supplies a zero-width `MISSING ")"` node while the struct is
@@ -646,17 +666,7 @@ fn generate_field_insertions(
         if needs_separator {
             body.push(' ');
         }
-        let rendered: Vec<String> = missing_fields
-            .iter()
-            .map(|(name, field)| {
-                format!(
-                    "{}: {}",
-                    name,
-                    generate_default_value(&field.type_name, analyzer)
-                )
-            })
-            .collect();
-        body.push_str(&rendered.join(", "));
+        body.push_str(&one_line_fields(missing_fields, analyzer));
     } else {
         let indent = field_indent(content, struct_node);
         for (name, field) in missing_fields {
@@ -705,6 +715,22 @@ fn generate_field_insertions(
         new_text: body,
     });
     Some(edits)
+}
+
+/// The missing fields written out for a struct that is staying on one line:
+/// `name: value, name: value`.
+fn one_line_fields(missing_fields: &[(String, FieldInfo)], analyzer: &RustAnalyzer) -> String {
+    missing_fields
+        .iter()
+        .map(|(name, field)| {
+            format!(
+                "{}: {}",
+                name,
+                generate_default_value(&field.type_name, analyzer)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The indentation to put in front of a field inserted into `struct_node`:
@@ -1991,6 +2017,25 @@ mod tests {
         assert_eq!(insert("Cfg()", &[("b", "u32")]), "Cfg(b: 0)");
     }
 
+    /// `()` is a struct value with nothing in it, but the grammar hands it back
+    /// as one indivisible `unit` token — no `(` and `)` children to anchor an
+    /// insertion between. Without a path of its own the missing-field quick-fix
+    /// had nothing to offer on the very document that is missing everything.
+    #[test]
+    fn test_insert_into_empty_unnamed_struct() {
+        assert_eq!(insert("()", &[("b", "u32")]), "(b: 0)");
+        assert_eq!(
+            insert("()", &[("b", "u32"), ("c", "String")]),
+            "(b: 0, c: \"\")"
+        );
+        // Not on the first line, and not at column 0: the insertion point is
+        // one character past the `(` wherever that happens to be.
+        assert_eq!(
+            insert("// a comment\n    ()", &[("b", "u32")]),
+            "// a comment\n    (b: 0)"
+        );
+    }
+
     #[test]
     fn test_insert_keeps_single_line_struct_on_one_line() {
         assert_eq!(insert("Cfg(a: 1)", &[("b", "u32")]), "Cfg(a: 1, b: 0)");
@@ -2066,5 +2111,63 @@ mod tests {
         for edits in edit_sets {
             assert_eq!(apply(content, edits), "Cfg(\n    a: 1,\n    b: \"\",\n)");
         }
+    }
+
+    /// The validator reports `missing-required-field` on a nested `()`, so the
+    /// quick-fix that fills it in has to reach it too — otherwise the error
+    /// names fields the user is left to type out by hand.
+    #[test]
+    fn test_nested_empty_unnamed_struct_gets_its_own_action() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let config = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "srv".to_string(),
+                type_name: "Server".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let url = Url::parse("file:///test.ron").unwrap();
+
+        let content = "Cfg(\n    srv: (),\n)";
+        let actions = generate_code_actions(
+            &parse(content),
+            content,
+            &config,
+            &url,
+            Arc::new(analyzer),
+            &[],
+        );
+        let nested: Vec<(&String, &Vec<TextEdit>)> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) if a.title.ends_with("to srv") => {
+                    Some((&a.title, a.edit.as_ref()?.changes.as_ref()?.get(&url)?))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            nested.len(),
+            1,
+            "expected one action for the nested value. Got: {actions:?}"
+        );
+        assert_eq!(nested[0].0, "Add 1 required field to srv");
+        assert_eq!(
+            apply(content, nested[0].1),
+            "Cfg(\n    srv: (host: \"\"),\n)",
+            "the field goes into the empty value's own parens"
+        );
     }
 }

@@ -153,7 +153,14 @@ async fn validate_struct_node(
     use super::ts_utils;
     let mut diagnostics = Vec::new();
 
-    if node.kind() != "struct" {
+    // RON's unnamed struct syntax with no field written is just `()`, which the
+    // grammar reports as a `unit` node of its own rather than as an empty
+    // `struct`. serde still reads it as the struct the field declares, and
+    // still refuses it when that struct has a field with no default — so it is
+    // validated here as a struct value that supplied nothing, which is exactly
+    // what it is. Skipping it instead left `server: ()`, and a whole document
+    // of `()`, reported as clean and then rejected by the application.
+    if !matches!(node.kind(), "struct" | "unit") {
         return diagnostics;
     }
     // Tuple/newtype structs and variants have positional fields ("0", "1", ...)
@@ -3387,5 +3394,110 @@ mod tests {
                 "for {content}"
             );
         }
+    }
+
+    /// An unnamed struct with nothing in it is written `()`, which the grammar
+    /// hands back as a `unit` token rather than as an empty `struct`. serde
+    /// reads it as the struct the position declares and refuses it when that
+    /// struct has a field with no default — `ron::from_str` answers
+    /// `MissingStructField` — so the fields it leaves out have to be reported
+    /// like any other struct's. Letting the node kind decide meant `()` was
+    /// the one way to write a struct that the server never looked inside,
+    /// which is exactly the spelling someone reaches for to mean "defaults
+    /// here".
+    #[tokio::test]
+    async fn test_empty_unnamed_struct_still_requires_fields() {
+        let missing = |content: &'static str| async move {
+            let (config, analyzer) = named_value_fixture();
+            validate_ron_with_analyzer(content, None, &config, analyzer)
+                .await
+                .into_iter()
+                .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+                .map(|d| (d.message, d.range.start))
+                .collect::<Vec<_>>()
+        };
+
+        // Nested: `Server` still wants its `host`.
+        assert_eq!(
+            missing("Config(\n    mode: Ephemeral,\n    server: (),\n)").await,
+            vec![("Required fields: host".to_string(), Position::new(2, 12))],
+            "`()` written for a struct supplies none of its fields"
+        );
+
+        // The whole document: the root type's own fields are all absent, and
+        // the report lands at the value's first character, there being no
+        // struct name to put it on.
+        assert_eq!(
+            missing("()").await,
+            vec![(
+                "Required fields: mode, server".to_string(),
+                Position::new(0, 0)
+            )],
+            "a document that is only `()` is missing every root field"
+        );
+
+        // Nothing is invented for a struct whose fields all have defaults.
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Tunables".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "retries".to_string(),
+                type_name: "u32".to_string(),
+                ..Default::default()
+            }]),
+            has_default: true,
+            ..Default::default()
+        });
+        let tunables = analyzer
+            .get_type_info("Tunables")
+            .expect("Tunables")
+            .clone();
+        assert!(
+            validate_ron_with_analyzer("()", None, &tunables, Arc::new(analyzer))
+                .await
+                .is_empty(),
+            "`()` is a complete value for a struct that needs nothing"
+        );
+    }
+
+    /// An element of a `Vec<T>` is a value in its own right, so `()` written as
+    /// one is checked against `T` the way a field's value is checked against
+    /// the type the field declares.
+    #[tokio::test]
+    async fn test_empty_unnamed_struct_in_vec_element_requires_fields() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let config = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "servers".to_string(),
+                type_name: "Vec<Server>".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let content = r#"Config(servers: [(host: "x"), ()])"#;
+        let missing: Vec<_> =
+            validate_ron_with_analyzer(content, None, &config, Arc::new(analyzer))
+                .await
+                .into_iter()
+                .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+                .map(|d| (d.message, d.range.start))
+                .collect();
+
+        assert_eq!(
+            missing,
+            vec![("Required fields: host".to_string(), Position::new(0, 30))],
+            "the empty element is reported where it is written, the complete one not at all"
+        );
     }
 }
