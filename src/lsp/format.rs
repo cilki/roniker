@@ -2,7 +2,7 @@
 /// This formatter uses the AST to properly handle formatting while preserving comments
 use super::ts_utils;
 use std::collections::HashSet;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 /// Represents a comment found in the source
 #[derive(Debug, Clone)]
@@ -253,17 +253,27 @@ fn format_items(
     output.push_str(&indent_str.repeat(indent_level));
 }
 
-/// Format RON content using tree-sitter AST, preserving comments
+/// Format RON content using tree-sitter AST, preserving comments.
+///
+/// For a whole open document, prefer [`format_tree`]: the server already holds
+/// that document's parse tree, and parsing a large file again costs more than
+/// laying it out does.
 pub fn format_ron(content: &str) -> String {
-    let indent_str = "    "; // 4 spaces
+    match ts_utils::parse(content) {
+        Some(tree) => format_tree(&tree, content),
+        // If parsing fails, return original content
+        None => content.to_string(),
+    }
+}
 
-    let tree = match ts_utils::parse(content) {
-        Some(t) => t,
-        None => {
-            // If parsing fails, return original content
-            return content.to_string();
-        }
-    };
+/// [`format_ron`] for content whose parse tree the caller already has.
+///
+/// `tree` must be the tree of `content`: the layout is read off the tree and
+/// the text of each leaf is read out of `content` at the byte offsets the tree
+/// recorded, so a tree belonging to different text would reproduce that text's
+/// contents.
+pub fn format_tree(tree: &Tree, content: &str) -> String {
+    let indent_str = "    "; // 4 spaces
 
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
@@ -275,7 +285,7 @@ pub fn format_ron(content: &str) -> String {
     let mut result = String::new();
 
     // Format the main value
-    if let Some(main_value) = ts_utils::find_main_value(&tree) {
+    if let Some(main_value) = ts_utils::find_main_value(tree) {
         // Collect and emit top-level comments
         let top_comments = collect_top_level_comments(&tree.root_node(), content, &main_value);
         for comment in &top_comments {

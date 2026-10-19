@@ -410,8 +410,14 @@ impl LanguageServer for Backend {
 
         let documents = self.documents.read().await;
         if let Some(doc) = documents.get(&uri) {
-            // Basic RON formatting: normalize whitespace and indentation
-            let formatted = Backend::format_ron(&doc.content);
+            // Basic RON formatting: normalize whitespace and indentation. The
+            // document's own tree is laid out directly: it is the tree of
+            // exactly this content, and parsing a large file again costs more
+            // than the layout itself.
+            let formatted = match doc.tree.as_ref() {
+                Some(tree) => format::format_tree(tree, &doc.content),
+                None => Backend::format_ron(&doc.content),
+            };
 
             if formatted != doc.content {
                 let line_count = doc.content.lines().count() as u32;
@@ -1964,6 +1970,67 @@ Document::new(content.to_string()),
                 "completion should not offer Config's fields ({label}). Got: {labels:?}"
             );
         }
+    }
+
+    /// Whole-document formatting lays out the tree the document already
+    /// carries instead of parsing its text again, so what the editor is handed
+    /// has to be exactly what parsing from scratch would have produced — over
+    /// the whole document, including the comments and the `#![enable(...)]`
+    /// header that only the tree knows the position of.
+    #[tokio::test]
+    async fn formatting_a_document_matches_formatting_its_text() {
+        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+
+        let uri: Url = "file:///test/format.ron".parse().unwrap();
+        let content = "#![enable(implicit_some)]\n// leading\nConfig(port:8080,hosts:[\"a\",\"b\"],\nnested:Inner(x:1),)\n";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+
+        let edits = backend
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: FormattingOptions::default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("an unformatted document should produce an edit");
+
+        assert_eq!(edits.len(), 1, "the whole document is replaced at once");
+        assert_eq!(
+            edits[0].new_text,
+            Backend::format_ron(content),
+            "the cached tree and a fresh parse must lay out identically"
+        );
+        assert_eq!(
+            edits[0].range.start,
+            Position::new(0, 0),
+            "the edit replaces the document from its first character"
+        );
+
+        // An already-formatted document is left alone: the handler compares the
+        // layout against the content it came from, not against a reparse.
+        let formatted = edits[0].new_text.clone();
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(formatted));
+        assert!(
+            backend
+                .formatting(DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    options: FormattingOptions::default(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap()
+                .is_none(),
+            "formatting an already-formatted document should produce no edit"
+        );
     }
 
     #[test]
