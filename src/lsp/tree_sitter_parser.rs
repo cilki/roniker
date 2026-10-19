@@ -1,6 +1,6 @@
 use super::ts_utils::{
-    ancestors, child_by_kind, field_name, node_at_position, node_text, position_to_byte_offset,
-    struct_name,
+    ancestor_chain, ancestors, child_by_kind, field_name, node_at_position, node_text,
+    owning_field_for_children, position_to_byte_offset, struct_name,
 };
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
@@ -32,42 +32,36 @@ pub fn find_type_context_at_position(
     content: &str,
     position: Position,
 ) -> Vec<TypeContext> {
-    let mut contexts = Vec::new();
-    if let Some(current) = node_at_position(tree, content, position) {
-        // Walk up the tree to collect all struct contexts
-        for node in ancestors(current) {
-            if node.kind() == "struct" {
-                contexts.push(struct_type_context(&node, content));
-            }
-        }
-    }
+    let Some(current) = node_at_position(tree, content, position) else {
+        return Vec::new();
+    };
 
-    // Reverse to get outermost to innermost
-    contexts.reverse();
+    // The chain arrives outermost first, which is the order the contexts are
+    // wanted in, and costs one descent rather than one `parent` call per level.
+    // Each struct's owning field comes down the chain with it for the same
+    // reason: asking per struct is another walk back up per struct.
+    let mut contexts = Vec::new();
+    let mut owning_field = None;
+    for node in ancestor_chain(tree, current) {
+        if node.kind() == "struct" {
+            contexts.push(struct_type_context(&node, content, owning_field));
+        }
+        owning_field = owning_field_for_children(&node, content, owning_field);
+    }
     contexts
 }
 
 /// The type context a `struct` node contributes: the type name the value writes
 /// out, when it writes one, and the field it is the value of.
-pub fn struct_type_context(node: &Node, content: &str) -> TypeContext {
+///
+/// `owning_field` is that field's name, which the caller supplies because it is
+/// walking the tree and so already has it — see
+/// [`owning_field_for_children`](super::ts_utils::owning_field_for_children).
+pub fn struct_type_context(node: &Node, content: &str, owning_field: Option<&str>) -> TypeContext {
     TypeContext {
         type_name: struct_name(node, content).map(str::to_string),
-        field_name: owning_field_name(node, content).map(str::to_string),
+        field_name: owning_field.map(str::to_string),
     }
-}
-
-/// The name of the field whose value `node` is, if any.
-///
-/// The walk stops at the first enclosing `struct`, because a value nested
-/// directly inside another struct value — the `Inner(..)` of `Some(Inner(..))`
-/// — is that struct's payload rather than the value of any field. Wrappers
-/// that aren't structs are walked through, so the element of an array still
-/// finds the field the array belongs to.
-fn owning_field_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
-    ancestors(*node)
-        .skip(1)
-        .take_while(|ancestor| ancestor.kind() != "struct")
-        .find_map(|ancestor| field_name(&ancestor, content))
 }
 
 /// Get the field name at a specific position in RON content using tree-sitter
@@ -81,12 +75,12 @@ pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> 
     // report the enclosing field instead (or nothing at all), so value
     // completion falls back to offering every workspace type. Recover the field
     // name from that `identifier ERROR(":")` pair first.
-    if let Some(field) = field_of_unterminated_value(current, content, position) {
+    if let Some(field) = field_of_unterminated_value(tree, current, content, position) {
         return Some(field);
     }
 
     // Walk up to find a field node
-    ancestors(current).find_map(|node| field_name(&node, content).map(str::to_string))
+    ancestors(tree, current).find_map(|node| field_name(&node, content).map(str::to_string))
 }
 
 /// Recover the field name for a value that is mid-edit and has no terminator.
@@ -96,8 +90,13 @@ pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> 
 /// `:`. When the cursor sits at or past that identifier within the same struct,
 /// treat it as the field being edited. The cursor check keeps a well-formed
 /// earlier field on the same struct from being misattributed to the dangling one.
-fn field_of_unterminated_value(node: Node, content: &str, position: Position) -> Option<String> {
-    let (name, _) = unterminated_field_pair(node, content, position)?;
+fn field_of_unterminated_value(
+    tree: &Tree,
+    node: Node,
+    content: &str,
+    position: Position,
+) -> Option<String> {
+    let (name, _) = unterminated_field_pair(tree, node, content, position)?;
     node_text(&name, content).map(str::to_string)
 }
 
@@ -107,7 +106,7 @@ fn field_of_unterminated_value(node: Node, content: &str, position: Position) ->
 /// completing a value have no `field` node to go on in that case.
 pub fn unterminated_value_field(tree: &Tree, content: &str, position: Position) -> Option<String> {
     let node = node_at_position(tree, content, position)?;
-    let (name, colon) = unterminated_field_pair(node, content, position)?;
+    let (name, colon) = unterminated_field_pair(tree, node, content, position)?;
     if position_to_byte_offset(content, position) < colon.end_byte() {
         return None;
     }
@@ -117,12 +116,13 @@ pub fn unterminated_value_field(tree: &Tree, content: &str, position: Position) 
 /// Locate the `identifier` / `ERROR(":")` child pair that an unterminated field
 /// leaves behind in the struct containing `node`, if the cursor is at or past it.
 fn unterminated_field_pair<'a>(
+    tree: &'a Tree,
     node: Node<'a>,
     content: &str,
     position: Position,
 ) -> Option<(Node<'a>, Node<'a>)> {
     let cursor_byte = position_to_byte_offset(content, position);
-    let struct_node = ancestors(node).find(|n| n.kind() == "struct")?;
+    let struct_node = ancestors(tree, node).find(|n| n.kind() == "struct")?;
 
     let mut walk = struct_node.walk();
     let children: Vec<Node> = struct_node.children(&mut walk).collect();
@@ -142,7 +142,7 @@ pub fn find_current_variant_context(
 ) -> Option<String> {
     // Walk up to find the innermost struct node with a name
     let current = node_at_position(tree, content, position)?;
-    ancestors(current).find_map(|node| {
+    ancestors(tree, current).find_map(|node| {
         if node.kind() != "struct" {
             return None;
         }
@@ -223,6 +223,34 @@ mod tests {
         assert_eq!(contexts[0].field_name, None);
         assert_eq!(contexts[1].field_name, None);
         assert_eq!(contexts[2].field_name.as_deref(), Some("author"));
+    }
+
+    /// Each struct's owning field comes down the ancestor chain with it now,
+    /// rather than from a walk back out of it, so every level of the nesting
+    /// has to still name the field it is the value of — and the root, which is
+    /// the value of none, has to still say so.
+    #[test]
+    fn test_find_type_context_names_the_owning_field_at_every_level() {
+        let content = "A(b: B(c: C(d: D(e: 1))))";
+        // on the `1`
+        let contexts = find_type_context_at_position(
+            &parse(content),
+            content,
+            Position::new(0, content.find('1').unwrap() as u32),
+        );
+        let named: Vec<_> = contexts
+            .iter()
+            .map(|c| (c.type_name.as_deref(), c.field_name.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (Some("A"), None),
+                (Some("B"), Some("b")),
+                (Some("C"), Some("c")),
+                (Some("D"), Some("d")),
+            ]
+        );
     }
 
     #[test]

@@ -232,20 +232,91 @@ pub fn node_at_position<'a>(tree: &'a Tree, content: &str, position: Position) -
     root.descendant_for_byte_range(byte_offset, byte_offset)
 }
 
-/// Iterate over `node` and each of its ancestors, innermost first (the node
-/// itself comes first, then its parent, and so on up to the root).
-pub fn ancestors<'a>(node: Node<'a>) -> impl Iterator<Item = Node<'a>> {
+/// Every node from the root of `tree` down to `node`, outermost first, with
+/// `node` itself last.
+///
+/// `Node::parent` is not the single step it looks like. Tree-sitter stores no
+/// parent pointers: it answers `parent` by descending from the root of the tree
+/// again, so one parent costs the node's depth and a node's whole ancestry,
+/// asked for one `parent` at a time, costs the *square* of it. Resolving what
+/// a value's type is means collecting every struct value it is nested in, which
+/// is that ancestry, so on a deeply nested document the square is the
+/// difference between answering a request and hanging the editor that sent it.
+///
+/// Descending from the root once costs the depth instead. The descent is
+/// steered by `node`'s byte range: a node's ancestor at each level is the one
+/// child of that level spanning the range, so following it down arrives at
+/// `node` having passed through exactly its ancestors.
+pub fn ancestor_chain<'a>(tree: &'a Tree, node: Node<'a>) -> Vec<Node<'a>> {
+    let mut chain = vec![tree.root_node()];
+    while let Some(&current) = chain.last() {
+        if current.id() == node.id() {
+            return chain;
+        }
+        let mut cursor = current.walk();
+        let spanning = current.children(&mut cursor).find(|child| {
+            child.start_byte() <= node.start_byte() && node.end_byte() <= child.end_byte()
+        });
+        match spanning {
+            Some(child) => chain.push(child),
+            // The descent lost `node` — because it belongs to another tree, or
+            // because two nodes sharing a byte range sent it down the wrong
+            // one. Nothing here needs either to be impossible: fall back to
+            // the walk up, which is slow but cannot miss.
+            None => break,
+        }
+    }
+
+    let mut chain = Vec::new();
     let mut next = Some(node);
-    std::iter::from_fn(move || {
-        let current = next?;
+    while let Some(current) = next {
+        chain.push(current);
         next = current.parent();
-        Some(current)
-    })
+    }
+    chain.reverse();
+    chain
+}
+
+/// Iterate over `node` and each of its ancestors, innermost first (the node
+/// itself comes first, then its parent, and so on up to the root of `tree`).
+///
+/// Prefer [`ancestor_chain`] where the ancestry is wanted outermost first, or
+/// where more than one node's ancestry is: an ancestry costs a descent from
+/// the root, so a walk that asks per value should carry the answer down with
+/// it instead — see [`owning_field_for_children`].
+pub fn ancestors<'a>(tree: &'a Tree, node: Node<'a>) -> impl Iterator<Item = Node<'a>> {
+    ancestor_chain(tree, node).into_iter().rev()
 }
 
 /// Find the first ancestor of a node with a given kind
-pub fn find_ancestor_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    ancestors(node).skip(1).find(|n| n.kind() == kind)
+pub fn find_ancestor_by_kind<'a>(tree: &'a Tree, node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    ancestors(tree, node).skip(1).find(|n| n.kind() == kind)
+}
+
+/// The owning field name to hand a node's children, given the one that reached
+/// the node itself — the walking-down form of the question
+/// [`super::tree_sitter_parser::struct_type_context`] needs answered.
+///
+/// A value's owning field is the innermost `field` ancestor above it, with the
+/// search cut off at the first enclosing `struct`: a value nested directly
+/// inside another struct value — the `Inner(..)` of `Some(Inner(..))` — is that
+/// struct's payload rather than the value of any field. Wrappers that aren't
+/// structs are threaded through, so an array element still finds the field the
+/// array belongs to.
+///
+/// Threading the answer down a walk costs nothing. Asking for it per value
+/// means walking back up per value, which is what makes a walk over a nested
+/// document quadratic — see [`ancestor_chain`].
+pub fn owning_field_for_children<'a>(
+    node: &Node,
+    content: &'a str,
+    owning_field: Option<&'a str>,
+) -> Option<&'a str> {
+    if node.kind() == "struct" {
+        None
+    } else {
+        field_name(node, content).or(owning_field)
+    }
 }
 
 /// Get all children of a node with a specific kind
@@ -479,6 +550,97 @@ mod tests {
     /// A RON document nesting `depth` structs inside each other.
     fn nested(depth: usize) -> String {
         format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth))
+    }
+
+    /// Every node of a document, breadth-first from the root.
+    fn all_nodes<'a>(tree: &'a Tree) -> Vec<Node<'a>> {
+        let mut nodes = vec![tree.root_node()];
+        let mut visited = 0;
+        while visited < nodes.len() {
+            let node = nodes[visited];
+            visited += 1;
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            nodes.extend(children);
+        }
+        nodes
+    }
+
+    /// The ancestry a descent from the root collects has to be exactly the one
+    /// walking up with `Node::parent` gives. The walk up is the definition;
+    /// the descent is only the way to get it without paying the depth over
+    /// again at every level.
+    #[test]
+    fn test_ancestor_chain_matches_the_walk_up() {
+        let documents = [
+            "Config()",
+            "Config(port: 8080)",
+            "Config(\n    server: Server(\n        host: \"münchen\",\n    ),\n)",
+            "Config(servers: [Server(port: 1), (port: 2)], mode: Prod)",
+            "Some(Inner(a: [1, 2, {\"k\": (b: 3)}]))",
+            "Config(\n    // a comment\n    port: 1, /* and another */\n)",
+            // Documents the grammar can only make an error node of still have
+            // an ancestry, and the handlers still ask for it.
+            "Config(port: ",
+            "(((",
+            "Config(port: 1) trailing garbage",
+            // Deep enough that a chain of more than a handful of nodes is
+            // checked; the walk up it is compared against is quadratic, so
+            // deeper than this costs the test suite more than it proves.
+            &nested(40),
+        ];
+
+        for content in documents {
+            let tree = parse(content).expect("fixture must parse");
+            let nodes = all_nodes(&tree);
+            assert!(nodes.len() > 1, "fixture must have children: {content:?}");
+
+            for node in nodes {
+                let mut expected = Vec::new();
+                let mut next = Some(node);
+                while let Some(current) = next {
+                    expected.push(current.id());
+                    next = current.parent();
+                }
+                expected.reverse();
+
+                let chain: Vec<usize> =
+                    ancestor_chain(&tree, node).iter().map(|n| n.id()).collect();
+                assert_eq!(
+                    chain,
+                    expected,
+                    "chain for {} in {content:?}",
+                    node.to_sexp()
+                );
+            }
+        }
+    }
+
+    /// A value's owning field is the innermost `field` above it, and the
+    /// search for it stops at the first enclosing `struct`: a struct's own
+    /// payload belongs to no field of it. Threaded down a walk, that means
+    /// each node hands its children either its own field name, nothing (if it
+    /// is a struct), or whatever it was handed.
+    #[test]
+    fn test_owning_field_for_children() {
+        let content = "Config(server: Some([(port: 1)]))";
+        let tree = parse(content).unwrap();
+
+        let field_of = |kind: &str, owning| {
+            let node = descendants_by_kind(&tree, kind)
+                .into_iter()
+                .next()
+                .expect("fixture must contain the node");
+            owning_field_for_children(&node, content, owning)
+        };
+
+        // A field hands its name down, overriding anything above it.
+        assert_eq!(field_of("field", Some("outer")), Some("server"));
+        // A struct cuts the thread: its payload is not the value of a field.
+        assert_eq!(field_of("struct", Some("server")), None);
+        // Anything else passes on what it was handed, so an array element
+        // still finds the field the array belongs to.
+        assert_eq!(field_of("array", Some("server")), Some("server"));
     }
 
     #[test]

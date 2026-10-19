@@ -633,7 +633,7 @@ fn field_name_node_at<'a>(
     let field_node = if node.kind() == "field" {
         node
     } else {
-        ts_utils::find_ancestor_by_kind(node, "field")?
+        ts_utils::find_ancestor_by_kind(tree, node, "field")?
     };
     let name_node = field_node.child(0)?;
 
@@ -844,9 +844,12 @@ impl Backend {
         let mut owners: HashMap<usize, Option<rust_analyzer::TypeInfo>> = HashMap::new();
         let mut found = Vec::new();
         // Children are pushed in reverse so that they pop in document order.
-        let mut stack = vec![(tree.root_node(), None)];
+        // Each carries the field its value belongs to, for the same reason it
+        // carries the enclosing struct: recovering either from the node means
+        // walking back up the tree, once per value.
+        let mut stack = vec![(tree.root_node(), None, None)];
 
-        while let Some((node, enclosing)) = stack.pop() {
+        while let Some((node, enclosing, owning_field)) = stack.pop() {
             let enclosing = if node.kind() == "struct" {
                 let owner = match enclosing
                     .and_then(|id| owners.get(&id))
@@ -856,7 +859,7 @@ impl Backend {
                     Some(outer) => navigation::step_type_context(
                         &self.rust_analyzer,
                         outer,
-                        &tree_sitter_parser::struct_type_context(&node, content),
+                        &tree_sitter_parser::struct_type_context(&node, content, owning_field),
                     ),
                     // Nothing encloses it, so it is the document's root value.
                     None if enclosing.is_none() => root.clone(),
@@ -880,9 +883,10 @@ impl Backend {
                 found.push((name, owner));
             }
 
+            let child_field = ts_utils::owning_field_for_children(&node, content, owning_field);
             for i in (0..node.child_count()).rev() {
                 if let Some(child) = node.child(i) {
-                    stack.push((child, enclosing));
+                    stack.push((child, enclosing, child_field));
                 }
             }
         }
@@ -2605,6 +2609,97 @@ PostReference(
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "renaming in a {depth}-deep document took {elapsed:?}"
+        );
+    }
+
+    /// Hover, go-to-definition, completion and rename all resolve what type a
+    /// value has by collecting the struct values it is nested in, which was a
+    /// `Node::parent` walk from the cursor out to the root of the document.
+    /// Tree-sitter stores no parent pointers — it answers `parent` by
+    /// descending from the root again — so that walk cost the square of the
+    /// depth, and so did the walk down the document that rename resolves
+    /// owners on, which asked each value's own ancestry what field it belonged
+    /// to. In a release build a single hover inside a 15 KB document nested
+    /// 1000 values deep took 400 ms, 60 KB and 4000 deep took 5.4 s, and
+    /// 120 KB and 8000 deep took 21 s — with the editor blocked on the answer
+    /// and nothing bounding the wait.
+    ///
+    /// The bounds below are deliberately loose. What they test is the
+    /// complexity class, not the constant: one descent answers all of these in
+    /// well under a tenth of a second, while the walk out took 24 seconds per
+    /// request at this depth in the unoptimized build the tests run in.
+    #[tokio::test]
+    async fn test_position_resolution_does_not_grow_with_the_square_of_the_document() {
+        let backend = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+
+        let depth = 4000;
+        let level = "Server(host: \"x\", inner: ";
+        let content = format!(
+            "{}Server(host: \"innermost\"){}",
+            level.repeat(depth),
+            ")".repeat(depth)
+        );
+        let uri = "file:///deep.ron";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content));
+
+        // Inside the `host` of the innermost value, which is as far from the
+        // root as the document goes.
+        let position = Position::new(0, (level.len() * depth + "Server(h".len()) as u32);
+        let text_document_position = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse(uri).unwrap(),
+            },
+            position,
+        };
+
+        let started = std::time::Instant::now();
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        let hovered = started.elapsed();
+        let Some(Hover {
+            contents: HoverContents::Markup(markup),
+            ..
+        }) = hover
+        else {
+            panic!("hover on the innermost 'host' returned nothing");
+        };
+        assert!(
+            markup.value.contains("host: String"),
+            "hover should describe the field. Got: {}",
+            markup.value
+        );
+        assert!(
+            hovered < std::time::Duration::from_secs(5),
+            "hovering at depth {depth} took {hovered:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let completions = backend
+            .completion(CompletionParams {
+                text_document_position,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+        let completed = started.elapsed();
+        assert!(
+            completions.is_some(),
+            "completion at depth {depth} returned nothing"
+        );
+        assert!(
+            completed < std::time::Duration::from_secs(5),
+            "completing at depth {depth} took {completed:?}"
         );
     }
 

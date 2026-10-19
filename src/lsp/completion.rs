@@ -37,7 +37,7 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
     // field — a cursor anywhere inside `server: ServerConfig(...)` would be
     // read as the `server` field's value position, so field names of the
     // nested struct were never offered.
-    for ancestor in ts_utils::ancestors(node) {
+    for ancestor in ts_utils::ancestors(tree, node) {
         match ancestor.kind() {
             // Inside this struct's parentheses. A cursor still on the struct's
             // own name is not in the body yet, so it falls through to the

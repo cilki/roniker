@@ -70,7 +70,7 @@ pub fn generate_remove_field_actions(
         let Some(field_node) = (if node.kind() == "field" {
             Some(node)
         } else {
-            ts_utils::find_ancestor_by_kind(node, "field")
+            ts_utils::find_ancestor_by_kind(tree, node, "field")
         }) else {
             continue;
         };
