@@ -220,6 +220,96 @@ pub fn node_text<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
     node.utf8_text(content.as_bytes()).ok()
 }
 
+/// How long a row has to be before [`LineIndex`] checkpoints it, and so how
+/// much of one a single conversion can end up counting.
+const CHECKPOINT_BYTES: usize = 1024;
+
+/// Byte offset to [`Position`] for a request that converts many of them, in
+/// time that doesn't depend on how long the rows are.
+///
+/// [`byte_offset_to_position`] finds the start of the row by scanning backwards
+/// from the offset, then counts the UTF-16 width of everything between: one
+/// conversion costs as much as the row is long. A request converting a single
+/// position can afford that. One converting a position per node — the outline
+/// carries two ranges for every value and every field, and a rename one for
+/// every occurrence of the field — pays it per node, so the request costs the
+/// document's size multiplied by its longest row. A RON document written on a
+/// single line makes those the same number and the request quadratic, and
+/// nothing stops a RON document from being written on a single line.
+///
+/// This records the UTF-16 column at intervals along the rows long enough to be
+/// worth it, leaving a conversion on one to count at most
+/// [`CHECKPOINT_BYTES`] of it. Rows shorter than that are left to
+/// [`byte_offset_to_position`], which already costs no more than they are long,
+/// so an ordinary document is indexed by doing nothing and converted exactly as
+/// it was before.
+pub struct LineIndex {
+    /// `(byte offset, row, UTF-16 column)` at each checkpoint, by ascending
+    /// offset. Empty for a document whose every row is short.
+    checkpoints: Vec<(usize, u32, u32)>,
+}
+
+impl LineIndex {
+    /// Index the rows of `content` that are long enough to need it.
+    pub fn new(content: &str) -> Self {
+        let mut checkpoints = Vec::new();
+        let mut row_start = 0;
+
+        for (row, line) in content.split('\n').enumerate() {
+            // Only a long row is walked character by character; splitting on
+            // `\n` to find out is a pass over the bytes and nothing more.
+            if line.len() > CHECKPOINT_BYTES {
+                let mut column = 0u32;
+                let mut next = CHECKPOINT_BYTES;
+                for (byte, ch) in line.char_indices() {
+                    if byte >= next {
+                        checkpoints.push((row_start + byte, row as u32, column));
+                        next = byte + CHECKPOINT_BYTES;
+                    }
+                    column += ch.len_utf16() as u32;
+                }
+            }
+            row_start += line.len() + 1; // + the '\n' that split consumed
+        }
+
+        Self { checkpoints }
+    }
+
+    /// The LSP position of `byte_offset`, which falls on `row`.
+    ///
+    /// Takes the row the way [`byte_offset_to_position`] does — from the caller,
+    /// which has it from tree-sitter — and clamps the offset the same way, so
+    /// the two cannot disagree about where an offset lands.
+    pub fn position(&self, content: &str, byte_offset: usize, row: usize) -> Position {
+        let offset = floor_char_boundary(content, byte_offset);
+        let passed = self
+            .checkpoints
+            .partition_point(|&(byte, _, _)| byte <= offset)
+            .checked_sub(1)
+            .map(|last| self.checkpoints[last])
+            .filter(|&(_, checkpoint_row, _)| checkpoint_row as usize == row);
+
+        match passed {
+            // Carry on counting from the last checkpoint passed on this row.
+            Some((from, _, counted)) => Position {
+                line: row as u32,
+                character: counted + utf16_len(&content[from..offset]),
+            },
+            // The row holds no checkpoint, so it is short enough to scan.
+            None => byte_offset_to_position(content, offset, row),
+        }
+    }
+
+    /// The LSP range `node` spans: the indexed counterpart of
+    /// [`node_to_lsp_range`].
+    pub fn node_range(&self, node: &Node, content: &str) -> Range {
+        Range {
+            start: self.position(content, node.start_byte(), node.start_position().row),
+            end: self.position(content, node.end_byte(), node.end_position().row),
+        }
+    }
+}
+
 /// Whether a node is a RON comment (`// ...` line or `/* ... */` block).
 pub fn is_comment(node: &Node) -> bool {
     matches!(node.kind(), "line_comment" | "block_comment")
@@ -924,6 +1014,59 @@ mod tests {
                 "position {position:?} should resolve to the field name node"
             );
         }
+    }
+
+    /// The outline and a rename convert a position per node, so they go through
+    /// [`LineIndex`] instead of scanning the row each offset lands on. The two
+    /// have to answer identically at every offset: the indexed answer is what
+    /// the editor is given, and a column off by one highlights the wrong text.
+    #[test]
+    fn test_line_index_agrees_with_scanning_the_row() {
+        // Rows long enough to carry several checkpoints each, of differing
+        // lengths so offsets land both just after a checkpoint and far past
+        // one, with CRLF endings, a two-byte character and a surrogate pair.
+        let mut content = String::new();
+        for row in 0..4 {
+            content.push_str(&"aä🚀b".repeat(row * 150 + 150));
+            content.push_str(if row % 2 == 0 { "\r\n" } else { "\n" });
+        }
+        // A short row too, which is left to the unindexed path.
+        content.push_str("trailing");
+
+        let index = LineIndex::new(&content);
+        assert!(
+            index.checkpoints.len() > 8,
+            "the fixture has to checkpoint its rows several times over"
+        );
+
+        // Every offset, mid-character ones included: both snap back to the
+        // character boundary before them, and have to snap to the same one.
+        let mut row = 0;
+        for offset in 0..=content.len() {
+            assert_eq!(
+                index.position(&content, offset, row),
+                byte_offset_to_position(&content, offset, row),
+                "offset {offset} on row {row} should land in the same place either way"
+            );
+            if content.as_bytes().get(offset) == Some(&b'\n') {
+                row += 1;
+            }
+        }
+
+        // And an offset past the end of the document is clamped into it.
+        assert_eq!(
+            index.position(&content, content.len() + 99, row),
+            byte_offset_to_position(&content, content.len(), row)
+        );
+    }
+
+    /// An empty document has no row to index and no offset that isn't the start
+    /// of it, which still has to convert rather than reach past the end.
+    #[test]
+    fn test_line_index_of_empty_document() {
+        let index = LineIndex::new("");
+        assert_eq!(index.position("", 0, 0), Position::new(0, 0));
+        assert_eq!(index.position("", 10, 0), Position::new(0, 0));
     }
 
     #[test]

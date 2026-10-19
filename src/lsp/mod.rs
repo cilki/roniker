@@ -577,7 +577,11 @@ impl LanguageServer for Backend {
         // the same name under *other* types are left alone
         let target_type = self.resolve_owner_type_at(&content, Some(&tree), position);
 
-        // Collect the exact name-node ranges of matching fields
+        // Collect the exact name-node ranges of matching fields. Every
+        // occurrence is one byte-offset-to-position conversion, and a document
+        // can hold as many occurrences as it is long, so the long rows are
+        // indexed once instead of being scanned again for every edit.
+        let lines = ts_utils::LineIndex::new(&content);
         let mut changes = Vec::new();
         for (node, owner) in self.fields_named(&tree, &content, &field_name) {
             // When either side can't be resolved, fall back to matching by name
@@ -588,7 +592,7 @@ impl LanguageServer for Backend {
             }
 
             changes.push(TextEdit {
-                range: ts_utils::node_to_lsp_range(&node, &content),
+                range: lines.node_range(&node, &content),
                 new_text: new_name.clone(),
             });
         }
@@ -2827,6 +2831,84 @@ PostReference(
         let edits = &changes[&Url::parse(uri).unwrap()];
         let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
         assert_eq!(lines, vec![2, 3, 4], "all three entries: {edits:?}");
+    }
+
+    /// Each edit a rename produces is one byte-offset-to-position conversion,
+    /// and a document holds as many occurrences of a field as it is long. When
+    /// that conversion scans the row the offset sits on, a document written as
+    /// one long line pays the length of the whole document per edit: renaming
+    /// 16000 occurrences on one line took 1.2 seconds in a release build,
+    /// against 102ms for the same occurrences one per line, and the cost
+    /// quadrupled every time the document doubled.
+    ///
+    /// The bound below is deliberately loose. What it tests is the complexity
+    /// class, not the constant.
+    #[tokio::test]
+    async fn test_rename_cost_does_not_grow_with_the_square_of_the_row() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "servers".to_string(),
+                type_name: "Vec<Server>".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+
+        let entries = 4000;
+        let content = format!(
+            "Config(servers: [{}])",
+            "Server(host: \"x\"), ".repeat(entries)
+        );
+        let uri = "file:///one-line.ron";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content));
+
+        let started = std::time::Instant::now();
+        let result = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::parse(uri).unwrap(),
+                    },
+                    // the `host` of the first entry
+                    position: Position::new(0, 24),
+                },
+                new_name: "hostname".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let changes = result
+            .expect("rename should produce edits")
+            .changes
+            .unwrap();
+        let edits = &changes[&Url::parse(uri).unwrap()];
+        assert_eq!(
+            edits.len(),
+            entries,
+            "every entry owns a 'host', so all of them are renamed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "renaming {entries} occurrences on one line took {elapsed:?}"
+        );
     }
 
     /// A workspace with a struct whose field is an enum, both carrying source
