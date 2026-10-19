@@ -244,11 +244,26 @@ pub const MAX_TREE_DEPTH: usize = 256;
 ///
 /// Deliberately iterative: a recursive depth check would blow the stack on
 /// exactly the input it exists to reject.
+///
+/// A subtree is only ever as deep as it has nodes, so one holding fewer nodes
+/// than the walk has levels left cannot reach the limit however it is shaped,
+/// and is skipped whole. Tree-sitter keeps that node count on the node itself,
+/// so the question costs one field read. An ordinary document is mostly small
+/// subtrees — a value, its fields, their literals — which is why this matters:
+/// the guard runs before every outline request and every format, and visiting
+/// every node of the document to find out it is shallow cost more than the
+/// request it was guarding.
 pub fn exceeds_max_depth(node: &Node) -> bool {
     let mut stack = vec![(*node, 1usize)];
     while let Some((node, depth)) = stack.pop() {
         if depth > MAX_TREE_DEPTH {
             return true;
+        }
+        // A subtree is never deeper than it has nodes, and tree-sitter keeps
+        // that count on the node itself, so a subtree with no room left to
+        // exceed the limit needs no walking at all.
+        if node.descendant_count() <= MAX_TREE_DEPTH - depth + 1 {
+            continue;
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -694,6 +709,52 @@ mod tests {
     fn test_exceeds_max_depth_rejects_deeply_nested_documents() {
         let tree = parse(&nested(MAX_TREE_DEPTH + 1)).unwrap();
         assert!(exceeds_max_depth(&tree.root_node()));
+    }
+
+    /// [`exceeds_max_depth`] skips a subtree whose node count leaves no room to
+    /// reach the limit, so what it answers now depends on arithmetic rather than
+    /// only on the walk. Check it against the walk it replaced, over every
+    /// nesting depth either side of the limit: a guard that fires one level
+    /// early silently costs a legitimate document its outline and its
+    /// formatting, and one that fires one level late is a stack overflow that
+    /// takes the server down.
+    #[test]
+    fn test_exceeds_max_depth_matches_a_full_walk_at_every_depth() {
+        /// The whole-tree walk, with no subtree skipped.
+        fn full_walk(node: &Node) -> bool {
+            let mut stack = vec![(*node, 1usize)];
+            while let Some((node, depth)) = stack.pop() {
+                if depth > MAX_TREE_DEPTH {
+                    return true;
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    stack.push((child, depth + 1));
+                }
+            }
+            false
+        }
+
+        // Each shape nests a different number of tree levels per level of
+        // document nesting, so between them they cross the limit at different
+        // points and no single off-by-one can satisfy them all.
+        let shapes: [fn(usize) -> String; 3] = [
+            nested,
+            |d| format!("{}1{}", "[".repeat(d), "]".repeat(d)),
+            |d| format!("{}1{}", "Some(".repeat(d), ")".repeat(d)),
+        ];
+        for shape in shapes {
+            for depth in 0..=MAX_TREE_DEPTH + 2 {
+                let content = shape(depth);
+                let tree = parse(&content).unwrap();
+                let root = tree.root_node();
+                assert_eq!(
+                    exceeds_max_depth(&root),
+                    full_walk(&root),
+                    "disagreed on a document nesting {depth} levels"
+                );
+            }
+        }
     }
 
     #[test]
