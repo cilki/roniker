@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use tower_lsp::lsp_types::{Position, Range};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Point, Tree};
 
 /// Wrapper around tree-sitter parser for RON files
 pub struct RonParser {
@@ -144,20 +144,53 @@ pub fn line_end_column(content: &str, byte_offset: usize) -> u32 {
 /// here instead would mean counting newlines from the start of the document.
 pub fn byte_offset_to_position(content: &str, byte_offset: usize, row: usize) -> Position {
     let offset = floor_char_boundary(content, byte_offset);
+    position_on_row(content, line_start(content, offset), offset, row)
+}
+
+/// The LSP position of the byte offset `offset`, which falls on row `row` and
+/// whose row begins at byte `row_start`.
+///
+/// The UTF-16 column is the width of what precedes the offset on its own row,
+/// which [`utf16_len`] answers without looking at the rest of the document.
+fn position_on_row(content: &str, row_start: usize, offset: usize, row: usize) -> Position {
     Position {
         line: row as u32,
-        character: utf16_len(&content[line_start(content, offset)..offset]),
+        character: utf16_len(&content[row_start..offset]),
+    }
+}
+
+/// The LSP position of the byte offset a tree-sitter [`Point`] describes.
+///
+/// A `Point` carries the row *and the byte column* of the offset, and
+/// tree-sitter counts that column from the start of the row exactly as
+/// [`line_start`] does — so the row's start is a subtraction away, where
+/// [`byte_offset_to_position`] has to search the text backwards for the newline
+/// that precedes the offset. Every node range the server hands the editor is
+/// two of these conversions, and a large document is converted tens of
+/// thousands of times per request, so skipping that search is worth the
+/// narrower entry point.
+fn point_to_position(content: &str, byte_offset: usize, point: Point) -> Position {
+    let offset = floor_char_boundary(content, byte_offset);
+
+    // The point and the content only disagree if the tree was parsed from
+    // different text than it is being read against; fall back to finding the
+    // row's start in the text rather than slicing at an offset it doesn't have.
+    match offset.checked_sub(point.column) {
+        Some(row_start) if content.is_char_boundary(row_start) => {
+            position_on_row(content, row_start, offset, point.row)
+        }
+        _ => byte_offset_to_position(content, offset, point.row),
     }
 }
 
 /// The LSP position of a node's first byte.
 pub fn node_start_position(node: &Node, content: &str) -> Position {
-    byte_offset_to_position(content, node.start_byte(), node.start_position().row)
+    point_to_position(content, node.start_byte(), node.start_position())
 }
 
 /// The LSP position just past a node's last byte.
 pub fn node_end_position(node: &Node, content: &str) -> Position {
-    byte_offset_to_position(content, node.end_byte(), node.end_position().row)
+    point_to_position(content, node.end_byte(), node.end_position())
 }
 
 /// Convert LSP Position to byte offset in content
@@ -864,11 +897,11 @@ mod tests {
         assert_eq!(line_end_column(content, content.len()), 2);
     }
 
-    /// Node positions are derived from the node's byte offset, scanning back to
-    /// the start of its own line, rather than by counting rows forward from the
-    /// start of the document. The two have to answer identically for every node
-    /// — including on lines carrying multi-byte and astral characters, where a
-    /// byte offset and a UTF-16 column come apart.
+    /// Node positions are derived from the byte column tree-sitter reports for
+    /// the node, rather than by counting rows forward from the start of the
+    /// document. The two have to answer identically for every node — including
+    /// on lines carrying multi-byte and astral characters, where a byte offset
+    /// and a UTF-16 column come apart.
     #[test]
     fn test_node_ranges_agree_with_row_scan() {
         let content =
@@ -905,6 +938,35 @@ mod tests {
             stack.extend(node.children(&mut cursor));
         }
         assert!(walked > 10, "expected a non-trivial tree, walked {walked}");
+    }
+
+    /// A node's position is read off the byte column its own tree recorded,
+    /// which only describes the text that tree was parsed from. Reading a tree
+    /// against text it doesn't belong to is a bug in the caller, but it must
+    /// not take the server down: a panic here would abort the process over one
+    /// stale document. Every offset is clamped into the content at hand, and a
+    /// column the content cannot account for falls back to finding the row's
+    /// start in it.
+    #[test]
+    fn test_node_ranges_against_mismatched_content() {
+        let parsed = "Config(\n    city: \"münchen\",\n    port: 8080,\n)";
+        let tree = parse(parsed).unwrap();
+
+        // Each of these truncates or re-encodes the text the tree describes,
+        // so the nodes' byte offsets and columns no longer fit it.
+        for other in ["", "x", "Config(\n", "ü", "Config(\n    city: \"m"] {
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                let range = node_to_lsp_range(&node, other);
+                assert!(
+                    range.start.character as usize <= other.len(),
+                    "column of {range:?} should be bounded by {other:?}"
+                );
+
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+        }
     }
 
     #[test]
