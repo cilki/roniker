@@ -1,8 +1,11 @@
 /// Tree-sitter based RON formatter with comment preservation
 /// This formatter uses the AST to properly handle formatting while preserving comments
 use super::ts_utils;
-use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
+
+/// One level of indentation. The formatter has never offered a choice of width,
+/// so it is a constant rather than something every layout step carries.
+const INDENT: &str = "    ";
 
 /// Represents a comment found in the source
 #[derive(Debug, Clone)]
@@ -114,143 +117,12 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
     comments
 }
 
-/// Emit any not-yet-emitted leading (non-trailing) comments that fall before
-/// `items[i]` and after the previous item. The struct, array, and map
-/// formatters all lay leading comments out identically; this is that shared
-/// logic. Comments are indented one level deeper than `indent_level`.
-fn emit_leading_comments(
-    output: &mut String,
-    comments: &[Comment],
-    emitted: &mut HashSet<usize>,
-    items: &[Node<'_>],
-    i: usize,
-    indent_str: &str,
-    indent_level: usize,
-) {
-    let item = &items[i];
-    for comment in comments {
-        if emitted.contains(&comment.start_byte) {
-            continue;
-        }
-        if !comment.is_trailing
-            && comment.end_byte <= item.start_byte()
-            && (i == 0 || comment.start_byte > items[i - 1].end_byte())
-        {
-            output.push_str(&indent_str.repeat(indent_level + 1));
-            output.push_str(&comment.text);
-            output.push('\n');
-            emitted.insert(comment.start_byte);
-        }
-    }
-}
-
-/// Emit the single trailing comment (if any) that belongs after `items[i]` and
-/// before the next item. At most one comment is emitted.
-fn emit_trailing_comment(
-    output: &mut String,
-    comments: &[Comment],
-    emitted: &mut HashSet<usize>,
-    items: &[Node<'_>],
-    i: usize,
-) {
-    let item = &items[i];
-    for comment in comments {
-        if emitted.contains(&comment.start_byte) {
-            continue;
-        }
-        if comment.is_trailing && comment.start_byte > item.end_byte() {
-            let next_start = items.get(i + 1).map(|n| n.start_byte());
-            let is_before_next = next_start.map(|s| comment.end_byte <= s).unwrap_or(true);
-            if is_before_next {
-                output.push(' ');
-                output.push_str(&comment.text);
-                emitted.insert(comment.start_byte);
-                break;
-            }
-        }
-    }
-}
-
-/// Emit any not-yet-emitted, non-trailing comments that follow the last item in
-/// a container.
-fn emit_remaining_comments(
-    output: &mut String,
-    comments: &[Comment],
-    emitted: &mut HashSet<usize>,
-    items: &[Node<'_>],
-    indent_str: &str,
-    indent_level: usize,
-) {
-    let Some(last) = items.last() else {
-        return;
-    };
-    for comment in comments {
-        if emitted.contains(&comment.start_byte) {
-            continue;
-        }
-        if comment.start_byte > last.end_byte() && !comment.is_trailing {
-            output.push_str(&indent_str.repeat(indent_level + 1));
-            output.push_str(&comment.text);
-            output.push('\n');
-            emitted.insert(comment.start_byte);
-        }
-    }
-}
-
 /// The named children of a node that carry data, with comments filtered out.
 fn value_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     ts_utils::named_children(node)
         .into_iter()
         .filter(|n| !ts_utils::is_comment(n))
         .collect()
-}
-
-/// Lay out the items of a container one per line, with their comments: leading
-/// comments above the item, the item itself at one extra level of indentation,
-/// a terminating comma, and any trailing comment after it. Comments that follow
-/// the last item are emitted before the caller's closing delimiter.
-///
-/// This is the one layout rule shared by structs, arrays, maps and tuples —
-/// they differ only in the delimiters, which the caller writes, and in what
-/// their items are. Nothing at all is written for an empty container, so the
-/// caller's delimiters stay adjacent.
-fn format_items(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-    items: &[Node<'_>],
-) {
-    if items.is_empty() {
-        return;
-    }
-
-    let comments = collect_inner_comments(node, content);
-
-    output.push('\n');
-    for (i, item) in items.iter().enumerate() {
-        emit_leading_comments(
-            output,
-            &comments,
-            emitted,
-            items,
-            i,
-            indent_str,
-            indent_level,
-        );
-
-        output.push_str(&indent_str.repeat(indent_level + 1));
-        format_node(item, content, output, indent_level + 1, indent_str, emitted);
-        output.push(',');
-
-        emit_trailing_comment(output, &comments, emitted, items, i);
-        output.push('\n');
-    }
-
-    emit_remaining_comments(output, &comments, emitted, items, indent_str, indent_level);
-    output.push_str(&indent_str.repeat(indent_level));
 }
 
 /// Format RON content using tree-sitter AST, preserving comments.
@@ -273,299 +145,246 @@ pub fn format_ron(content: &str) -> String {
 /// recorded, so a tree belonging to different text would reproduce that text's
 /// contents.
 pub fn format_tree(tree: &Tree, content: &str) -> String {
-    let indent_str = "    "; // 4 spaces
-
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
     if ts_utils::exceeds_max_depth(&tree.root_node()) {
         return content.to_string();
     }
 
-    // Build the formatted output
-    let mut result = String::new();
+    let Some(main_value) = ts_utils::find_main_value(tree) else {
+        return String::new();
+    };
 
-    // Format the main value
-    if let Some(main_value) = ts_utils::find_main_value(tree) {
-        // Collect and emit top-level comments
-        let top_comments = collect_top_level_comments(&tree.root_node(), content, &main_value);
-        for comment in &top_comments {
-            result.push_str(&comment.text);
-            result.push('\n');
-        }
+    let mut formatter = Formatter {
+        content,
+        output: String::new(),
+    };
 
-        // Track which comments we've emitted to avoid duplicates
-        let mut emitted_comments = HashSet::new();
-        for comment in &top_comments {
-            emitted_comments.insert(comment.start_byte);
-        }
-
-        format_node(
-            &main_value,
-            content,
-            &mut result,
-            0,
-            indent_str,
-            &mut emitted_comments,
-        );
+    for comment in collect_top_level_comments(&tree.root_node(), content, &main_value) {
+        formatter.output.push_str(&comment.text);
+        formatter.output.push('\n');
     }
+    formatter.node(&main_value, 0);
 
-    result.trim_end().to_string()
+    formatter.output.trim_end().to_string()
 }
 
-/// Format a single node recursively
-fn format_node(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    match node.kind() {
-        "struct" => format_struct(node, content, output, indent_level, indent_str, emitted),
-        "array" => format_array(node, content, output, indent_level, indent_str, emitted),
-        "map" => format_map(node, content, output, indent_level, indent_str, emitted),
-        "tuple" => format_tuple(node, content, output, indent_level, indent_str, emitted),
-        "field" => format_field(node, content, output, indent_level, indent_str, emitted),
-        "map_entry" => format_map_entry(node, content, output, indent_level, indent_str, emitted),
-        // Leaf nodes, and anything the grammar hands us that we don't lay out
-        // ourselves, are reproduced verbatim
-        _ => {
-            if let Some(text) = ts_utils::node_text(node, content) {
-                output.push_str(text);
+/// The document being laid out, and the text being laid out from it.
+///
+/// Every step of the layout needs the source — to read each node's text out of
+/// — and somewhere to write, and neither changes as it descends. Holding both
+/// here leaves each step taking only what actually varies: the node, and how
+/// deep it sits.
+struct Formatter<'a> {
+    content: &'a str,
+    output: String,
+}
+
+impl Formatter<'_> {
+    /// Write `level` levels of indentation.
+    fn indent(&mut self, level: usize) {
+        for _ in 0..level {
+            self.output.push_str(INDENT);
+        }
+    }
+
+    /// Lay out a single node, recursing into whatever it contains.
+    fn node(&mut self, node: &Node, level: usize) {
+        match node.kind() {
+            "struct" => self.struct_value(node, level),
+            "array" => self.container(node, level, ('[', ']'), &value_children(node)),
+            "tuple" => self.container(node, level, ('(', ')'), &value_children(node)),
+            "map" => {
+                let entries = ts_utils::children_by_kind(node, "map_entry");
+                self.container(node, level, ('{', '}'), &entries)
+            }
+            "field" => self.field(node, level),
+            "map_entry" => self.map_entry(node, level),
+            // Leaf nodes, and anything the grammar hands us that we don't lay
+            // out ourselves, are reproduced verbatim
+            _ => {
+                if let Some(text) = ts_utils::node_text(node, self.content) {
+                    self.output.push_str(text);
+                }
             }
         }
     }
-}
 
-/// Format a struct node
-fn format_struct(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    // Get struct name if it exists
-    if let Some(name) = ts_utils::struct_name(node, content) {
-        output.push_str(name);
+    /// Lay out `items` one per line between `delimiters`, with their comments:
+    /// leading comments above the item, the item itself at one extra level of
+    /// indentation, a terminating comma, and any trailing comment after it.
+    /// Comments that follow the last item go before the closing delimiter.
+    ///
+    /// This is the one layout rule shared by arrays, maps, tuples and
+    /// field-style structs — they differ only in their delimiters and in what
+    /// their items are. An empty container keeps its delimiters adjacent.
+    fn container(
+        &mut self,
+        node: &Node,
+        level: usize,
+        (open, close): (char, char),
+        items: &[Node<'_>],
+    ) {
+        self.output.push(open);
+        if !items.is_empty() {
+            let comments = collect_inner_comments(node, self.content);
+
+            self.output.push('\n');
+            for (i, item) in items.iter().enumerate() {
+                self.leading_comments(&comments, items, i, level);
+
+                self.indent(level + 1);
+                self.node(item, level + 1);
+                self.output.push(',');
+
+                self.trailing_comment(&comments, items, i);
+                self.output.push('\n');
+            }
+
+            self.remaining_comments(&comments, items, level);
+            self.indent(level);
+        }
+        self.output.push(close);
     }
 
-    if ts_utils::is_empty_structure(node) {
-        output.push_str("()");
-        return;
+    /// Lay out a struct value: `Name(...)`, or `(...)` when the document leaves
+    /// the name to be inferred.
+    fn struct_value(&mut self, node: &Node, level: usize) {
+        if let Some(name) = ts_utils::struct_name(node, self.content) {
+            self.output.push_str(name);
+        }
+
+        // A struct is either field-style — `User(id: 1)`, laid out like every
+        // other container — or tuple-style, which has its own rules
+        let fields = ts_utils::struct_fields(node);
+        if fields.is_empty() {
+            self.output.push('(');
+            self.struct_values(node, level);
+            self.output.push(')');
+        } else {
+            self.container(node, level, ('(', ')'), &fields);
+        }
     }
 
-    output.push('(');
+    /// Lay out the values of a tuple-style struct (`Some("value")`,
+    /// `Point(1, 2)`). These are the one container whose items are *separated*
+    /// rather than terminated by commas, and a lone value stays on the struct's
+    /// own line, so they don't go through [`Formatter::container`].
+    fn struct_values(&mut self, node: &Node, level: usize) {
+        let values = ts_utils::struct_values(node, self.content);
+        if values.is_empty() {
+            return;
+        }
 
-    // A struct is either field-style — `User(id: 1)`, laid out like every other
-    // container — or tuple-style, which has its own rules
-    let fields = ts_utils::struct_fields(node);
-    if fields.is_empty() {
-        format_struct_values(node, content, output, indent_level, indent_str, emitted);
-    } else {
-        format_items(
-            node,
-            content,
-            output,
-            indent_level,
-            indent_str,
-            emitted,
-            &fields,
-        );
-    }
+        let comments = collect_inner_comments(node, self.content);
+        let inline = values.len() == 1;
 
-    output.push(')');
-}
-
-/// Format the values of a tuple-style struct (`Some("value")`, `Point(1, 2)`).
-/// These are the one container whose items are *separated* rather than
-/// terminated by commas, and a lone value stays on the struct's own line, so
-/// they don't go through `format_items`.
-fn format_struct_values(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    let values = ts_utils::struct_values(node, content);
-    if values.is_empty() {
-        return;
-    }
-
-    let comments = collect_inner_comments(node, content);
-    let inline = values.len() == 1;
-
-    if !inline {
-        output.push('\n');
-    }
-
-    for (i, value) in values.iter().enumerate() {
         if !inline {
-            emit_leading_comments(
-                output,
-                &comments,
-                emitted,
-                &values,
-                i,
-                indent_str,
-                indent_level,
-            );
-            output.push_str(&indent_str.repeat(indent_level + 1));
+            self.output.push('\n');
         }
 
-        format_node(
-            value,
-            content,
-            output,
-            indent_level + 1,
-            indent_str,
-            emitted,
-        );
+        for (i, value) in values.iter().enumerate() {
+            if !inline {
+                self.leading_comments(&comments, &values, i, level);
+                self.indent(level + 1);
+            }
 
-        if i + 1 < values.len() {
-            output.push(',');
-            output.push(if inline { ' ' } else { '\n' });
+            self.node(value, level + 1);
+
+            if i + 1 < values.len() {
+                self.output.push(',');
+                self.output.push(if inline { ' ' } else { '\n' });
+            }
+        }
+
+        if !inline {
+            self.output.push('\n');
+            self.indent(level);
         }
     }
 
-    if !inline {
-        output.push('\n');
-        output.push_str(&indent_str.repeat(indent_level));
-    }
-}
+    /// Lay out a `name: value` field of a struct.
+    fn field(&mut self, node: &Node, level: usize) {
+        if let Some(name) = ts_utils::field_name(node, self.content) {
+            self.output.push_str(name);
+            self.output.push_str(": ");
+        }
 
-/// Format a field node
-fn format_field(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    // Get field name
-    if let Some(name) = ts_utils::field_name(node, content) {
-        output.push_str(name);
-        output.push_str(": ");
+        if let Some(value) = ts_utils::field_value(node) {
+            self.node(&value, level);
+        }
     }
 
-    // Get field value
-    if let Some(value) = ts_utils::field_value(node) {
-        format_node(&value, content, output, indent_level, indent_str, emitted);
-    }
-}
+    /// Lay out a `key: value` entry of a map.
+    fn map_entry(&mut self, node: &Node, level: usize) {
+        let children = value_children(node);
+        let [key, value, ..] = children.as_slice() else {
+            return;
+        };
 
-/// Format a map entry node (`key: value`)
-fn format_map_entry(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    let children = value_children(node);
-    if children.len() < 2 {
-        return;
+        self.node(key, level);
+        self.output.push_str(": ");
+        self.node(value, level);
     }
 
-    format_node(
-        &children[0],
-        content,
-        output,
-        indent_level,
-        indent_str,
-        emitted,
-    );
-    output.push_str(": ");
-    format_node(
-        &children[1],
-        content,
-        output,
-        indent_level,
-        indent_str,
-        emitted,
-    );
-}
-
-/// Format an array node
-fn format_array(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    if ts_utils::is_empty_structure(node) {
-        output.push_str("[]");
-        return;
+    /// Emit the leading (non-trailing) comments that fall before `items[i]` and
+    /// after the item before it, one per line at one level deeper than `level`.
+    ///
+    /// No comment reaches this twice, so nothing records which ones have
+    /// already been written. The window each `i` accepts — past `items[i - 1]`
+    /// and before `items[i]` — is disjoint from every other `i`'s, from the
+    /// window [`Formatter::trailing_comment`] accepts (which wants a *trailing*
+    /// comment), and from [`Formatter::remaining_comments`]' (which starts past
+    /// the last item). A comment belongs to exactly one of them, and the three
+    /// only ever look at one node's own children.
+    fn leading_comments(
+        &mut self,
+        comments: &[Comment],
+        items: &[Node<'_>],
+        i: usize,
+        level: usize,
+    ) {
+        for comment in comments {
+            if !comment.is_trailing
+                && comment.end_byte <= items[i].start_byte()
+                && (i == 0 || comment.start_byte > items[i - 1].end_byte())
+            {
+                self.indent(level + 1);
+                self.output.push_str(&comment.text);
+                self.output.push('\n');
+            }
+        }
     }
 
-    output.push('[');
-    format_items(
-        node,
-        content,
-        output,
-        indent_level,
-        indent_str,
-        emitted,
-        &value_children(node),
-    );
-    output.push(']');
-}
+    /// Emit the single trailing comment (if any) that belongs after `items[i]`
+    /// and before the next item.
+    fn trailing_comment(&mut self, comments: &[Comment], items: &[Node<'_>], i: usize) {
+        let next_start = items.get(i + 1).map(|n| n.start_byte());
+        let trailing = comments.iter().find(|comment| {
+            comment.is_trailing
+                && comment.start_byte > items[i].end_byte()
+                && next_start.is_none_or(|start| comment.end_byte <= start)
+        });
 
-/// Format a map node
-fn format_map(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    if ts_utils::is_empty_structure(node) {
-        output.push_str("{}");
-        return;
+        if let Some(comment) = trailing {
+            self.output.push(' ');
+            self.output.push_str(&comment.text);
+        }
     }
 
-    output.push('{');
-    format_items(
-        node,
-        content,
-        output,
-        indent_level,
-        indent_str,
-        emitted,
-        &ts_utils::children_by_kind(node, "map_entry"),
-    );
-    output.push('}');
-}
-
-/// Format a tuple node
-fn format_tuple(
-    node: &Node,
-    content: &str,
-    output: &mut String,
-    indent_level: usize,
-    indent_str: &str,
-    emitted: &mut HashSet<usize>,
-) {
-    output.push('(');
-    format_items(
-        node,
-        content,
-        output,
-        indent_level,
-        indent_str,
-        emitted,
-        &value_children(node),
-    );
-    output.push(')');
+    /// Emit the non-trailing comments that follow the last item in a container.
+    fn remaining_comments(&mut self, comments: &[Comment], items: &[Node<'_>], level: usize) {
+        let Some(last) = items.last() else {
+            return;
+        };
+        for comment in comments {
+            if !comment.is_trailing && comment.start_byte > last.end_byte() {
+                self.indent(level + 1);
+                self.output.push_str(&comment.text);
+                self.output.push('\n');
+            }
+        }
+    }
 }
 
 #[cfg(test)]

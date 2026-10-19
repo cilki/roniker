@@ -619,19 +619,6 @@ pub fn unwrap_some<'a>(node: &Node<'a>, content: &str) -> Option<Node<'a>> {
     }
 }
 
-/// Check if a node represents an empty structure (), [], or {}
-pub fn is_empty_structure(node: &Node) -> bool {
-    match node.kind() {
-        "struct" | "array" | "map" | "tuple" => {
-            // Check if it has any named children (fields, values, etc.)
-            let mut cursor = node.walk();
-            let has_children = node.named_children(&mut cursor).next().is_some();
-            !has_children
-        }
-        _ => false,
-    }
-}
-
 /// The enum variant a value names, and where that name is written.
 #[derive(Debug, Clone)]
 pub struct ParsedEnumVariant {
