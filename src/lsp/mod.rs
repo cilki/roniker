@@ -986,7 +986,6 @@ impl Backend {
                 &type_info,
                 self.rust_analyzer.clone(),
             )
-            .await
         } else {
             vec![]
         };

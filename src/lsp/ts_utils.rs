@@ -216,8 +216,17 @@ pub fn node_to_lsp_range(node: &Node, content: &str) -> Range {
 }
 
 /// Get the text content of a node
+///
+/// Sliced out of `content` rather than read through `Node::utf8_text`, which
+/// takes the source as bytes and so has to validate the node's whole span as
+/// UTF-8 to hand back a `&str`. `content` is already a `&str`, so the only
+/// thing left to check is that the node's bounds fall on character boundaries
+/// — which `str::get` answers by looking at two bytes instead of at every byte
+/// of the node. Every value and every name the server reads goes through here,
+/// and the root value's span is the whole document, so the difference is a pass
+/// over the file per level of nesting.
 pub fn node_text<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
-    node.utf8_text(content.as_bytes()).ok()
+    content.get(node.start_byte()..node.end_byte())
 }
 
 /// How long a row has to be before [`LineIndex`] checkpoints it, and so how

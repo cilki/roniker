@@ -50,8 +50,11 @@ impl FieldInfo {
             return true;
         }
         // Normalize first: type names from `quote!` are tokenized with spaces
-        // (e.g. "Option < String >")
-        self.type_name.replace(' ', "").starts_with("Option<")
+        // (e.g. "Option < String >"). Borrowing when there is nothing to strip
+        // matters here: every struct value in a document asks this of every
+        // field its type declares, and copying the type name to answer it was
+        // an allocation per field per value.
+        strip_type_whitespace(&self.type_name).starts_with("Option<")
     }
 
     /// Whether this field is positional rather than named — i.e. a field of a

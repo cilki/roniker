@@ -85,7 +85,7 @@ impl ExpectedStruct<'_> {
 /// Every diagnostic for a RON document whose root value is declared to be
 /// `type_info`: a syntax error if it doesn't parse, and otherwise whatever a
 /// walk of the parse tree turns up.
-pub async fn validate_ron_with_analyzer(
+pub fn validate_ron_with_analyzer(
     content: &str,
     tree: Option<&Tree>,
     type_info: &TypeInfo,
@@ -129,9 +129,13 @@ pub async fn validate_ron_with_analyzer(
     // down, validating each value against the type it is declared as. Each
     // value is visited once, so nothing is reported twice.
     if let Some(main_value) = super::ts_utils::find_main_value(tree) {
-        diagnostics.extend(
-            validate_node_with_type_info(&main_value, content, type_info, &analyzer, true).await,
-        );
+        diagnostics.extend(validate_node_with_type_info(
+            &main_value,
+            content,
+            type_info,
+            &analyzer,
+            true,
+        ));
     }
 
     diagnostics
@@ -144,7 +148,7 @@ pub async fn validate_ron_with_analyzer(
 /// Every named-field value in the document goes through here — a struct type's
 /// value and an enum's struct variant alike — so the field-matching,
 /// type-checking and missing-field rules exist in exactly one place.
-async fn validate_struct_node(
+fn validate_struct_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
     expected: &ExpectedStruct<'_>,
@@ -236,15 +240,12 @@ async fn validate_struct_node(
             });
         }
 
-        diagnostics.extend(
-            Box::pin(validate_typed_value(
-                &value_node,
-                content,
-                &field_info.type_name,
-                analyzer,
-            ))
-            .await,
-        );
+        diagnostics.extend(validate_typed_value(
+            &value_node,
+            content,
+            &field_info.type_name,
+            analyzer,
+        ));
     }
 
     // Missing required fields: compare expected fields against those we saw above.
@@ -279,7 +280,7 @@ async fn validate_struct_node(
 ///
 /// Every typed value in the document is checked here, whether it is a struct
 /// field's value or a tuple variant's payload.
-async fn validate_typed_value(
+fn validate_typed_value(
     value_node: &tree_sitter::Node<'_>,
     content: &str,
     declared_type: &str,
@@ -296,15 +297,17 @@ async fn validate_typed_value(
     // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
     // validate_nested_value handles all generic-wrapper cases uniformly, so
     // there are no per-container special cases here.
-    let deep = Box::pin(validate_nested_value(
-        value_node,
-        content,
-        declared_type,
-        analyzer,
-    ))
-    .await;
+    let deep = validate_nested_value(value_node, content, declared_type, analyzer);
     if !deep.diagnostics.is_empty() {
         return deep.diagnostics;
+    }
+    // The walk above went through the value itself and reported whatever it
+    // found there, value by value and at each value's own position, so there is
+    // nothing left for the surface check to learn — and learning it would mean
+    // deserializing the value all over again, which for the long array of
+    // structs a large config file mostly consists of is the whole document.
+    if deep.settled {
+        return Vec::new();
     }
 
     // Primitive / surface-level type check. The value's own source text carries
@@ -317,12 +320,6 @@ async fn validate_typed_value(
     let value_text = super::ts_utils::node_text(value_node, content);
     let parsed_value = if is_custom_type(declared_type) {
         None
-    } else if let Some(shape) = deep.shape {
-        // The walk above went through the value itself and left behind what it
-        // found there, so there is nothing left to learn from deserializing it
-        // — which for the long array of structs that a large config file mostly
-        // consists of would mean parsing the whole document a second time.
-        Some(shape)
     } else {
         value_text.and_then(|text| ron::from_str::<Value>(text).ok())
     };
@@ -356,7 +353,50 @@ async fn validate_typed_value(
 /// [`validate_nested_value`] and [`check_declared_type`] exactly as before, so
 /// this can only ever skip a check that would have found nothing.
 fn literal_satisfies(node: &tree_sitter::Node, content: &str, declared_type: &str) -> bool {
-    match (node.kind(), declared_type) {
+    tree_satisfies(node, content, &normalize_type(declared_type))
+}
+
+/// [`literal_satisfies`] on an already-normalized type name, so that the
+/// recursion through generic wrappers doesn't renormalize at every layer.
+///
+/// The wrappers are seen *through*: a document writes `Option<T>` as `Some(v)`,
+/// `None` or a bare `v`, and `Box<T>`/`Rc<T>`/`Arc<T>` as the inner value
+/// outright, so in each case the question is the one the wrapped type asks of
+/// the value the tree already holds. A `Vec<T>` is an array whose every element
+/// has to answer it.
+///
+/// Only while the wrapped type is not a custom struct or enum, though. Those
+/// are [`validate_nested_value`]'s business: it reports things no amount of
+/// looking at the tree can — a `Vec<T>` whose `T` the analyzer never
+/// registered, say — from the very same spellings, so a wrapper around one is
+/// never settled here.
+fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bool {
+    if let Some(inner) = extract_inner_type(declared, "Option<") {
+        if is_custom_type(inner) {
+            return false;
+        }
+        // `None` is the one spelling that carries no value to look at.
+        if node.kind() == "identifier" {
+            return super::ts_utils::node_text(node, content) == Some("None");
+        }
+        let inner_node = super::ts_utils::unwrap_some(node, content).unwrap_or(*node);
+        return tree_satisfies(&inner_node, content, inner);
+    }
+    if let Some(inner) = ["Box<", "Rc<", "Arc<"]
+        .iter()
+        .find_map(|wrapper| extract_inner_type(declared, wrapper))
+    {
+        return !is_custom_type(inner) && tree_satisfies(node, content, inner);
+    }
+    if let Some(element) = extract_inner_type(declared, "Vec<") {
+        return !is_custom_type(element)
+            && node.kind() == "array"
+            && super::ts_utils::array_elements(node)
+                .iter()
+                .all(|value| tree_satisfies(value, content, element));
+    }
+
+    match (node.kind(), declared) {
         ("boolean", "bool") | ("char", "char") => true,
         ("string", "String" | "&str" | "str") => true,
         // An integer literal in a float field is fine — serde widens it — and
@@ -368,7 +408,7 @@ fn literal_satisfies(node: &tree_sitter::Node, content: &str, declared_type: &st
             // field's type can hold it. Only a plain decimal literal is read
             // here, and RON's hexadecimal, binary and digit-separated forms
             // fall through to the full check.
-            let Some((min, max)) = integer_bounds(declared_type) else {
+            let Some((min, max)) = integer_bounds(declared) else {
                 return false;
             };
             super::ts_utils::node_text(node, content)
@@ -410,16 +450,15 @@ fn struct_name_range(node: &tree_sitter::Node, content: &str) -> Range {
 /// What recursing into a value turned up.
 struct Nested {
     diagnostics: Vec<Diagnostic>,
-    /// The value's shape, filled in when the walk descended into the value
-    /// itself and so already knows what that shape is. The surface check in
-    /// [`validate_typed_value`] can then work from this instead of
-    /// deserializing the value to find out — which for a long array of structs
-    /// means copying the whole subtree.
-    ///
-    /// Only the shape matters: the contents are left empty, because whatever
-    /// the surface check would have made of them the walk has just reported
-    /// for itself, value by value and at each value's own position.
-    shape: Option<Value>,
+    /// Whether the walk went through the value itself, leaving the surface
+    /// check in [`validate_typed_value`] nothing to add. Set only where the
+    /// walk reached the value the document actually wrote — the elements of an
+    /// array written for a `Vec`, the value inside an explicit `Some(..)` —
+    /// since that is what makes the surface check redundant rather than merely
+    /// expensive: it would have to deserialize the whole subtree to conclude
+    /// what the walk has just reported value by value, at each value's own
+    /// position.
+    settled: bool,
 }
 
 /// Recurse into a value whose declared type is a custom struct/enum, or a
@@ -429,14 +468,14 @@ struct Nested {
 /// (Vec<T>, Option<T>, …). Nothing is reported for a type we don't recurse
 /// into — the caller ([`validate_typed_value`]) checks those against the
 /// value's own shape instead.
-async fn validate_nested_value<'a>(
+fn validate_nested_value<'a>(
     value_node: &tree_sitter::Node<'a>,
     content: &str,
     field_type: &str,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Nested {
     let mut diagnostics = Vec::new();
-    let mut shape = None;
+    let mut settled = false;
     let field_type_normalized = normalize_type(field_type);
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
@@ -464,13 +503,11 @@ async fn validate_nested_value<'a>(
                 diagnostics.push(unknown_type_diag(inner_type));
             } else if value_node.kind() == "array" {
                 for element in super::ts_utils::array_elements(value_node) {
-                    let elem_diags = Box::pin(validate_typed_value(
+                    diagnostics.extend(validate_typed_value(
                         &element, content, inner_type, analyzer,
-                    ))
-                    .await;
-                    diagnostics.extend(elem_diags);
+                    ));
                 }
-                shape = Some(Value::Seq(Vec::new()));
+                settled = true;
             }
         }
     } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
@@ -483,17 +520,32 @@ async fn validate_nested_value<'a>(
                 // An `Option` field is usually written `Some(value)`. Validate
                 // the wrapped value rather than the `Some` wrapper, or the
                 // inner type's own fields go unchecked.
-                let inner_node =
-                    super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
-                let nested_diags = Box::pin(validate_node_with_type_info(
-                    &inner_node,
-                    content,
-                    inner_type_info,
-                    analyzer,
-                    false,
-                ))
-                .await;
-                diagnostics.extend(nested_diags);
+                //
+                // What is inside an explicit `Some(..)` is checked against the
+                // inner type exactly the way a field's value is checked
+                // against the field's type — the same way a `Vec`'s elements
+                // are above — so a wrapped value of the wrong shape is
+                // reported where it is written and against the type that was
+                // actually expected there. Having been through it, the surface
+                // check in [`validate_typed_value`] has nothing left to add.
+                match super::ts_utils::unwrap_some(value_node, content) {
+                    Some(inner) => {
+                        settled = true;
+                        diagnostics
+                            .extend(validate_typed_value(&inner, content, inner_type, analyzer));
+                    }
+                    // A bare value written for the `Option`, which RON also
+                    // accepts. There is no wrapper to see through, so the
+                    // value is the inner type's own and the surface check
+                    // still reads it as the wrapper's.
+                    None => diagnostics.extend(validate_node_with_type_info(
+                        value_node,
+                        content,
+                        inner_type_info,
+                        analyzer,
+                        false,
+                    )),
+                }
             } else {
                 diagnostics.push(unknown_type_diag(inner_type));
             }
@@ -501,15 +553,13 @@ async fn validate_nested_value<'a>(
     } else if is_custom_type(&field_type_normalized) {
         // Plain custom struct/enum — validate the node directly
         if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
-            let nested_diags = Box::pin(validate_node_with_type_info(
+            diagnostics.extend(validate_node_with_type_info(
                 value_node,
                 content,
                 nested_type_info,
                 analyzer,
                 false,
-            ))
-            .await;
-            diagnostics.extend(nested_diags);
+            ));
         } else {
             // Unknown custom type — report an error at the value node
             diagnostics.push(Diagnostic {
@@ -522,7 +572,10 @@ async fn validate_nested_value<'a>(
         }
     }
 
-    Nested { diagnostics, shape }
+    Nested {
+        diagnostics,
+        settled,
+    }
 }
 
 /// The "unknown variant" diagnostic for a name the enum `type_info` does not
@@ -557,7 +610,7 @@ fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Di
 ///
 /// `at_root` is true only for the document's root value, and gates the
 /// informational type hints, which are deliberately top-level only.
-async fn validate_node_with_type_info<'a>(
+fn validate_node_with_type_info<'a>(
     node: &tree_sitter::Node<'a>,
     content: &str,
     type_info: &TypeInfo,
@@ -575,9 +628,9 @@ async fn validate_node_with_type_info<'a>(
                 variant: None,
                 at_root,
             };
-            Box::pin(validate_struct_node(node, content, &expected, analyzer)).await
+            validate_struct_node(node, content, &expected, analyzer)
         }
-        TypeKind::Enum(_) => Box::pin(validate_enum_node(node, content, type_info, analyzer)).await,
+        TypeKind::Enum(_) => validate_enum_node(node, content, type_info, analyzer),
     }
 }
 
@@ -587,7 +640,7 @@ async fn validate_node_with_type_info<'a>(
 /// RON spells a unit variant as a bare name (`Prod`), a tuple variant as
 /// `Prod(30)` and a struct variant as `Prod(retries: 3)` — the last two both
 /// parsing as a `struct` node whose leading identifier is the variant name.
-async fn validate_enum_node(
+fn validate_enum_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
     type_info: &TypeInfo,
@@ -636,15 +689,12 @@ async fn validate_enum_node(
     if expected.iter().all(|(_, f)| f.is_positional()) {
         let mut diagnostics = Vec::new();
         for (value_node, (_, field)) in payload.iter().zip(&expected) {
-            diagnostics.extend(
-                Box::pin(validate_typed_value(
-                    value_node,
-                    content,
-                    &field.type_name,
-                    analyzer,
-                ))
-                .await,
-            );
+            diagnostics.extend(validate_typed_value(
+                value_node,
+                content,
+                &field.type_name,
+                analyzer,
+            ));
         }
         return diagnostics;
     }
@@ -656,7 +706,7 @@ async fn validate_enum_node(
         variant: Some(&named.name),
         at_root: false,
     };
-    Box::pin(validate_struct_node(node, content, &expected, analyzer)).await
+    validate_struct_node(node, content, &expected, analyzer)
 }
 
 /// What is wrong with a value declared to be `expected_type`, worded as the
@@ -983,10 +1033,10 @@ mod tests {
         }
     }
 
-    async fn syntax_error(content: &str) -> Diagnostic {
+    fn syntax_error(content: &str) -> Diagnostic {
         let analyzer = Arc::new(RustAnalyzer::new());
         let diagnostics =
-            validate_ron_with_analyzer(content, None, &two_field_config(), analyzer).await;
+            validate_ron_with_analyzer(content, None, &two_field_config(), analyzer);
         assert_eq!(
             diagnostics.len(),
             1,
@@ -1006,11 +1056,11 @@ mod tests {
     /// failed in, and anchoring every error at the start of the file instead
     /// underlines the first character of a document whose mistake is twenty
     /// lines down.
-    #[tokio::test]
-    async fn test_syntax_error_reported_at_the_offending_line() {
+    #[test]
+    fn test_syntax_error_reported_at_the_offending_line() {
         // The colon after `port` is missing.
         let content = "Config(\n    host: \"localhost\",\n    port 8080,\n)";
-        let diagnostic = syntax_error(content).await;
+        let diagnostic = syntax_error(content);
 
         assert_eq!(
             diagnostic.range.start.line, 2,
@@ -1026,10 +1076,10 @@ mod tests {
 
     /// An unclosed container is reported at the end of the document, not at its
     /// start.
-    #[tokio::test]
-    async fn test_syntax_error_at_end_of_document() {
+    #[test]
+    fn test_syntax_error_at_end_of_document() {
         let content = "Config(\n    host: \"localhost\",\n    port: 8080,\n";
-        let diagnostic = syntax_error(content).await;
+        let diagnostic = syntax_error(content);
 
         assert!(
             diagnostic.range.start.line >= 2,
@@ -1040,8 +1090,8 @@ mod tests {
 
     /// The reported range is never empty: a zero-width diagnostic doesn't render
     /// in most editors.
-    #[tokio::test]
-    async fn test_syntax_error_range_is_not_empty() {
+    #[test]
+    fn test_syntax_error_range_is_not_empty() {
         for content in [
             "Config(",
             "Config(\n    host: \"localhost\"\n    port: 8080,\n)",
@@ -1049,7 +1099,7 @@ mod tests {
             ")",
             "Config(\n    host: \"unterminated,\n)",
         ] {
-            let range = syntax_error(content).await.range;
+            let range = syntax_error(content).range;
             let start = (range.start.line, range.start.character);
             let end = (range.end.line, range.end.character);
             assert!(
@@ -1063,10 +1113,10 @@ mod tests {
     /// `3:6-4:1:` span prefix that `SpannedError` prints — the span is already
     /// carried by the diagnostic's range, and repeating it as text is noise the
     /// editor shows inline.
-    #[tokio::test]
-    async fn test_syntax_error_message_has_no_span_prefix() {
+    #[test]
+    fn test_syntax_error_message_has_no_span_prefix() {
         let content = "Config(\n    host: \"localhost\",\n    port 8080,\n)";
-        let diagnostic = syntax_error(content).await;
+        let diagnostic = syntax_error(content);
 
         assert_eq!(
             diagnostic.message, "RON syntax error: Expected colon",
@@ -1077,11 +1127,11 @@ mod tests {
 
     /// Columns go out in UTF-16 code units, while RON counts them in characters.
     /// A non-ASCII string earlier on the line is what tells the two apart.
-    #[tokio::test]
-    async fn test_syntax_error_column_is_utf16() {
+    #[test]
+    fn test_syntax_error_column_is_utf16() {
         // The comma after the string is missing, so the error lands on `port`.
         let content = "Config(host: \"münchen 🚀\" port: 80)";
-        let diagnostic = syntax_error(content).await;
+        let diagnostic = syntax_error(content);
 
         let expected = content
             .split_once("port")
@@ -1104,8 +1154,8 @@ mod tests {
     /// owns the variant's field. That has to work however the enclosing values
     /// are spelled: on one line or several, and with or without their struct
     /// names (RON lets those be omitted).
-    #[tokio::test]
-    async fn test_struct_variant_fields_in_nested_value() {
+    #[test]
+    fn test_struct_variant_fields_in_nested_value() {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "PostType".to_string(),
@@ -1163,7 +1213,7 @@ mod tests {
 
             for (shape, content) in [("multi-line", multiline), ("single-line", single_line)] {
                 let diagnostics =
-                    validate_ron_with_analyzer(&content, None, &config, analyzer.clone()).await;
+                    validate_ron_with_analyzer(&content, None, &config, analyzer.clone());
                 assert!(
                     diagnostics.iter().any(|d| {
                         d.severity == Some(DiagnosticSeverity::ERROR)
@@ -1179,7 +1229,7 @@ mod tests {
                 "{root}(\n    server: {nested}(\n        post_type: Detailed(\n            length: 1,\n        ),\n    ),\n)"
             );
             let diagnostics =
-                validate_ron_with_analyzer(&good, None, &config, analyzer.clone()).await;
+                validate_ron_with_analyzer(&good, None, &config, analyzer.clone());
             assert!(
                 !diagnostics
                     .iter()
@@ -1189,8 +1239,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_enum_variant_validation() {
+    #[test]
+    fn test_enum_variant_validation() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "PostType".to_string(),
@@ -1222,7 +1272,7 @@ mod tests {
 
         // Valid enum variant
         let content = "Long";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1232,7 +1282,7 @@ mod tests {
 
         // Another valid variant
         let content = "Short";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1242,7 +1292,7 @@ mod tests {
 
         // Invalid enum variant
         let content = "Medium";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert_eq!(diagnostics.len(), 1, "Medium should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Medium'"),
@@ -1252,7 +1302,7 @@ mod tests {
 
         // Invalid enum variant (typo)
         let content = "Longs";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert_eq!(diagnostics.len(), 1, "Longs should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Longs'"),
@@ -1261,8 +1311,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_struct_with_enum_field() {
+    #[test]
+    fn test_struct_with_enum_field() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Post".to_string(),
@@ -1309,7 +1359,7 @@ mod tests {
             title: "Test",
             post_type: Long,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -1320,8 +1370,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_nested_enum_field_variant_validation() {
+    #[test]
+    fn test_nested_enum_field_variant_validation() {
         // A registered enum used as the value of a nested struct field must be
         // validated: an invalid variant should error, a valid one should not.
         let mut analyzer = RustAnalyzer::new();
@@ -1368,7 +1418,7 @@ mod tests {
 
         // A nested variant typo must be flagged with a "did you mean" suggestion.
         let bad = "Config(\n    server: Server(\n        mode: Productio,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone());
         let variant_err = diagnostics.iter().find(|d| {
             d.severity == Some(DiagnosticSeverity::ERROR)
                 && d.message.contains("Unknown variant 'Productio'")
@@ -1389,7 +1439,7 @@ mod tests {
 
         // A completely different word must still error, just without a suggestion.
         let bad = "Config(\n    server: Server(\n        mode: Prod,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone());
         assert!(
             diagnostics.iter().any(|d| {
                 d.severity == Some(DiagnosticSeverity::ERROR)
@@ -1401,7 +1451,7 @@ mod tests {
 
         // Valid nested variant must not produce any error.
         let good = "Config(\n    server: Server(\n        mode: Production,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(good, None, &config, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(good, None, &config, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -1411,8 +1461,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_struct_field_expects_struct_not_primitive() {
+    #[test]
+    fn test_struct_field_expects_struct_not_primitive() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Post".to_string(),
@@ -1449,7 +1499,7 @@ mod tests {
             id: 101,
             author: 1,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics.is_empty(),
             "Should error on primitive when expecting struct"
@@ -1467,7 +1517,7 @@ mod tests {
             id: 101,
             author: User(id: 1, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         assert!(
             diagnostics.iter().any(
                 |d| d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("User")
@@ -1508,7 +1558,7 @@ mod tests {
             ..Default::default()
         });
         let analyzer = Arc::new(raw_analyzer);
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1521,8 +1571,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_alias_field_accepted() {
+    #[test]
+    fn test_serde_alias_field_accepted() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -1538,7 +1588,7 @@ mod tests {
 
         // The alias is accepted — no "Unknown field" diagnostic
         let content = r#"(old_port: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -1549,7 +1599,7 @@ mod tests {
 
         // The canonical name still works
         let content = r#"(port: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -1560,7 +1610,7 @@ mod tests {
 
         // A genuinely unknown field is still reported
         let content = r#"(bogus: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -1570,8 +1620,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_type_mismatch_primitives() {
+    #[test]
+    fn test_type_mismatch_primitives() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "User".to_string(),
@@ -1608,7 +1658,7 @@ mod tests {
             id: "not a number",
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         assert!(!diagnostics.is_empty(), "Should error on type mismatch");
         assert!(
             diagnostics
@@ -1635,12 +1685,12 @@ mod tests {
 
     /// The error messages validation produces for `Cfg(n: <literal>)` where `n`
     /// is declared as `type_name`.
-    async fn numeric_errors(type_name: &str, literal: &str) -> Vec<String> {
+    fn numeric_errors(type_name: &str, literal: &str) -> Vec<String> {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = single_field_type(type_name);
         let content = format!("Cfg(n: {literal})");
         validate_ron_with_analyzer(&content, None, &type_info, analyzer)
-            .await
+            
             .into_iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| d.message)
@@ -1651,8 +1701,8 @@ mod tests {
     /// whole document with "Integer is out of bounds". Letting it through means
     /// the config looks clean in the editor and then fails to load, which is
     /// the one thing this diagnostic exists to prevent.
-    #[tokio::test]
-    async fn test_integer_literal_out_of_range_is_reported() {
+    #[test]
+    fn test_integer_literal_out_of_range_is_reported() {
         for (type_name, literal) in [
             ("u16", "-1"),
             ("u16", "99999"),
@@ -1664,7 +1714,7 @@ mod tests {
             ("i16", "32768"),
             ("i32", "2147483648"),
         ] {
-            let errors = numeric_errors(type_name, literal).await;
+            let errors = numeric_errors(type_name, literal);
             assert!(
                 errors.iter().any(|m| m.contains(literal)
                     && m.contains("out of range")
@@ -1676,8 +1726,8 @@ mod tests {
 
     /// The boundary values themselves, and anything inside them, deserialize
     /// fine and must not be reported.
-    #[tokio::test]
-    async fn test_integer_literal_in_range_is_accepted() {
+    #[test]
+    fn test_integer_literal_in_range_is_accepted() {
         for (type_name, literal) in [
             ("u8", "0"),
             ("u8", "255"),
@@ -1693,7 +1743,7 @@ mod tests {
             ("i128", "18446744073709551615"),
             ("u128", "18446744073709551615"),
         ] {
-            let errors = numeric_errors(type_name, literal).await;
+            let errors = numeric_errors(type_name, literal);
             assert!(
                 errors.is_empty(),
                 "{literal} is in range for {type_name}, got {errors:?}"
@@ -1704,8 +1754,8 @@ mod tests {
     /// serde widens an integer literal into a float field, so `ratio: 1` for an
     /// `f64` is a perfectly good document. Reporting it put a red squiggle on
     /// config that loads without complaint.
-    #[tokio::test]
-    async fn test_integer_literal_accepted_for_float_field() {
+    #[test]
+    fn test_integer_literal_accepted_for_float_field() {
         for (type_name, literal) in [
             ("f32", "0"),
             ("f32", "1"),
@@ -1713,7 +1763,7 @@ mod tests {
             ("f64", "-3"),
             ("f64", "1.5"),
         ] {
-            let errors = numeric_errors(type_name, literal).await;
+            let errors = numeric_errors(type_name, literal);
             assert!(
                 errors.is_empty(),
                 "{literal} is valid for {type_name}, got {errors:?}"
@@ -1724,15 +1774,15 @@ mod tests {
     /// A float literal in an integer field is still wrong — `ron` will not
     /// truncate it — and a number in a field that isn't numeric at all is still
     /// wrong too.
-    #[tokio::test]
-    async fn test_float_literal_rejected_for_integer_field() {
-        let errors = numeric_errors("u16", "1.5").await;
+    #[test]
+    fn test_float_literal_rejected_for_integer_field() {
+        let errors = numeric_errors("u16", "1.5");
         assert!(
             errors.iter().any(|m| m.contains("expected u16, got float")),
             "got {errors:?}"
         );
 
-        let errors = numeric_errors("String", "1").await;
+        let errors = numeric_errors("String", "1");
         assert!(
             errors
                 .iter()
@@ -1743,15 +1793,15 @@ mod tests {
 
     /// The range check has to reach through the generic wrappers, since that is
     /// where the integer actually lands.
-    #[tokio::test]
-    async fn test_integer_range_checked_through_wrappers() {
+    #[test]
+    fn test_integer_range_checked_through_wrappers() {
         for (type_name, literal) in [
             ("Option<u8>", "Some(300)"),
             ("Option<u8>", "300"),
             ("Box<u8>", "300"),
             ("Vec<u8>", "[1, 300]"),
         ] {
-            let errors = numeric_errors(type_name, literal).await;
+            let errors = numeric_errors(type_name, literal);
             assert!(
                 errors
                     .iter()
@@ -1767,7 +1817,7 @@ mod tests {
             ("Box<u8>", "200"),
             ("Vec<u8>", "[1, 200]"),
         ] {
-            let errors = numeric_errors(type_name, literal).await;
+            let errors = numeric_errors(type_name, literal);
             assert!(
                 errors.is_empty(),
                 "{literal} is valid for {type_name}, got {errors:?}"
@@ -1775,8 +1825,113 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_unnamed_struct_syntax() {
+    /// A value whose declared type bottoms out in primitives is settled from
+    /// the parse tree alone, which is only ever allowed to *skip* a check that
+    /// would have found nothing. These are the spellings the tree looks right
+    /// at a glance and is wrong about, so each has to come back reported
+    /// exactly as it would be if nothing were skipped.
+    #[test]
+    fn test_tree_shortcut_does_not_swallow_wrapper_mismatches() {
+        for (type_name, literal, expected) in [
+            // A wrapper the tree can see through still gets its contents
+            // checked, element by element and layer by layer.
+            ("Vec<String>", r#"["a", 1]"#, "in Vec: expected String, got"),
+            ("Vec<u16>", r#"[1, "x"]"#, "in Vec: expected u16, got string"),
+            ("Option<String>", "Some(1)", "expected String, got"),
+            ("Option<bool>", "Some(\"x\")", "expected bool, got string"),
+            ("Box<u8>", "\"x\"", "expected u8, got string"),
+            ("Vec<Vec<u8>>", "[[1], [300]]", "out of range for u8"),
+            // A non-array written for a `Vec` is not an array of anything.
+            ("Vec<String>", "5", "expected Vec<String>, got"),
+            // `None` is the one spelling with nothing inside it to look at,
+            // and it only fits an `Option`.
+            ("Vec<String>", "None", "expected Vec<String>, got"),
+            ("u8", "None", "expected u8, got None"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
+            );
+        }
+    }
+
+    /// The analyzer resolves the type a wrapper wraps, and a wrapper around
+    /// one it has never heard of is the build script missing a source file —
+    /// which has to be reported however the document spells the wrapper,
+    /// including the spellings that carry no value to look at.
+    #[test]
+    fn test_unknown_wrapped_type_reported_for_every_spelling() {
+        for (type_name, literal) in [
+            ("Option<Ghost>", "None"),
+            ("Option<Ghost>", "Some(Ghost())"),
+            ("Vec<Ghost>", "[]"),
+            ("Vec<Ghost>", "[Ghost()]"),
+            ("Box<Ghost>", "Ghost()"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains("Unknown type 'Ghost'")),
+                "{literal} in {type_name} should report the unregistered type, got {errors:?}"
+            );
+        }
+    }
+
+    /// What an explicit `Some(..)` wraps is checked against the type the
+    /// `Option` declares, the same way a `Vec`'s elements are: against the
+    /// inner type, and reported where the offending value is written rather
+    /// than at the wrapper around it.
+    #[test]
+    fn test_some_payload_checked_against_the_inner_type() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Retry".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "attempts".to_string(),
+                type_name: "u8".to_string(),
+                has_default: true,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+        let config = single_field_type("Option<Retry>");
+
+        // A literal where the wrapped struct belongs is a mismatch against
+        // that struct, pointed at the literal itself.
+        let content = "Cfg(n: Some(42))";
+        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &config, analyzer.clone())
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(
+            errors[0].message.contains("expected Retry"),
+            "got {:?}",
+            errors[0].message
+        );
+        let offending = content.find("42").unwrap() as u32;
+        assert_eq!(
+            (errors[0].range.start.character, errors[0].range.end.character),
+            (offending, offending + 2),
+            "the payload is underlined, not the `Some(..)` around it"
+        );
+
+        // And the well-formed spellings stay clean.
+        for literal in ["None", "Some(Retry())", "Some(Retry(attempts: 3))"] {
+            let content = format!("Cfg(n: {literal})");
+            let errors: Vec<_> =
+                validate_ron_with_analyzer(&content, None, &config, analyzer.clone())
+                    .into_iter()
+                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                    .map(|d| d.message)
+                    .collect();
+            assert!(errors.is_empty(), "{literal} is valid, got {errors:?}");
+        }
+    }
+
+    #[test]
+    fn test_unnamed_struct_syntax() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "User".to_string(),
@@ -1813,7 +1968,7 @@ mod tests {
             id: 1,
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1826,8 +1981,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_enum_with_tuple_variant() {
+    #[test]
+    fn test_enum_with_tuple_variant() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Value".to_string(),
@@ -1875,7 +2030,7 @@ mod tests {
 
         // Valid tuple variant
         let content = "Int(42)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1885,7 +2040,7 @@ mod tests {
 
         // Another valid variant
         let content = r#"Str("hello")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1894,8 +2049,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_unit_variant_with_data_error() {
+    #[test]
+    fn test_unit_variant_with_data_error() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Status".to_string(),
@@ -1927,7 +2082,7 @@ mod tests {
 
         // Unit variant should not have data
         let content = "Active(123)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
         // Should get error for providing data to unit variant
         assert!(
             diagnostics
@@ -1939,8 +2094,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_enum_with_vec_of_custom_type_missing_fields() {
+    #[test]
+    fn test_enum_with_vec_of_custom_type_missing_fields() {
         // Create User type info
         let user_type = TypeInfo {
             name: "User".to_string(),
@@ -2042,7 +2197,7 @@ mod tests {
 
         // Test with missing required fields in User structs
         let content = r#"UserTag([User(age: 22), User(email: "hello")])"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
 
         // We expect errors about missing fields
         // First User(age: 22) is missing: id, name, email, is_active, roles
@@ -2092,8 +2247,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_unknown_type_in_ron_file() {
+    #[test]
+    fn test_unknown_type_in_ron_file() {
         // Create a struct with a custom type field
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
@@ -2131,7 +2286,7 @@ mod tests {
             id: 1,
             author: UnknownType(name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
 
         assert!(
             diagnostics
@@ -2143,8 +2298,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_known_type_in_ron_file_no_error() {
+    #[test]
+    fn test_known_type_in_ron_file_no_error() {
         // Register User type with the analyzer
         let user_type = TypeInfo {
             name: "User".to_string(),
@@ -2215,7 +2370,7 @@ mod tests {
             id: 1,
             author: User(id: 42, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
 
         assert!(
             !diagnostics
@@ -2226,8 +2381,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_rename_all_fields() {
+    #[test]
+    fn test_serde_rename_all_fields() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2250,7 +2405,7 @@ mod tests {
 
         // The serialized (camelCase) name is what serde expects
         let content = "(maxConnections: 5)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -2261,7 +2416,7 @@ mod tests {
 
         // The Rust name is tolerated as a lenient fallback
         let content = "(max_connections: 5)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -2272,7 +2427,7 @@ mod tests {
 
         // A missing required field is reported under its serialized name
         let content = "(debugMode: true)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2282,8 +2437,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_field_rename() {
+    #[test]
+    fn test_serde_field_rename() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2297,7 +2452,7 @@ mod tests {
         };
 
         let content = r#"(kind: "full")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -2307,7 +2462,7 @@ mod tests {
         );
 
         let content = r#"(totally_unknown: "full")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2317,8 +2472,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_skip_and_flatten() {
+    #[test]
+    fn test_serde_skip_and_flatten() {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "Extra".to_string(),
@@ -2358,7 +2513,7 @@ mod tests {
         // Flattened fields are accepted at the top level; skipped fields are
         // not required and not accepted
         let content = r#"(name: "app", verbose: true)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -2369,7 +2524,7 @@ mod tests {
 
         // Missing the flattened required field is an error
         let content = r#"(name: "app")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics.iter().any(|d| d.message.contains("verbose")),
             "Missing flattened field should error. Got: {:?}",
@@ -2378,7 +2533,7 @@ mod tests {
 
         // A skipped field in the file is unknown to serde
         let content = r#"(name: "app", verbose: true, runtime_state: "x")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2388,8 +2543,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_unresolved_flatten_allows_unknown_fields() {
+    #[test]
+    fn test_serde_unresolved_flatten_allows_unknown_fields() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2404,7 +2559,7 @@ mod tests {
 
         // Flattening into a map means serde accepts arbitrary keys
         let content = r#"(anything: "goes", here: "too")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -2414,8 +2569,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_duplicate_field_diagnostic() {
+    #[test]
+    fn test_duplicate_field_diagnostic() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2428,7 +2583,7 @@ mod tests {
         };
 
         let content = "(\n    name: \"a\",\n    name: \"b\",\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         let duplicate: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("Duplicate field 'name'"))
@@ -2444,8 +2599,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_duplicate_field_diagnostic_nested() {
+    #[test]
+    fn test_duplicate_field_diagnostic_nested() {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "Inner".to_string(),
@@ -2469,7 +2624,7 @@ mod tests {
         };
 
         let content = "(\n    inner: (\n        value: 1,\n        value: 2,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2481,8 +2636,8 @@ mod tests {
 
     /// The document root and a nested field value share one struct validator,
     /// so the same struct written in either position must raise the same errors.
-    #[tokio::test]
-    async fn test_root_and_nested_struct_validation_agree() {
+    #[test]
+    fn test_root_and_nested_struct_validation_agree() {
         let inner = TypeInfo {
             name: "Inner".to_string(),
             kind: TypeKind::Struct(vec![
@@ -2535,10 +2690,10 @@ mod tests {
         };
 
         let root_codes = error_codes(
-            validate_ron_with_analyzer(as_root, None, &inner, analyzer.clone()).await,
+            validate_ron_with_analyzer(as_root, None, &inner, analyzer.clone()),
         );
         let nested_codes = error_codes(
-            validate_ron_with_analyzer(as_nested, None, &outer, analyzer.clone()).await,
+            validate_ron_with_analyzer(as_nested, None, &outer, analyzer.clone()),
         );
 
         assert_eq!(
@@ -2558,8 +2713,8 @@ mod tests {
 
     /// A value of the wrong primitive type is an error wherever it appears, not
     /// just directly under the document root.
-    #[tokio::test]
-    async fn test_type_mismatch_reported_at_every_depth() {
+    #[test]
+    fn test_type_mismatch_reported_at_every_depth() {
         let leaf = TypeInfo {
             name: "Leaf".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -2621,7 +2776,7 @@ mod tests {
         ];
         for content in bad {
             let diagnostics =
-                validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+                validate_ron_with_analyzer(content, None, &root, analyzer.clone());
             assert!(
                 diagnostics.iter().any(|d| {
                     d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
@@ -2643,7 +2798,7 @@ mod tests {
         ];
         for content in good {
             let diagnostics =
-                validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+                validate_ron_with_analyzer(content, None, &root, analyzer.clone());
             assert!(
                 !diagnostics
                     .iter()
@@ -2659,8 +2814,8 @@ mod tests {
     /// type, and an element that isn't even the right kind of value is reported
     /// where it is written — the array's own shape, meanwhile, is still checked
     /// against the field's type.
-    #[tokio::test]
-    async fn test_vec_element_shape_is_checked_per_element() {
+    #[test]
+    fn test_vec_element_shape_is_checked_per_element() {
         let leaf = TypeInfo {
             name: "Leaf".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -2689,7 +2844,7 @@ mod tests {
 
         // Line 3 holds the one element that is not a struct at all.
         let content = "(\n    leaves: [\n        (port: 80),\n        42,\n    ],\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &root, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &root, analyzer.clone());
         let mismatches: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string())))
@@ -2713,7 +2868,7 @@ mod tests {
 
         // The array itself still has to be an array.
         let diagnostics =
-            validate_ron_with_analyzer("(leaves: 42)", None, &root, analyzer.clone()).await;
+            validate_ron_with_analyzer("(leaves: 42)", None, &root, analyzer.clone());
         assert!(
             diagnostics.iter().any(|d| {
                 d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
@@ -2730,7 +2885,7 @@ mod tests {
             &root,
             analyzer,
         )
-        .await;
+        ;
         assert!(
             !diagnostics
                 .iter()
@@ -2740,8 +2895,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_serde_renamed_enum_variant() {
+    #[test]
+    fn test_serde_renamed_enum_variant() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Mode".to_string(),
@@ -2763,7 +2918,7 @@ mod tests {
         // rename_all applies to the first variant, explicit rename to the second
         for content in ["fast_mode", "legacy", "FastMode"] {
             let diagnostics =
-                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
             assert!(
                 !diagnostics
                     .iter()
@@ -2775,7 +2930,7 @@ mod tests {
         }
 
         let diagnostics =
-            validate_ron_with_analyzer("bogus_mode", None, &type_info, analyzer.clone()).await;
+            validate_ron_with_analyzer("bogus_mode", None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2785,8 +2940,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_unknown_field_suggests_closest() {
+    #[test]
+    fn test_unknown_field_suggests_closest() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2807,7 +2962,7 @@ mod tests {
 
         // A typo in a known field should be reported with a suggestion.
         let content = "(\n    ephemerl: true,\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics.iter().any(|d| d
                 .message
@@ -2818,7 +2973,7 @@ mod tests {
 
         // A field bearing no resemblance to any known field gets no suggestion.
         let content = "(\n    hostname: true,\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -2832,8 +2987,8 @@ mod tests {
     /// does, so it goes through the same validator: its field values are
     /// type-checked, recursed into, and reported at their own position — not at
     /// the top of the file — wherever in the document the variant appears.
-    #[tokio::test]
-    async fn test_variant_fields_validated_like_struct_fields() {
+    #[test]
+    fn test_variant_fields_validated_like_struct_fields() {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "Leaf".to_string(),
@@ -2890,7 +3045,7 @@ mod tests {
 
         for (content, root_type, retries_line) in [as_root, as_nested] {
             let diagnostics =
-                validate_ron_with_analyzer(content, None, root_type, analyzer.clone()).await;
+                validate_ron_with_analyzer(content, None, root_type, analyzer.clone());
 
             let retries = diagnostics
                 .iter()
@@ -2919,7 +3074,7 @@ mod tests {
             &config,
             analyzer.clone(),
         )
-        .await;
+        ;
         let missing_code = code(codes::MISSING_REQUIRED_FIELD);
         let missing = diagnostics
             .iter()
@@ -2934,7 +3089,7 @@ mod tests {
             "Config(\n    mode: Tuned(retries: 1, inner: Leaf(port: 80)),\n)",
         ] {
             let diagnostics =
-                validate_ron_with_analyzer(content, None, &config, analyzer.clone()).await;
+                validate_ron_with_analyzer(content, None, &config, analyzer.clone());
             assert!(
                 !diagnostics
                     .iter()
@@ -2952,8 +3107,8 @@ mod tests {
     /// `missing-required-field` never fired for anybody, while serde went on
     /// refusing to deserialize the file.
     #[cfg(feature = "analyze")]
-    #[tokio::test]
-    async fn test_derive_default_still_requires_fields() {
+    #[test]
+    fn test_derive_default_still_requires_fields() {
         let mut analyzer = RustAnalyzer::new();
         analyzer
             .add_source_with_prefix(
@@ -2992,16 +3147,11 @@ mod tests {
         // `port` is absent at the root and `host` is absent in the nested
         // struct. Both are required, at both depths.
         let missing = |content: &'static str| {
-            let analyzer = analyzer.clone();
-            let root = root.clone();
-            async move {
-                validate_ron_with_analyzer(content, None, &root, analyzer)
-                    .await
-                    .into_iter()
-                    .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-            }
+            validate_ron_with_analyzer(content, None, &root, analyzer.clone())
+                .into_iter()
+                .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
         };
 
         let no_port = "AppConfig(\n    debug: true,\n    server: ServerConfig(host: \"x\"),\n)";
@@ -3009,24 +3159,24 @@ mod tests {
         let complete = "AppConfig(\n    port: 80,\n    server: ServerConfig(host: \"x\"),\n)";
 
         assert_eq!(
-            missing(no_port).await,
+            missing(no_port),
             vec!["Required fields: port".to_string()],
             "a root struct that merely derives Default still requires its fields"
         );
         assert_eq!(
-            missing(no_host).await,
+            missing(no_host),
             vec!["Required fields: host".to_string()],
             "a nested struct that merely derives Default still requires its fields"
         );
 
         // The fully specified document is still clean.
-        assert!(missing(complete).await.is_empty());
+        assert!(missing(complete).is_empty());
 
         // A container `#[serde(default)]` does still excuse everything.
         let tunables = analyzer.get_type_info("crate::Tunables").expect("Tunables");
         assert!(
             validate_ron_with_analyzer("Tunables()", None, tunables, analyzer.clone())
-                .await
+                
                 .iter()
                 .all(|d| d.code != code(codes::MISSING_REQUIRED_FIELD)),
             "container #[serde(default)] still makes every field optional"
@@ -3035,8 +3185,8 @@ mod tests {
 
     /// A tuple variant's payload is matched to its positional fields in order
     /// and checked against their declared types, like any other value.
-    #[tokio::test]
-    async fn test_tuple_variant_payload_type_checked() {
+    #[test]
+    fn test_tuple_variant_payload_type_checked() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Value".to_string(),
@@ -3060,7 +3210,7 @@ mod tests {
         };
 
         let diagnostics =
-            validate_ron_with_analyzer(r#"Pair(1, "a")"#, None, &type_info, analyzer.clone()).await;
+            validate_ron_with_analyzer(r#"Pair(1, "a")"#, None, &type_info, analyzer.clone());
         assert!(
             !diagnostics
                 .iter()
@@ -3071,7 +3221,7 @@ mod tests {
         // The second element is declared String, so a number is wrong — and the
         // error belongs at that element, not at the start of the variant.
         let diagnostics =
-            validate_ron_with_analyzer("Pair(1, 2)", None, &type_info, analyzer.clone()).await;
+            validate_ron_with_analyzer("Pair(1, 2)", None, &type_info, analyzer.clone());
         let mismatch = diagnostics
             .iter()
             .find(|d| d.message.contains("expected String, got number"))
@@ -3081,8 +3231,8 @@ mod tests {
         assert_eq!(mismatch.range.start, Position::new(0, 8));
     }
 
-    #[tokio::test]
-    async fn test_unknown_variant_suggests_closest() {
+    #[test]
+    fn test_unknown_variant_suggests_closest() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Mode".to_string(),
@@ -3100,7 +3250,7 @@ mod tests {
         };
 
         let diagnostics =
-            validate_ron_with_analyzer("Ephemerl", None, &type_info, analyzer.clone()).await;
+            validate_ron_with_analyzer("Ephemerl", None, &type_info, analyzer.clone());
         assert!(
             diagnostics
                 .iter()
@@ -3115,8 +3265,8 @@ mod tests {
     /// put the squiggle one column right for every extra byte earlier on the
     /// line, so a document with an accented or emoji string value underlined
     /// the wrong text.
-    #[tokio::test]
-    async fn test_diagnostic_columns_are_utf16() {
+    #[test]
+    fn test_diagnostic_columns_are_utf16() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -3142,7 +3292,7 @@ mod tests {
         for host in ["x", "münchen", "🚀"] {
             let content = format!("Config(host: \"{host}\", bogus: 1, port: 80)");
             let diagnostics =
-                validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone()).await;
+                validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone());
 
             let unknown = diagnostics
                 .iter()
@@ -3160,8 +3310,8 @@ mod tests {
 
     /// The same for a type mismatch, whose range is clipped to the value's
     /// first line.
-    #[tokio::test]
-    async fn test_type_mismatch_columns_are_utf16() {
+    #[test]
+    fn test_type_mismatch_columns_are_utf16() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -3185,7 +3335,7 @@ mod tests {
 
         let content = "Config(host: \"🚀\", port: \"nope\")";
         let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         let mismatch = diagnostics
             .iter()
             .find(|d| d.code == code(codes::TYPE_MISMATCH))
@@ -3250,10 +3400,10 @@ mod tests {
     }
 
     /// The type-mismatch messages for a document, in order.
-    async fn type_mismatches(content: &str) -> Vec<String> {
+    fn type_mismatches(content: &str) -> Vec<String> {
         let (config, analyzer) = named_value_fixture();
         validate_ron_with_analyzer(content, None, &config, analyzer)
-            .await
+            
             .into_iter()
             .filter(|d| d.code == code(codes::TYPE_MISMATCH))
             .map(|d| d.message)
@@ -3267,8 +3417,8 @@ mod tests {
     /// struct value naming a type that doesn't exist is a different mistake
     /// from one naming a type that does, and a literal where a struct belongs
     /// is reported by what the literal is.
-    #[tokio::test]
-    async fn test_named_type_is_checked_against_the_declared_type() {
+    #[test]
+    fn test_named_type_is_checked_against_the_declared_type() {
         for (content, expected) in [
             // A value that names no variant of the enum it is declared as.
             (
@@ -3301,7 +3451,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                type_mismatches(content).await,
+                type_mismatches(content),
                 vec![expected.to_string()],
                 "for {content}"
             );
@@ -3312,8 +3462,8 @@ mod tests {
     /// whole point of having them: an editor filters on the code rather than on
     /// the message. An error published without one, or under a code nobody
     /// documents, is invisible to that filter.
-    #[tokio::test]
-    async fn test_every_error_carries_a_documented_code() {
+    #[test]
+    fn test_every_error_carries_a_documented_code() {
         let documented = [
             codes::SYNTAX_ERROR,
             codes::UNKNOWN_FIELD,
@@ -3334,7 +3484,7 @@ mod tests {
             r#"Config(mode: Ephemeral, mode: Ephemeral, server: ())"#,
         ] {
             let (config, analyzer) = named_value_fixture();
-            let diagnostics = validate_ron_with_analyzer(content, None, &config, analyzer).await;
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, analyzer);
             assert!(!diagnostics.is_empty(), "nothing reported for {content}");
 
             for diagnostic in &diagnostics {
@@ -3356,8 +3506,8 @@ mod tests {
     /// so their severity is all a client has to tell them apart by — which is
     /// exactly what `Backend::publish_diagnostics` filters on when they are
     /// switched off.
-    #[tokio::test]
-    async fn test_informational_hint_is_identified_by_severity_alone() {
+    #[test]
+    fn test_informational_hint_is_identified_by_severity_alone() {
         let (config, analyzer) = named_value_fixture();
         let diagnostics = validate_ron_with_analyzer(
             r#"Config(mode: Ephemeral, server: (host: "x"))"#,
@@ -3365,7 +3515,7 @@ mod tests {
             &config,
             analyzer,
         )
-        .await;
+        ;
 
         let hints: Vec<&Diagnostic> = diagnostics
             .iter()
@@ -3382,14 +3532,14 @@ mod tests {
 
     /// RON lets a struct value omit its type name, which leaves nothing to
     /// disagree with the declared type — at the root and nested alike.
-    #[tokio::test]
-    async fn test_unnamed_value_never_mismatches_its_declared_type() {
+    #[test]
+    fn test_unnamed_value_never_mismatches_its_declared_type() {
         for content in [
             r#"Config(mode: Ephemeral, server: (host: "x"))"#,
             r#"(mode: Ephemeral, server: (host: "x"))"#,
         ] {
             assert_eq!(
-                type_mismatches(content).await,
+                type_mismatches(content),
                 Vec::<String>::new(),
                 "for {content}"
             );
@@ -3405,12 +3555,11 @@ mod tests {
     /// the one way to write a struct that the server never looked inside,
     /// which is exactly the spelling someone reaches for to mean "defaults
     /// here".
-    #[tokio::test]
-    async fn test_empty_unnamed_struct_still_requires_fields() {
-        let missing = |content: &'static str| async move {
+    #[test]
+    fn test_empty_unnamed_struct_still_requires_fields() {
+        let missing = |content: &'static str| {
             let (config, analyzer) = named_value_fixture();
             validate_ron_with_analyzer(content, None, &config, analyzer)
-                .await
                 .into_iter()
                 .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
                 .map(|d| (d.message, d.range.start))
@@ -3419,7 +3568,7 @@ mod tests {
 
         // Nested: `Server` still wants its `host`.
         assert_eq!(
-            missing("Config(\n    mode: Ephemeral,\n    server: (),\n)").await,
+            missing("Config(\n    mode: Ephemeral,\n    server: (),\n)"),
             vec![("Required fields: host".to_string(), Position::new(2, 12))],
             "`()` written for a struct supplies none of its fields"
         );
@@ -3428,7 +3577,7 @@ mod tests {
         // the report lands at the value's first character, there being no
         // struct name to put it on.
         assert_eq!(
-            missing("()").await,
+            missing("()"),
             vec![(
                 "Required fields: mode, server".to_string(),
                 Position::new(0, 0)
@@ -3454,7 +3603,7 @@ mod tests {
             .clone();
         assert!(
             validate_ron_with_analyzer("()", None, &tunables, Arc::new(analyzer))
-                .await
+                
                 .is_empty(),
             "`()` is a complete value for a struct that needs nothing"
         );
@@ -3463,8 +3612,8 @@ mod tests {
     /// An element of a `Vec<T>` is a value in its own right, so `()` written as
     /// one is checked against `T` the way a field's value is checked against
     /// the type the field declares.
-    #[tokio::test]
-    async fn test_empty_unnamed_struct_in_vec_element_requires_fields() {
+    #[test]
+    fn test_empty_unnamed_struct_in_vec_element_requires_fields() {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "Server".to_string(),
@@ -3488,7 +3637,7 @@ mod tests {
         let content = r#"Config(servers: [(host: "x"), ()])"#;
         let missing: Vec<_> =
             validate_ron_with_analyzer(content, None, &config, Arc::new(analyzer))
-                .await
+                
                 .into_iter()
                 .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
                 .map(|d| (d.message, d.range.start))

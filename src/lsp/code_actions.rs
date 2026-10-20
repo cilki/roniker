@@ -1606,7 +1606,6 @@ mod tests {
                 &root,
                 analyzer.clone(),
             )
-            .await
             .into_iter()
             .filter(|d| d.severity != Some(DiagnosticSeverity::INFORMATION))
             .map(|d| d.message)
