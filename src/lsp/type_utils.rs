@@ -9,15 +9,19 @@ pub fn short_name(path: &str) -> &str {
 }
 
 /// Normalize a type name for comparison by removing all spaces, so that
-/// `Vec < Post >` and `Vec<Post>` are treated the same. Depending on the source
-/// formatting the analyzer extracts types with inconsistent internal spacing,
-/// so this is applied before any prefix/suffix or set-membership checks.
+/// `Vec < Post >` and `Vec<Post>` are treated the same, and by dropping the
+/// module path in front of a standard-library name, so that
+/// `std::collections::HashMap<String, u32>` is treated the same as
+/// `HashMap<String, u32>`. Depending on the source formatting the analyzer
+/// extracts types with inconsistent internal spacing, and it records whatever
+/// path the source spelled, so this is applied before any prefix/suffix or
+/// set-membership checks.
 ///
 /// This is the same normalization [`crate::rust_analyzer::RustAnalyzer::get_type_info`]
 /// applies to a lookup key, so the two cannot disagree about what a type name
 /// means.
 pub fn normalize_type(type_name: &str) -> Cow<'_, str> {
-    crate::rust_analyzer::strip_type_whitespace(type_name)
+    crate::rust_analyzer::normalize_type_name(type_name)
 }
 
 /// Extract the inner type from a generic type when it starts with the given
@@ -192,6 +196,60 @@ mod tests {
         assert_eq!(strip_outer_generic("Post"), "Post");
         // Only the outermost layer is stripped.
         assert_eq!(strip_outer_generic("Option<Vec<Post>>"), "Vec<Post>");
+    }
+
+    /// A crate that doesn't import a standard-library type names it by its
+    /// module path, and the analyzer records that spelling verbatim. Every
+    /// type check in the LSP matches the bare name, so the path has to come
+    /// off first or the type falls through as a user-defined one.
+    #[test]
+    fn test_normalize_type_unqualifies_std_names() {
+        assert_eq!(
+            normalize_type("std::collections::HashMap<String, u32>"),
+            "HashMap<String,u32>"
+        );
+        assert_eq!(normalize_type("std::option::Option<u64>"), "Option<u64>");
+        assert_eq!(normalize_type("std::vec::Vec<String>"), "Vec<String>");
+        assert_eq!(normalize_type("std::string::String"), "String");
+        assert_eq!(normalize_type("core::option::Option<u8>"), "Option<u8>");
+        assert_eq!(normalize_type("alloc::boxed::Box<Server>"), "Box<Server>");
+        // `use std::collections;` leaves only the one segment in front.
+        assert_eq!(normalize_type("collections::BTreeSet<u8>"), "BTreeSet<u8>");
+
+        // Only the outermost name's path is dropped; a user-defined generic
+        // argument keeps the path that resolves it.
+        assert_eq!(
+            normalize_type("std::vec::Vec<crate::config::Server>"),
+            "Vec<crate::config::Server>"
+        );
+    }
+
+    /// A user-defined type keeps its path: that is what distinguishes two
+    /// types registered under the same final segment from different modules.
+    #[test]
+    fn test_normalize_type_keeps_other_paths() {
+        assert_eq!(
+            normalize_type("crate::config::Server"),
+            "crate::config::Server"
+        );
+        assert_eq!(normalize_type("config::Server"), "config::Server");
+        // A composite type has no single name in front to unqualify, and must
+        // not be cut at its last `::` either.
+        assert_eq!(
+            normalize_type("(u8, std::collections::HashMap<String, u32>)"),
+            "(u8,std::collections::HashMap<String,u32>)"
+        );
+    }
+
+    /// The classifiers normalize internally, so a qualified std type lands on
+    /// the same side of each of them as the bare spelling does.
+    #[test]
+    fn test_qualified_std_types_are_classified_as_std() {
+        assert!(is_primitive_type("std::string::String"));
+        assert!(!is_custom_type("std::string::String"));
+        assert!(!is_custom_type("std::collections::HashMap<String, u32>"));
+        assert!(!is_custom_type("std::option::Option<u64>"));
+        assert!(is_custom_type("crate::config::Server"));
     }
 
     #[test]

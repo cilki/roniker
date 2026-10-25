@@ -793,7 +793,11 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     if clean == "bool" {
         return "false".to_string();
     }
-    if clean.starts_with("Vec") || clean.starts_with("[") {
+    // A set serializes as a sequence, the same as a `Vec`.
+    if ["Vec", "[", "HashSet", "BTreeSet"]
+        .iter()
+        .any(|prefix| clean.starts_with(prefix))
+    {
         return "[]".to_string();
     }
     if clean.starts_with("HashMap") || clean.starts_with("BTreeMap") {
@@ -950,6 +954,9 @@ mod tests {
         assert_eq!(default_value("Option<u32>"), "None");
         assert_eq!(default_value("Vec<u8>"), "[]");
         assert_eq!(default_value("HashMap<String, u32>"), "{}");
+        // A set is written as a sequence, not as a `HashSet(...)` call.
+        assert_eq!(default_value("HashSet<String>"), "[]");
+        assert_eq!(default_value("BTreeSet<u8>"), "[]");
 
         // Every numeric primitive defaults to 0, including the pointer-sized
         // integers whose names contain non-`iuf` letters.
@@ -964,6 +971,52 @@ mod tests {
         // way RON spells a type: by its last path segment.
         assert_eq!(default_value("Server"), "Server()");
         assert_eq!(default_value("config::Server"), "Server()");
+    }
+
+    /// A field that names a std type through its module path used to miss
+    /// every prefix check here and fall through to constructor notation, so
+    /// the quick-fix inserted `HashMap<String,u32>()` — which RON cannot
+    /// parse. Each of these has to produce the same placeholder as the bare
+    /// spelling does.
+    #[test]
+    fn test_generate_default_value_for_qualified_std_types() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Server".to_string(),
+            kind: TypeKind::Struct(vec![]),
+            ..Default::default()
+        });
+        let default_value = |type_name: &str| generate_default_value(type_name, &analyzer);
+
+        assert_eq!(
+            default_value("std::collections::HashMap<String, u32>"),
+            "{}"
+        );
+        assert_eq!(
+            default_value("std::collections::BTreeMap<String, u32>"),
+            "{}"
+        );
+        assert_eq!(default_value("std::collections::HashSet<String>"), "[]");
+        assert_eq!(default_value("std::vec::Vec<String>"), "[]");
+        assert_eq!(default_value("std::option::Option<u64>"), "None");
+        assert_eq!(default_value("std::string::String"), "\"\"");
+        // A smart pointer is seen through to the type it wraps, qualified or
+        // not.
+        assert_eq!(default_value("std::boxed::Box<Server>"), "Server()");
+
+        // Each one has to be something RON will actually parse.
+        for type_name in [
+            "std::collections::HashMap<String, u32>",
+            "std::collections::HashSet<String>",
+            "std::vec::Vec<String>",
+            "std::option::Option<u64>",
+            "std::string::String",
+        ] {
+            let document = format!("Cfg(field: {})", default_value(type_name));
+            ron::from_str::<ron::Value>(&document).unwrap_or_else(|e| {
+                panic!("placeholder for {type_name} is not valid RON ({e}): {document}")
+            });
+        }
     }
 
     /// An enum field's placeholder has to name a variant. `Mode()` names none of

@@ -2569,6 +2569,118 @@ mod tests {
         );
     }
 
+    /// A crate that doesn't import its standard-library types names them by
+    /// their module path, and the analyzer records that spelling. Every type
+    /// check here matched the bare name only, so a correct document came back
+    /// with `type-mismatch` on its arrays, maps and `Some(..)`s,
+    /// `unknown-type` on its strings, and the `Option` field reported as a
+    /// `missing-required-field`.
+    #[test]
+    fn test_qualified_std_field_types_accept_a_correct_document() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Server".to_string(),
+            kind: TypeKind::Struct(vec![field("host", "String")]),
+            ..Default::default()
+        });
+        let type_info = TypeInfo {
+            name: "Root".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("labels", "std::collections::HashMap<String, String>"),
+                field("enabled", "std::collections::HashSet<String>"),
+                field("timeout", "std::option::Option<u64>"),
+                field("hosts", "std::vec::Vec<String>"),
+                field("server", "std::boxed::Box<Server>"),
+                field("name", "std::string::String"),
+            ]),
+            ..Default::default()
+        };
+        let analyzer = Arc::new(analyzer);
+
+        let content = concat!(
+            "Root(\n",
+            "    labels: {\"a\": \"b\"},\n",
+            "    enabled: [\"f\"],\n",
+            "    timeout: Some(5),\n",
+            "    hosts: [\"h\"],\n",
+            "    server: Server(host: \"h\"),\n",
+            "    name: \"n\",\n",
+            ")",
+        );
+        let errors: Vec<_> =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+        assert!(errors.is_empty(), "Got: {errors:?}");
+
+        // The `Option` field is optional, so leaving it out is not an error
+        // either.
+        let content = concat!(
+            "Root(\n",
+            "    labels: {},\n",
+            "    enabled: [],\n",
+            "    hosts: [],\n",
+            "    server: Server(host: \"h\"),\n",
+            "    name: \"n\",\n",
+            ")",
+        );
+        let errors: Vec<_> =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+        assert!(errors.is_empty(), "Got: {errors:?}");
+    }
+
+    /// The qualified spelling must not make a mismatch go unreported either:
+    /// unqualifying the name is only meant to put the check back on the
+    /// footing the bare spelling is on.
+    #[test]
+    fn test_qualified_std_field_types_still_report_a_mismatch() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let type_info = TypeInfo {
+            name: "Root".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("hosts", "std::vec::Vec<String>"),
+                field("name", "std::string::String"),
+            ]),
+            ..Default::default()
+        };
+        let analyzer = Arc::new(RustAnalyzer::new());
+
+        let content = "Root(\n    hosts: [1],\n    name: 7,\n)";
+        let messages: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| (d.code, d.message))
+            .collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                (
+                    code(codes::TYPE_MISMATCH),
+                    "Type mismatch: in Vec: expected String, got number".to_string()
+                ),
+                (
+                    code(codes::TYPE_MISMATCH),
+                    "Type mismatch: expected String, got number".to_string()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn test_duplicate_field_diagnostic() {
         let analyzer = Arc::new(RustAnalyzer::new());

@@ -488,7 +488,11 @@ fn generate_value_completions_by_type(
             insert_text: Some("false".to_string()),
             ..Default::default()
         });
-    } else if clean_type.starts_with("Vec<") || clean_type.starts_with("[") {
+    } else if ["Vec<", "[", "HashSet<", "BTreeSet<"]
+        .iter()
+        .any(|prefix| clean_type.starts_with(prefix))
+    {
+        // A set is written as a sequence too, so it takes the same values.
         completions.push(CompletionItem {
             label: "[]".to_string(),
             kind: Some(CompletionItemKind::VALUE),
@@ -782,6 +786,40 @@ mod tests {
             "unrelated workspace types should not be appended: {:?}",
             labels
         );
+    }
+
+    /// Value completion keys off the field's declared type, which a crate that
+    /// doesn't import its standard-library types spells with the module path.
+    /// Matching the bare name only meant none of these fields got the values
+    /// they take; they fell through to the "every registered type" fallback.
+    #[test]
+    fn test_value_completion_for_qualified_std_field_types() {
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let labels = |type_name: &str| -> Vec<String> {
+            generate_value_completions_by_type(type_name, analyzer.clone())
+                .iter()
+                .map(|c| c.label.clone())
+                .collect()
+        };
+
+        for (type_name, expected) in [
+            (
+                "std::collections::HashMap<String, u32>",
+                vec!["{}", "{...}"],
+            ),
+            (
+                "std::collections::BTreeMap<String, u32>",
+                vec!["{}", "{...}"],
+            ),
+            // A set is a sequence, so it takes the same values as a `Vec`.
+            ("std::collections::HashSet<String>", vec!["[]", "[...]"]),
+            ("HashSet<String>", vec!["[]", "[...]"]),
+            ("std::vec::Vec<String>", vec!["[]", "[...]"]),
+            ("std::option::Option<u64>", vec!["Some()", "None"]),
+            ("std::string::String", vec!["\"\""]),
+        ] {
+            assert_eq!(labels(type_name), expected, "type: {type_name}");
+        }
     }
 
     #[test]

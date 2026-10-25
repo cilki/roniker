@@ -20,6 +20,68 @@ pub(crate) fn strip_type_whitespace(type_name: &str) -> Cow<'_, str> {
     }
 }
 
+/// Standard-library types the rest of the crate special-cases by name —
+/// `Option<T>` makes a field optional, `Vec<T>` is written as an array, a
+/// `HashMap` as a map, and so on. Every one of those checks matches the bare
+/// spelling, by equality or by a `Name<` prefix.
+const STD_TYPE_NAMES: [&str; 11] = [
+    "Option", "Vec", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "Result", "Box", "Rc", "Arc",
+    "String",
+];
+
+/// Drop the module path in front of a standard-library type name, so that the
+/// `std::collections::HashMap<String, u32>` a crate that doesn't import the
+/// type writes is recognised as the map it is.
+///
+/// The analyzer records a field's type exactly as the source spells it, and
+/// `std::`-qualified names used to fall through every one of the checks in
+/// [`STD_TYPE_NAMES`] as if they named a user-defined type: a correct document
+/// came back with `type-mismatch` on its arrays and `Some(..)`s,
+/// `unknown-type` on its strings, an `Option` field reported as required, and
+/// an "add missing fields" quick-fix that inserted `HashMap<String,u32>()`.
+///
+/// Anything else keeps its path: a user-defined `crate::config::Server` is
+/// resolved against the registered types by that path, and only its final
+/// segment going missing would make two types in different modules
+/// indistinguishable.
+fn unqualify_std_type(type_name: &str) -> &str {
+    // Only the path in front of the outermost name is a candidate. The generic
+    // arguments keep theirs and are unqualified when they are visited in turn.
+    let head = &type_name[..type_name.find('<').unwrap_or(type_name.len())];
+
+    // A composite type — a tuple, a reference, an array — has no single head to
+    // unqualify, and `rfind` below would otherwise cut it in half.
+    if !head
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+    {
+        return type_name;
+    }
+
+    let Some(offset) = head.rfind("::") else {
+        return type_name;
+    };
+    match STD_TYPE_NAMES.contains(&&head[offset + 2..]) {
+        true => &type_name[offset + 2..],
+        false => type_name,
+    }
+}
+
+/// Reduce a type name to the spelling the crate's type checks are written
+/// against: no whitespace ([`strip_type_whitespace`]) and no module path in
+/// front of a standard-library name ([`unqualify_std_type`]).
+pub(crate) fn normalize_type_name(type_name: &str) -> Cow<'_, str> {
+    match strip_type_whitespace(type_name) {
+        Cow::Borrowed(clean) => Cow::Borrowed(unqualify_std_type(clean)),
+        // The whitespace strip already allocated, so reuse that string unless
+        // the path strip actually shortens it.
+        Cow::Owned(clean) => match unqualify_std_type(&clean) {
+            unqualified if unqualified.len() == clean.len() => Cow::Owned(clean),
+            unqualified => Cow::Owned(unqualified.to_string()),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldInfo {
     pub name: String,
@@ -50,11 +112,12 @@ impl FieldInfo {
             return true;
         }
         // Normalize first: type names from `quote!` are tokenized with spaces
-        // (e.g. "Option < String >"). Borrowing when there is nothing to strip
-        // matters here: every struct value in a document asks this of every
-        // field its type declares, and copying the type name to answer it was
-        // an allocation per field per value.
-        strip_type_whitespace(&self.type_name).starts_with("Option<")
+        // (e.g. "Option < String >"), and a crate that doesn't import the type
+        // spells it `std::option::Option<String>`. Borrowing when there is
+        // nothing to strip matters here: every struct value in a document asks
+        // this of every field its type declares, and copying the type name to
+        // answer it was an allocation per field per value.
+        normalize_type_name(&self.type_name).starts_with("Option<")
     }
 
     /// Whether this field is positional rather than named — i.e. a field of a
@@ -505,7 +568,7 @@ impl RustAnalyzer {
         // via `quote!(#ty).to_string()` are tokenized with spaces around `::`
         // and `<>`, but cache keys are stored space-free. Without this every
         // call site would have to remember to pre-normalize.
-        let normalized = strip_type_whitespace(type_path);
+        let normalized = normalize_type_name(type_path);
         let lookup = normalized.as_ref();
 
         // Resolve type aliases first
@@ -579,7 +642,7 @@ impl RustAnalyzer {
 
     /// Check if a field type is known, returning the unknown type name if not.
     fn check_field_type_known(&self, type_name: &str) -> Option<String> {
-        let clean = type_name.replace(" ", "");
+        let clean = normalize_type_name(type_name).into_owned();
 
         // Primitive types are always known
         let primitives = [
@@ -659,6 +722,46 @@ mod tests {
         // A tail has to start at a path segment, not in the middle of one.
         assert!(analyzer.get_type_info("Struct").is_none());
         assert!(analyzer.get_type_info("ested::MyStruct").is_none());
+    }
+
+    /// A field declared `std::option::Option<T>` — the spelling a crate that
+    /// doesn't rely on the prelude uses — is as optional as a bare
+    /// `Option<T>`. Reading only the bare spelling reported it as a
+    /// `missing-required-field` on a document serde deserializes happily.
+    #[test]
+    fn test_is_optional_reads_a_qualified_option() {
+        let optional = |type_name: &str| {
+            FieldInfo {
+                type_name: type_name.to_string(),
+                ..Default::default()
+            }
+            .is_optional()
+        };
+
+        assert!(optional("Option<u64>"));
+        assert!(optional("std::option::Option<u64>"));
+        assert!(optional("core::option::Option<u64>"));
+        assert!(optional("std :: option :: Option < u64 >"));
+
+        assert!(!optional("u64"));
+        // A user-defined type whose name merely ends in `Option` is not one.
+        assert!(!optional("crate::config::MyOption<u64>"));
+    }
+
+    /// Unqualifying std names must not cost a registered type its own path:
+    /// `crate::config::Box` is a user type that happens to share a final
+    /// segment with a std one, and the path is what identifies it.
+    #[test]
+    fn test_get_type_info_resolves_a_user_type_named_like_a_std_one() {
+        let analyzer = registered("crate::config::Box");
+
+        for lookup in ["crate::config::Box", "config::Box", "Box"] {
+            assert_eq!(
+                analyzer.get_type_info(lookup).map(|t| t.name.as_str()),
+                Some("crate::config::Box"),
+                "{lookup} should resolve"
+            );
+        }
     }
 
     /// Tail lookups are answered from an index built on first use, so every way
