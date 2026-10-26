@@ -1,8 +1,10 @@
 use super::type_utils::{
-    closest_name, extract_inner_type, is_custom_type, is_primitive_type, missing_required_fields,
-    normalize_type, short_name, tuple_element_types,
+    SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type, is_custom_type,
+    is_primitive_type, missing_required_fields, normalize_type, short_name, tuple_element_types,
 };
-use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{
+    FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
+};
 use ron::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -382,18 +384,30 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
         let inner_node = super::ts_utils::unwrap_some(node, content).unwrap_or(*node);
         return tree_satisfies(&inner_node, content, inner);
     }
-    if let Some(inner) = ["Box<", "Rc<", "Arc<"]
+    if let Some(inner) = TRANSPARENT_WRAPPERS
         .iter()
         .find_map(|wrapper| extract_inner_type(declared, wrapper))
     {
         return !is_custom_type(inner) && tree_satisfies(node, content, inner);
     }
-    if let Some(element) = extract_inner_type(declared, "Vec<") {
+    if let Some(element) = SEQUENCE_WRAPPERS
+        .iter()
+        .find_map(|wrapper| extract_inner_type(declared, wrapper))
+    {
         return !is_custom_type(element)
             && node.kind() == "array"
             && super::ts_utils::array_elements(node)
                 .iter()
                 .all(|value| tree_satisfies(value, content, element));
+    }
+
+    // A standard-library type with no generic arguments is settled by the
+    // literal's kind exactly like a primitive: the tree already knows whether
+    // the `PathBuf` field holds a string. The integer ones fall through to the
+    // `integer` arm below, which has the range the literal must fit, and the
+    // record ones to the full check.
+    if std_type(declared).map(|std| std.shape) == Some(StdShape::Text) {
+        return node.kind() == "string";
     }
 
     match (node.kind(), declared) {
@@ -487,7 +501,10 @@ fn validate_nested_value<'a>(
         ..Default::default()
     };
 
-    if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
+    if let Some(inner_type) = SEQUENCE_WRAPPERS
+        .iter()
+        .find_map(|wrapper| extract_inner_type(&field_type_normalized, wrapper))
+    {
         // Vec<CustomType> — every element is validated against the inner type
         // exactly the way a field's value is validated against the field's
         // type, so an element of the wrong shape is reported where it is
@@ -521,8 +538,8 @@ fn validate_nested_value<'a>(
             }
             settled = true;
         }
-    } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
-        .iter()
+    } else if let Some(inner_type) = std::iter::once(&"Option<")
+        .chain(TRANSPARENT_WRAPPERS.iter())
         .find_map(|w| extract_inner_type(&field_type_normalized, w))
     {
         // Single-element wrapper — check the inner type is known
@@ -585,26 +602,31 @@ fn validate_nested_value<'a>(
             settled = true;
             diagnostics.extend(found);
         }
+    } else if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
+        // A plain struct/enum the workspace defines — validate the node
+        // directly. Asked before the standard-library table below, so a
+        // configuration crate that defines a `Duration` or a `Path` of its own
+        // is validated against its own definition rather than being mistaken
+        // for std's.
+        diagnostics.extend(validate_node_with_type_info(
+            value_node,
+            content,
+            nested_type_info,
+            analyzer,
+            false,
+        ));
     } else if is_custom_type(&field_type_normalized) {
-        // Plain custom struct/enum — validate the node directly
-        if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
-            diagnostics.extend(validate_node_with_type_info(
-                value_node,
-                content,
-                nested_type_info,
-                analyzer,
-                false,
-            ));
-        } else {
-            // Unknown custom type — report an error at the value node
-            diagnostics.push(Diagnostic {
-                range: super::ts_utils::node_to_lsp_range(value_node, content),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Unknown type '{}'", field_type_normalized),
-                code: code(codes::UNKNOWN_TYPE),
-                ..Default::default()
-            });
-        }
+        // Unknown custom type — report an error at the value node. A
+        // standard-library type is not one of these: it is absent from the
+        // analyzer because it is not defined in the workspace the analyzer
+        // read, which says nothing about the build script.
+        diagnostics.push(Diagnostic {
+            range: super::ts_utils::node_to_lsp_range(value_node, content),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Unknown type '{}'", field_type_normalized),
+            code: code(codes::UNKNOWN_TYPE),
+            ..Default::default()
+        });
     }
 
     Nested {
@@ -910,32 +932,6 @@ fn literal_kind(trimmed: &str) -> Option<&'static str> {
     }
 }
 
-/// The inclusive range of integers the named Rust integer type accepts, or
-/// `None` when `type_name` is not an integer type.
-///
-/// `isize`/`usize` are sized after the host, which is the machine the
-/// configured application is built on in practice.
-fn integer_bounds(type_name: &str) -> Option<(i128, i128)> {
-    Some(match type_name {
-        "i8" => (i8::MIN as i128, i8::MAX as i128),
-        "i16" => (i16::MIN as i128, i16::MAX as i128),
-        "i32" => (i32::MIN as i128, i32::MAX as i128),
-        "i64" => (i64::MIN as i128, i64::MAX as i128),
-        "isize" => (isize::MIN as i128, isize::MAX as i128),
-        "u8" => (0, u8::MAX as i128),
-        "u16" => (0, u16::MAX as i128),
-        "u32" => (0, u32::MAX as i128),
-        "u64" => (0, u64::MAX as i128),
-        "usize" => (0, usize::MAX as i128),
-        // Everything `integer_value` can return fits in these, so there is
-        // nothing left to check — but they are still integer types, and saying
-        // so is what keeps a value in one from being reported as a non-numeric
-        // field.
-        "i128" | "u128" => (i128::MIN, i128::MAX),
-        _ => return None,
-    })
-}
-
 /// The exact value of an integer `ron::Number`, or `None` for a float.
 ///
 /// `ron` parses an integer literal into the narrowest variant that holds it, so
@@ -977,13 +973,20 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
         }
     }
 
-    // Handle Box, Rc, Arc - they serialize as just the inner value
-    if let Some(inner_type) = ["Box<", "Rc<", "Arc<"]
+    // Handle Box, Rc, Arc, Cow, NonZero and friends - they serialize as just
+    // the inner value
+    if let Some(inner_type) = TRANSPARENT_WRAPPERS
         .iter()
         .find_map(|w| extract_inner_type(&clean_type, w))
     {
         return check_type_mismatch(value, inner_type);
     }
+
+    // What a standard-library type with no generic arguments accepts. These are
+    // judged by shape alone: the analyzer has no definition of a `PathBuf` to
+    // check a value against, only the knowledge that RON writes one as a
+    // string.
+    let std_shape = std_type(&clean_type).map(|std| std.shape);
 
     match value {
         Value::Bool(_) if clean_type != "bool" => {
@@ -1016,21 +1019,27 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             }
         }
         Value::String(_) => {
-            // String is valid for String types
-            if clean_type == "String" || clean_type == "&str" || clean_type == "str" {
+            // String is valid for String types, and for the std types RON
+            // writes as one: a path, an address.
+            if clean_type == "String"
+                || clean_type == "&str"
+                || clean_type == "str"
+                || std_shape == Some(StdShape::Text)
+            {
                 return None;
             }
             // Otherwise it's an error
             return Some(format!("expected {}, got string", display_type));
         }
         Value::Seq(seq) => {
-            if clean_type.starts_with("Vec<") {
+            if let Some(elem_type) = SEQUENCE_WRAPPERS
+                .iter()
+                .find_map(|w| extract_inner_type(&clean_type, w))
+            {
                 // Check element types if possible
-                if let Some(elem_type) = extract_inner_type(&clean_type, "Vec<") {
-                    for elem in seq {
-                        if let Some(err) = check_type_mismatch(elem, elem_type) {
-                            return Some(format!("in Vec: {}", err));
-                        }
+                for elem in seq {
+                    if let Some(err) = check_type_mismatch(elem, elem_type) {
+                        return Some(format!("in Vec: {}", err));
                     }
                 }
             } else if clean_type.contains("HashSet<") || clean_type.contains("BTreeSet<") {
@@ -1889,6 +1898,164 @@ mod tests {
                 "{literal} in {type_name} is a std composite, not an unknown type: {errors:?}"
             );
         }
+    }
+
+    /// A standard-library type the analyzer could never have registered —
+    /// because it is not defined in the workspace the analyzer reads — used to
+    /// be classified as user-defined, resolved against the registered types,
+    /// and reported `unknown-type` on whatever value was written for it. Every
+    /// one of the documents below is one `ron` deserializes, and every one of
+    /// them came back broken.
+    #[test]
+    fn test_std_type_fields_accept_the_values_ron_reads() {
+        for (type_name, literal) in [
+            // Written as a string.
+            ("PathBuf", r#""/var/log/app.log""#),
+            ("std::path::PathBuf", r#""/etc/app""#),
+            ("SocketAddr", r#""127.0.0.1:8080""#),
+            ("IpAddr", r#""10.0.0.1""#),
+            ("Ipv6Addr", r#""::1""#),
+            // Written as an integer.
+            ("NonZeroU32", "4"),
+            ("NonZeroI32", "-4"),
+            // Written as the struct serde gives it.
+            ("Duration", "(secs: 30, nanos: 0)"),
+            // The generics that were missing from the wrapper list.
+            ("VecDeque<String>", r#"["a", "b"]"#),
+            ("LinkedList<u8>", "[1, 2]"),
+            ("BinaryHeap<u8>", "[1, 2]"),
+            ("Cow<'static, str>", r#""prod""#),
+            ("Mutex<u8>", "1"),
+            ("NonZero<u32>", "4"),
+            // A lifetime is not part of what the document writes.
+            ("&'a str", r#""prod""#),
+            // ... and each of them through a wrapper, in a sequence, or in a
+            // position of a composite.
+            ("Option<PathBuf>", r#"Some("/run/app.pid")"#),
+            ("Option<PathBuf>", "None"),
+            ("Vec<PathBuf>", r#"["/usr/share", "/opt"]"#),
+            ("Vec<Duration>", "[(secs: 1, nanos: 0)]"),
+            ("HashMap<String, PathBuf>", r#"{"log": "/var/log"}"#),
+            ("(PathBuf, NonZeroU32)", r#"("/etc", 1)"#),
+            ("Box<SocketAddr>", r#""0.0.0.0:0""#),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// What a standard-library field is checked *for* instead, now that it is
+    /// no longer reported as an unknown type. Every one of these is a document
+    /// `ron` refuses, so letting it through means the config looks clean in the
+    /// editor and then fails to load.
+    #[test]
+    fn test_std_type_field_mismatches_are_reported() {
+        for (type_name, literal, expected) in [
+            ("PathBuf", "7", "expected PathBuf, got number"),
+            ("PathBuf", "true", "expected PathBuf, got bool"),
+            ("PathBuf", "[1]", "expected PathBuf, got array"),
+            ("SocketAddr", "true", "expected SocketAddr, got bool"),
+            ("Duration", r#""30s""#, "expected Duration, got string"),
+            // `ron` refuses a zero for an unsigned `NonZero` outright, and the
+            // range is what says so.
+            ("NonZeroU32", "0", "0 is out of range for NonZeroU32"),
+            ("NonZeroU8", "300", "300 is out of range for NonZeroU8"),
+            ("NonZeroU32", r#""4""#, "expected NonZeroU32, got string"),
+            ("NonZero<u32>", "0", "0 is out of range for NonZero<u32>"),
+            // A sequence wrapper is checked element by element, like a `Vec`.
+            ("VecDeque<String>", "[1]", "expected String, got number"),
+            ("VecDeque<String>", r#""a""#, "expected VecDeque<String>"),
+            // ... and so is a std type inside one.
+            ("Vec<PathBuf>", "[1]", "expected PathBuf, got number"),
+            ("Option<PathBuf>", "Some(7)", "expected PathBuf, got number"),
+            ("(PathBuf, u16)", "(1, 2)", "expected PathBuf, got number"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|m| m.contains("Unknown type")),
+                "{literal} in {type_name} is a std type, not an unknown one: {errors:?}"
+            );
+        }
+    }
+
+    /// A type the build script really did forget is still reported — the
+    /// standard-library table must not become a blanket excuse for an
+    /// unresolvable name.
+    #[test]
+    fn test_unregistered_custom_type_is_still_unknown() {
+        for (type_name, literal) in [
+            ("Ghost", "Ghost(a: 1)"),
+            ("Option<Ghost>", "Some(Ghost(a: 1))"),
+            ("Vec<Ghost>", "[Ghost(a: 1)]"),
+            // A name that merely resembles a std one is nobody's.
+            ("Durations", "Durations(a: 1)"),
+            ("MyPathBuf", r#""/etc""#),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains("nknown type")),
+                "{type_name} is not registered and not std, got {errors:?}"
+            );
+        }
+    }
+
+    /// The standard-library table must not shadow a type the workspace
+    /// actually defines: a configuration crate with a `Duration` of its own
+    /// gets its own definition validated, fields and all.
+    #[test]
+    fn test_a_workspace_type_wins_over_the_std_table() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Duration".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "millis".to_string(),
+                type_name: "u64".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+        let type_info = single_field_type("Duration");
+
+        let errors = |literal: &str| -> Vec<String> {
+            let content = format!("Cfg(n: {literal})");
+            validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone())
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
+        };
+
+        // Its own spelling is accepted...
+        assert!(
+            errors("Duration(millis: 5)").is_empty(),
+            "got {:?}",
+            errors("Duration(millis: 5)")
+        );
+        // ... its own fields are checked, rather than being waved through as
+        // serde's `Duration` record would be ...
+        assert!(
+            errors("Duration(secs: 5)")
+                .iter()
+                .any(|m| m.contains("Unknown field 'secs'")),
+            "got {:?}",
+            errors("Duration(secs: 5)")
+        );
+        // ... and so is their type.
+        assert!(
+            errors(r#"Duration(millis: "5")"#)
+                .iter()
+                .any(|m| m.contains("expected u64, got string")),
+            "got {:?}",
+            errors(r#"Duration(millis: "5")"#)
+        );
     }
 
     /// A struct nested inside a tuple is reached through the positional walk

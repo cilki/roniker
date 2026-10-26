@@ -208,11 +208,17 @@ Opening a RON file matched by the pattern above gets you:
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file.
     This is about the *declaration*; a value naming a type nobody registered is
-    a `type-mismatch`, as above.
+    a `type-mismatch`, as above. A standard-library type is never reported here
+    — see [Standard-library types](#standard-library-types) below for the ones
+    that are understood without being registered.
 - code actions:
   - *Add N required fields* and *Add all N missing fields* on the root value,
     for structs and for enum variants alike. An enum root's titles name the
-    variant the fields belong to: *Add all 2 missing fields to Prod*
+    variant the fields belong to: *Add all 2 missing fields to Prod*. Each
+    field is filled in with a value `ron` will read, which for the types of
+    [Standard-library types](#standard-library-types) is the spelling listed
+    there: `""` for a `PathBuf`, `1` for a `NonZeroU32`,
+    `(secs: 0, nanos: 0)` for a `Duration`
   - *Add N required fields to `path`* for any value nested below it — a struct,
     an enum variant, an element of a `Vec`, or the contents of a `Some(...)` —
     naming it the way the file spells it (`server.tls`, `mode::Prod`,
@@ -239,6 +245,44 @@ element is marked where it is written; a `Vec` of primitives is checked as a
 whole, and the one message lands on the array (`in Vec: expected u16, got
 string`). Either way a non-array written where a `Vec` belongs is reported as
 the mismatch it is (`expected Vec<String>, got number`).
+
+### Standard-library types
+
+A configuration type is mostly made of standard-library types, and the analyzer
+only ever reads your own source: nothing in `std` is defined in the workspace it
+is given, so no build script can register a `PathBuf`. These are understood by
+name instead, by the RON spelling serde reads each one from:
+
+- written as a string: `PathBuf`, `Path`, `OsString`, `OsStr`, `IpAddr`,
+  `Ipv4Addr`, `Ipv6Addr`, `SocketAddr`, `SocketAddrV4`, `SocketAddrV6`
+- written as an integer: the `NonZero` family, under both the `NonZeroU32` and
+  the `NonZero<u32>` spelling. A `0` in an *unsigned* one is reported as out of
+  range, which is what `ron` does with it; a `0` in a signed one is refused by
+  `ron` too but is not reported
+- written as a struct of their own: `Duration` as `(secs: 0, nanos: 0)` and
+  `SystemTime` as `(secs_since_epoch: 0, nanos_since_epoch: 0)`. The fields
+  inside those are not checked
+- written as an array of their elements: `VecDeque<T>`, `LinkedList<T>`,
+  `BinaryHeap<T>`, alongside the `Vec<T>`, `HashSet<T>` and `BTreeSet<T>`
+  already handled
+- written as the wrapped value and nothing else: `Cow<T>`, `Cell<T>`,
+  `RefCell<T>`, `Mutex<T>`, `RwLock<T>`, alongside `Box<T>`, `Rc<T>` and
+  `Arc<T>`
+
+Each is accepted wherever a type can appear — on its own, behind an `Option`,
+as a `Vec`'s element, in a position of a tuple — and the module path in front
+of one is dropped, so `std::path::PathBuf` is the `PathBuf` it names. Lifetime
+arguments are dropped too, since a document never writes one: a
+`Cow<'static, str>` field takes the same values a `String` field does.
+
+A type of **your own** that shares a name with one of these keeps its own
+meaning: the analyzer is asked first, so a `Duration` your crate defines is
+validated against your definition, completed from it, and filled in by the
+quick-fix as `Duration()`.
+
+Anything else in `std` is still read as a type the build script should have
+registered, and a field declared as one gets `unknown-type`. `Result<T, E>`,
+`PhantomData<T>` and the atomics are the ones most likely to come up.
 
 ### Tuples and arrays
 
@@ -376,12 +420,15 @@ What gets offered depends on where in the value the cursor sits:
   `true`/`false` for a `bool`, `""` for a `String`, `''` for a `char`, `0` for
   any integer or float, `[]` and `[...]` for a `Vec`, a slice or a set, `(...)`
   for a tuple or a fixed-size array (see [Tuples and
-  arrays](#tuples-and-arrays)), `{}` and `{...}` for a `HashMap` or
+  arrays](#tuples-and-arrays)),   `{}` and `{...}` for a `HashMap` or
   `BTreeMap`, `Some(...)` and `None` for an `Option`, the variants of an enum,
-  and for a struct a snippet of the whole value with every field laid out.
+  and for a struct a snippet of the whole value with every field laid out. The
+  standard-library types of [Standard-library
+  types](#standard-library-types) are offered the value `ron` reads them from,
+  with the caret where the value goes: `""` for a `PathBuf`, `"0.0.0.0:0"` for
+  a `SocketAddr`, `(secs: 0, nanos: 0)` for a `Duration`.
 - Every registered type, as a fallback, when the field's declared type yields
-  none of the above — a `PathBuf` field, say, or anything else the build script
-  was not given the source for.
+  none of the above — anything the build script was not given the source for.
 
 Fields the value has already written are left out of the field-name
 completions, with one caveat: the names consulted are always the *root* value's,

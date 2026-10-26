@@ -1,8 +1,9 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
-    extract_inner_type, normalize_type, short_name, strip_outer_generic, tuple_element_types,
+    SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, normalize_type, short_name,
+    std_type, strip_outer_generic, tuple_element_types,
 };
-use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
@@ -442,6 +443,15 @@ fn generate_value_completions_by_type(
         }
     }
 
+    // A wrapper the document writes straight through — `Box<T>`, `Cow<T>`,
+    // `NonZero<T>` — takes exactly the values its inner type does.
+    if let Some(inner) = TRANSPARENT_WRAPPERS
+        .iter()
+        .find_map(|w| extract_inner_type(&clean_type, w))
+    {
+        return generate_value_completions_by_type(inner, analyzer);
+    }
+
     // Check for generic types and try to provide completions for the inner type
     if clean_type.starts_with("Option<") {
         let inner = extract_inner_type(&clean_type, "Option<").unwrap_or(&clean_type);
@@ -542,8 +552,9 @@ fn generate_value_completions_by_type(
                 ..Default::default()
             },
         });
-    } else if ["Vec<", "HashSet<", "BTreeSet<"]
+    } else if SEQUENCE_WRAPPERS
         .iter()
+        .chain(["HashSet<", "BTreeSet<"].iter())
         .any(|prefix| clean_type.starts_with(prefix))
     {
         // A set is written as a sequence too, so it takes the same values.
@@ -578,7 +589,50 @@ fn generate_value_completions_by_type(
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         });
-    } else if clean_type == "String" || clean_type == "&str" {
+    } else if let Some(std) = std_type(&clean_type) {
+        // A standard-library type the analyzer never registers. There is no
+        // definition to offer a snippet from, but its RON spelling is known,
+        // and offering it is what keeps a `PathBuf` field from falling through
+        // to "every type in the workspace".
+        completions.push(match std.shape {
+            StdShape::Text => {
+                // A type whose placeholder spells out a value — an `IpAddr`'s
+                // `"0.0.0.0"` — offers it pre-selected, as a starting point to
+                // edit rather than a value anybody wants as is. One with
+                // nothing to seed (`PathBuf`) just puts the caret in the
+                // quotes, exactly as a `String` field does.
+                let seed = std.placeholder.trim_matches('"');
+                CompletionItem {
+                    label: std.placeholder.to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some(format!("{field_type} as a string")),
+                    insert_text: Some(match seed.is_empty() {
+                        true => "\"$0\"".to_string(),
+                        false => format!("\"${{1:{seed}}}\""),
+                    }),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                }
+            }
+            StdShape::Integer => CompletionItem {
+                label: std.placeholder.to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(format!("{field_type} value")),
+                insert_text: Some(std.placeholder.to_string()),
+                ..Default::default()
+            },
+            StdShape::Record => CompletionItem {
+                label: std.placeholder.to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(format!("{field_type} as serde writes it")),
+                insert_text: Some(std.placeholder.to_string()),
+                ..Default::default()
+            },
+        });
+    } else if clean_type == "String" || clean_type == "&str" || clean_type == "str" {
+        // `str` reaches here through a wrapper: a `Cow<'a, str>` field is
+        // written as the string it borrows. Leaving it out sent those fields to
+        // the "every type in the workspace" fallback.
         completions.push(CompletionItem {
             label: "\"\"".to_string(),
             kind: Some(CompletionItemKind::VALUE),
@@ -672,6 +726,58 @@ mod tests {
         if let Some(Documentation::MarkupContent(content)) = &field_a.documentation {
             assert!(content.value.contains("Field A documentation"));
         }
+    }
+
+    /// A field declared as a standard-library type the analyzer never
+    /// registers used to yield no value completion at all, so the caller fell
+    /// back to offering every type in the workspace — a list of structs where
+    /// a path or an address belongs. Its RON spelling is known even though its
+    /// definition is not, and that is what gets offered.
+    #[test]
+    fn test_std_type_value_completions() {
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let labels = |type_name: &str| -> Vec<String> {
+            generate_value_completions_by_type(type_name, analyzer.clone())
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+
+        assert_eq!(labels("PathBuf"), vec!["\"\""]);
+        assert_eq!(labels("std::path::PathBuf"), vec!["\"\""]);
+        assert_eq!(labels("IpAddr"), vec!["\"0.0.0.0\""]);
+        assert_eq!(labels("SocketAddr"), vec!["\"0.0.0.0:0\""]);
+        assert_eq!(labels("Ipv6Addr"), vec!["\"::\""]);
+        assert_eq!(labels("NonZeroU32"), vec!["1"]);
+        assert_eq!(labels("Duration"), vec!["(secs: 0, nanos: 0)"]);
+
+        // A wrapper the document writes straight through offers what the type
+        // it wraps does — including `str`, which only ever arrives that way and
+        // which the string branch used to miss.
+        assert_eq!(labels("Cow<'static, str>"), vec!["\"\""]);
+        assert_eq!(labels("Box<PathBuf>"), vec!["\"\""]);
+        assert_eq!(labels("Arc<RwLock<Duration>>"), vec!["(secs: 0, nanos: 0)"]);
+
+        // `NonZero<u32>` is `NonZeroU32` under its other spelling, and must not
+        // be offered the `0` a bare `u32` would be: `ron` refuses it.
+        assert_eq!(labels("NonZero<u32>"), vec!["1"]);
+        assert_eq!(labels("std::num::NonZero<u32>"), vec!["1"]);
+
+        // The sequences that were missing from the wrapper list take the array
+        // spelling, like a `Vec`.
+        assert_eq!(labels("VecDeque<String>"), vec!["[]", "[...]"]);
+        assert_eq!(labels("BinaryHeap<u8>"), vec!["[]", "[...]"]);
+
+        // The snippet puts the caret where the value goes: inside the quotes
+        // for a path, over the seed value for an address.
+        let inserted = |type_name: &str| -> Option<String> {
+            generate_value_completions_by_type(type_name, analyzer.clone())
+                .first()?
+                .insert_text
+                .clone()
+        };
+        assert_eq!(inserted("PathBuf").as_deref(), Some("\"$0\""));
+        assert_eq!(inserted("IpAddr").as_deref(), Some("\"${1:0.0.0.0}\""));
     }
 
     #[tokio::test]

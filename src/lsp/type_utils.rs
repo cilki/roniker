@@ -79,55 +79,36 @@ fn is_primitive_normalized(clean: &str) -> bool {
     )
 }
 
-/// Standard-library generic wrappers the analyzer never resolves as a
-/// user-defined type. A name only counts when it is actually used as a generic,
-/// i.e. immediately followed by `<` (e.g. `Option<T>`, not a struct named
-/// `Options`), which is what [`is_std_generic_normalized`] checks for.
-const STD_GENERIC_WRAPPERS: [&str; 10] = [
-    "Option", "Vec", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "Result", "Box", "Rc", "Arc",
+/// Standard-library wrappers a value is written straight through: the document
+/// spells out the wrapped value and nothing else, so each of these asks of a
+/// value exactly what the type it wraps would.
+///
+/// `Option<T>` is not one of them: `Some(..)` and `None` are spellings of its
+/// own. Neither is `NonZero<T>`, which is written as the integer but is not
+/// *any* integer — [`crate::rust_analyzer::std_type`] answers for both its
+/// spellings, so that the value offered for one is the value offered for the
+/// other.
+pub const TRANSPARENT_WRAPPERS: [&str; 8] = [
+    "Box<", "Rc<", "Arc<", "Cow<", "Cell<", "RefCell<", "Mutex<", "RwLock<",
 ];
 
-/// Whether an already-normalized type name is a standard library generic
-/// (Option, Vec, HashMap, etc.).
+/// Standard-library sequences, which RON writes as an array of their elements
+/// and which therefore ask of a value exactly what a `Vec<T>` would.
 ///
-/// A wrapper counts anywhere it appears, not only at the start, so composite
-/// types that merely embed one — e.g. the tuple `(u8, Vec<Config>)` — are
-/// treated the same regardless of which wrapper they contain. Previously only
-/// the map/set wrappers were matched this way, so a tuple embedding a `Vec` or
-/// `Box` was misclassified as a custom type and drew a spurious "Unknown type"
-/// diagnostic while the same tuple embedding a `HashMap` did not.
-///
-/// Driven by where the `<`s are rather than by the wrapper list: a wrapper can
-/// only appear immediately in front of one, so a name holding no `<` at all is
-/// settled by a single scan for it. Asking the question once per wrapper
-/// instead meant ten substring searches — each building its own searcher — over
-/// every type name the validator classified, and most of those are a bare
-/// `Config` with no `<` anywhere in them.
-fn is_std_generic_normalized(clean: &str) -> bool {
-    let mut from = 0;
-    while let Some(offset) = clean[from..].find('<') {
-        let before = &clean[..from + offset];
-        if STD_GENERIC_WRAPPERS
-            .iter()
-            .any(|wrapper| before.ends_with(wrapper))
-        {
-            return true;
-        }
-        from += offset + 1;
-    }
-    false
-}
+/// The sets (`HashSet`, `BTreeSet`) are written the same way but are checked as
+/// a whole rather than element by element, so they are not in this list.
+pub const SEQUENCE_WRAPPERS: [&str; 4] = ["Vec<", "VecDeque<", "LinkedList<", "BinaryHeap<"];
 
 /// Whether an already-normalized type name is a standard-library *composite*:
 /// a tuple `(A, B)`, an array or slice `[T; N]`/`[T]`, or a reference `&T`.
 ///
 /// None of these is a name the analyzer could ever have registered, and none
-/// of them is spelled with a `<`, so [`is_std_generic_normalized`] does not
-/// recognise them. Without this they were classified as user-defined types and
-/// every field declared as one drew an `unknown-type` error, however correct
-/// the value written for it — unless the composite happened to embed a generic
-/// wrapper, which is the one spelling [`is_std_generic_normalized`] already
-/// caught.
+/// of them is spelled with a `<`, so [`crate::rust_analyzer::is_std_generic`]
+/// does not recognise them. Without this they were classified as user-defined
+/// types and every field declared as one drew an `unknown-type` error, however
+/// correct the value written for it — unless the composite happened to embed a
+/// generic wrapper, which is the one spelling
+/// [`crate::rust_analyzer::is_std_generic`] already caught.
 fn is_std_composite_normalized(clean: &str) -> bool {
     clean.starts_with(['(', '[', '&'])
 }
@@ -135,17 +116,27 @@ fn is_std_composite_normalized(clean: &str) -> bool {
 /// Check if a type is a user-defined struct or enum — i.e. something the
 /// analyzer should resolve and validate against. This is exactly the types that
 /// are none of a primitive ([`is_primitive_type`]), a standard-library generic
-/// wrapper ([`is_std_generic_normalized`]) or a standard-library composite
-/// ([`is_std_composite_normalized`]). The name is normalized here, so
-/// `type_name` may be passed raw or pre-normalized.
+/// ([`crate::rust_analyzer::is_std_generic`]), a standard-library composite
+/// ([`is_std_composite_normalized`]) or one of the standard-library types that
+/// take no generic arguments at all ([`crate::rust_analyzer::std_type`]). The
+/// name is normalized here, so `type_name` may be passed raw or pre-normalized.
 pub fn is_custom_type(type_name: &str) -> bool {
     // Normalized once and asked of every classifier rather than once each:
     // every value in a document is classified, several times over, and they
     // were normalizing the same name twice to answer the one question.
     let clean = normalize_type(type_name);
     !is_primitive_normalized(&clean)
-        && !is_std_generic_normalized(&clean)
+        && !crate::rust_analyzer::is_std_generic(&clean)
         && !is_std_composite_normalized(&clean)
+        && crate::rust_analyzer::std_type(&clean).is_none()
+}
+
+/// The standard-library type `type_name` names, if it is one of those that take
+/// no generic arguments. A thin wrapper over
+/// [`crate::rust_analyzer::std_type`] that normalizes the name first, so
+/// callers holding a raw type name don't each have to.
+pub fn std_type(type_name: &str) -> Option<crate::rust_analyzer::StdType> {
+    crate::rust_analyzer::std_type(&normalize_type(type_name))
 }
 
 /// Largest number of positions [`tuple_element_types`] will enumerate. An
@@ -358,6 +349,76 @@ mod tests {
         );
     }
 
+    /// A standard-library type with no generic arguments is not something the
+    /// analyzer could have registered, so reading it as user-defined meant a
+    /// field declared as one drew `unknown-type` on whatever value was written
+    /// for it, however correct that value was.
+    #[test]
+    fn test_is_custom_type_excludes_std_types() {
+        for name in [
+            "PathBuf",
+            "std::path::PathBuf",
+            "SocketAddr",
+            "Ipv4Addr",
+            "NonZeroU32",
+            "Duration",
+            // The generics that were missing from the wrapper list.
+            "VecDeque<String>",
+            "LinkedList<u8>",
+            "BinaryHeap<u8>",
+            "Cow<'static, str>",
+            "Mutex<Config>",
+            "NonZero<u32>",
+            // ... and through a wrapper, or embedded in a composite.
+            "Option<PathBuf>",
+            "Vec<SocketAddr>",
+            "(PathBuf, u16)",
+            "&'a str",
+        ] {
+            assert!(!is_custom_type(name), "{name} is not a user-defined type");
+        }
+
+        // A user-defined type whose name merely resembles one stays custom.
+        for name in ["Server", "Durations", "NonZeroThing", "MyPathBuf"] {
+            assert!(is_custom_type(name), "{name} is a user-defined type");
+        }
+    }
+
+    /// The standard-library wrapper lists are what the validator, the
+    /// completion generator and the quick-fix all read a wrapped value
+    /// through, so each entry has to be spelled the way
+    /// [`extract_inner_type`] expects: the name and its opening `<`.
+    #[test]
+    fn test_wrapper_lists_unwrap_their_inner_type() {
+        for wrapper in TRANSPARENT_WRAPPERS {
+            let declared = format!("{wrapper}Server>");
+            assert_eq!(
+                extract_inner_type(&declared, wrapper),
+                Some("Server"),
+                "{wrapper}"
+            );
+        }
+        for wrapper in SEQUENCE_WRAPPERS {
+            let declared = format!("{wrapper}Server>");
+            assert_eq!(
+                extract_inner_type(&declared, wrapper),
+                Some("Server"),
+                "{wrapper}"
+            );
+        }
+
+        // Every one of them is also a name the path strip and the generic
+        // classifier know, or a qualified spelling would fall through as a
+        // user-defined type again.
+        for wrapper in TRANSPARENT_WRAPPERS.iter().chain(SEQUENCE_WRAPPERS.iter()) {
+            let name = wrapper.trim_end_matches('<');
+            assert!(
+                crate::rust_analyzer::STD_GENERIC_NAMES.contains(&name),
+                "{name} is missing from STD_GENERIC_NAMES"
+            );
+        }
+    }
+
     /// The classifiers normalize internally, so a qualified std type lands on
     /// the same side of each of them as the bare spelling does.
     #[test]
@@ -369,10 +430,10 @@ mod tests {
         assert!(is_custom_type("crate::config::Server"));
     }
 
-    /// [`is_std_generic_normalized`] takes a name the way
+    /// [`crate::rust_analyzer::is_std_generic`] takes a name the way
     /// [`is_custom_type`] hands it over, so the tests normalize first.
     fn is_std_generic_type(type_name: &str) -> bool {
-        is_std_generic_normalized(&normalize_type(type_name))
+        crate::rust_analyzer::is_std_generic(&normalize_type(type_name))
     }
 
     #[test]

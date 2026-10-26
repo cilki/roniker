@@ -795,9 +795,16 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     }
     // A set serializes as a sequence, the same as a `Vec`. A fixed-size array
     // does not, despite the brackets in its name: see the tuple branch below.
-    if ["Vec", "HashSet", "BTreeSet"]
-        .iter()
-        .any(|prefix| clean.starts_with(prefix))
+    if [
+        "Vec",
+        "VecDeque",
+        "LinkedList",
+        "BinaryHeap",
+        "HashSet",
+        "BTreeSet",
+    ]
+    .iter()
+    .any(|prefix| clean.starts_with(prefix))
     {
         return "[]".to_string();
     }
@@ -834,24 +841,35 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     // A custom type is spelled by its last path segment: a field declared
     // `config::Server` is written `Server(...)` in RON.
     let short = super::type_utils::short_name(&clean).to_string();
-    // Constructor notation with no contents, for a type the analyzer doesn't
-    // know and so can't say anything more specific about.
+    // Constructor notation with no contents, for a named struct whose own
+    // required fields come back as a `missing-required-field` diagnostic with a
+    // nested action to finish the job.
     let opaque = || format!("{short}()");
+    // For a name the analyzer has no definition of at all: the value `ron`
+    // reads a standard-library type from, since the analyzer was never going to
+    // have one of those. `PathBuf()` is not a `PathBuf` — the very thing this
+    // generator exists to avoid — and nor are `SocketAddr()` or `Duration()`.
+    // Asked only once the analyzer has been, so a workspace type sharing a name
+    // with one of them keeps its own constructor.
+    let unresolved = || match super::type_utils::std_type(&clean) {
+        Some(std) => std.placeholder.to_string(),
+        None => opaque(),
+    };
 
     if depth == 0 {
-        return opaque();
+        return unresolved();
     }
 
     // Serde sees straight through a smart pointer, and so does RON: a
     // `Box<Server>` field is written exactly like a `Server` one.
-    for wrapper in ["Box<", "Rc<", "Arc<"] {
+    for wrapper in super::type_utils::TRANSPARENT_WRAPPERS {
         if let Some(inner) = super::type_utils::extract_inner_type(&clean, wrapper) {
             return generate_default_value_depth(inner, analyzer, depth - 1);
         }
     }
 
     let Some(info) = analyzer.get_type_info(&clean) else {
-        return opaque();
+        return unresolved();
     };
 
     match &info.kind {
@@ -1225,6 +1243,85 @@ mod tests {
                 panic!("{title:?} produced {document:?}, which ron rejects: {e}")
             });
         }
+    }
+
+    /// Same again for the standard-library types, which the analyzer never
+    /// registers and which the opaque fallback therefore reached: the quick-fix
+    /// used to fill a required `PathBuf` in as `PathBuf()`, a required
+    /// `SocketAddr` as `SocketAddr()` and a required `Duration` as
+    /// `Duration()`, none of which `ron` will read.
+    #[test]
+    fn test_missing_std_field_action_inserts_a_deserializable_document() {
+        use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+        use std::num::NonZeroU32;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Cfg {
+            log_file: PathBuf,
+            addr: SocketAddr,
+            advertise: IpAddr,
+            v6: Ipv6Addr,
+            workers: NonZeroU32,
+            timeout: Duration,
+            queue: std::collections::VecDeque<String>,
+            boxed: Box<PathBuf>,
+        }
+
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let type_info = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("log_file", "PathBuf"),
+                field("addr", "SocketAddr"),
+                field("advertise", "IpAddr"),
+                field("v6", "Ipv6Addr"),
+                field("workers", "NonZeroU32"),
+                field("timeout", "std::time::Duration"),
+                field("queue", "VecDeque<String>"),
+                field("boxed", "Box<PathBuf>"),
+            ]),
+            ..Default::default()
+        };
+
+        let actions = missing_field_actions("Cfg()", &type_info, Arc::new(RustAnalyzer::new()));
+        assert!(!actions.is_empty(), "the fields should be offered");
+        for (title, document) in actions {
+            ron::from_str::<Cfg>(&document).unwrap_or_else(|e| {
+                panic!("{title:?} produced {document:?}, which ron rejects: {e}")
+            });
+        }
+    }
+
+    /// A type the workspace defines is spelled by its own constructor even when
+    /// it shares a name with one of the standard-library types, since its
+    /// missing fields come back as a diagnostic with a nested action to finish
+    /// the job.
+    #[test]
+    fn test_std_placeholder_does_not_shadow_a_workspace_type() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Duration".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "millis".to_string(),
+                type_name: "u64".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        assert_eq!(generate_default_value("Duration", &analyzer), "Duration()");
+        // Nothing registered under that name: serde's spelling, not `Duration()`.
+        assert_eq!(
+            generate_default_value("Duration", &RustAnalyzer::new()),
+            "(secs: 0, nanos: 0)"
+        );
     }
 
     #[test]
