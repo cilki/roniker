@@ -254,53 +254,47 @@ impl Formatter<'_> {
             self.output.push_str(name);
         }
 
-        // A struct is either field-style — `User(id: 1)`, laid out like every
-        // other container — or tuple-style, which has its own rules
+        // A struct is either field-style — `User(id: 1)` — or tuple-style —
+        // `Point(1, 2)`, `Some("value")`. Both are containers and lay out as
+        // one, bar the single exception below.
         let fields = ts_utils::struct_fields(node);
-        if fields.is_empty() {
-            self.output.push('(');
-            self.struct_values(node, level);
-            self.output.push(')');
-        } else {
+        if !fields.is_empty() {
             self.container(node, level, ('(', ')'), &fields);
-        }
-    }
-
-    /// Lay out the values of a tuple-style struct (`Some("value")`,
-    /// `Point(1, 2)`). These are the one container whose items are *separated*
-    /// rather than terminated by commas, and a lone value stays on the struct's
-    /// own line, so they don't go through [`Formatter::container`].
-    fn struct_values(&mut self, node: &Node, level: usize) {
-        let values = ts_utils::struct_values(node, self.content);
-        if values.is_empty() {
             return;
         }
 
-        let comments = collect_inner_comments(node, self.content);
-        let inline = values.len() == 1;
+        let values = self.struct_values(node);
 
-        if !inline {
-            self.output.push('\n');
+        // A tuple-style struct holding one value keeps that value on the
+        // struct's own line: `Some([` rather than `Some(\n    [`. The value
+        // therefore sits at the struct's level and not one deeper — whatever it
+        // opens has to close back at the column the struct's own `)` is in.
+        //
+        // A comment among the values is the one thing that line can't hold, so
+        // it gives up the shorter form rather than the comment.
+        if let [only] = values.as_slice()
+            && collect_inner_comments(node, self.content).is_empty()
+        {
+            self.output.push('(');
+            self.node(only, level);
+            self.output.push(')');
+            return;
         }
 
-        for (i, value) in values.iter().enumerate() {
-            if !inline {
-                self.leading_comments(&comments, &values, i, level);
-                self.indent(level + 1);
-            }
+        self.container(node, level, ('(', ')'), &values);
+    }
 
-            self.node(value, level + 1);
-
-            if i + 1 < values.len() {
-                self.output.push(',');
-                self.output.push(if inline { ' ' } else { '\n' });
-            }
-        }
-
-        if !inline {
-            self.output.push('\n');
-            self.indent(level);
-        }
+    /// The values of a tuple-style struct, with its name and its comments left
+    /// out.
+    ///
+    /// [`ts_utils::struct_values`] drops the name but counts a comment as a
+    /// value, and a comment laid out as one acquires a terminating comma:
+    /// `Some(/* why */ 1)` became `Some(/* why */, 1)`, which RON rejects.
+    fn struct_values<'t>(&self, node: &Node<'t>) -> Vec<Node<'t>> {
+        ts_utils::struct_values(node, self.content)
+            .into_iter()
+            .filter(|value| !ts_utils::is_comment(value))
+            .collect()
     }
 
     /// Lay out a `name: value` field of a struct.
@@ -570,6 +564,76 @@ User(
     ),
 )"#;
         assert_eq!(format_ron(input), expected);
+        assert_eq!(format_ron(expected), expected);
+    }
+
+    /// A tuple struct holding one value keeps it on the struct's own line, so
+    /// the value belongs at the struct's level of indentation: what it opens on
+    /// that line has to close back at the column the struct's own `)` is in.
+    /// Laying the value out one level deeper instead pushed every nested
+    /// container — which is every `Option` field written `Some([...])` or
+    /// `Some(Inner(...))` — four spaces past where it belongs, and left its
+    /// closing delimiter hanging inside the struct's.
+    #[test]
+    fn test_single_value_tuple_struct_indents_its_value_at_its_own_level() {
+        assert_eq!(
+            format_ron("Root(extra: Some([1, 2]))"),
+            "Root(\n    extra: Some([\n        1,\n        2,\n    ]),\n)"
+        );
+        assert_eq!(
+            format_ron("Root(server: Some(Inner(a: 1)))"),
+            "Root(\n    server: Some(Inner(\n        a: 1,\n    )),\n)"
+        );
+        // Nesting one inside another compounded the error four spaces at a time
+        assert_eq!(
+            format_ron("Root(a: Some(Some([1])))"),
+            "Root(\n    a: Some(Some([\n        1,\n    ])),\n)"
+        );
+        // A root value of its own has nothing above it to be relative to
+        assert_eq!(format_ron("Some([1])"), "Some([\n    1,\n])");
+        // ...and a value that needs no line of its own still gets none
+        assert_eq!(format_ron("Root(x: Some(2))"), "Root(\n    x: Some(2),\n)");
+    }
+
+    /// Every other container terminates its items with a comma; a tuple struct
+    /// separated them instead, so the last value of `Span(1, 2)` came back
+    /// without one. RON accepts the trailing comma here as it does everywhere
+    /// else, and the README documents one after each item.
+    #[test]
+    fn test_multi_value_tuple_struct_terminates_its_values() {
+        let formatted = format_ron("Root(span: Span(1, 5))");
+        assert_eq!(
+            formatted,
+            "Root(\n    span: Span(\n        1,\n        5,\n    ),\n)"
+        );
+        assert_eq!(format_ron(&formatted), formatted);
+    }
+
+    /// `struct_values` counts a comment as a value, and a comment laid out as a
+    /// value got a terminating comma of its own: `Some(/* why */ 1)` came back
+    /// as `Some(/* why */, 1)`, which RON rejects — formatting turned a
+    /// deserializable document into an unparseable one. The comment is a
+    /// comment, and belongs on its own line above the value like any other.
+    #[test]
+    fn test_comment_in_tuple_struct_stays_a_comment() {
+        let formatted = format_ron("Some(/* why */ 1)");
+        assert_eq!(formatted, "Some(\n    /* why */\n    1,\n)");
+        assert_eq!(
+            ron::from_str::<Option<u32>>(&formatted).ok(),
+            Some(Some(1)),
+            "the formatted document still deserializes: {formatted:?}"
+        );
+        assert_eq!(format_ron(&formatted), formatted);
+    }
+
+    /// And a comment *after* a tuple struct's value is a trailing comment,
+    /// which stays on that value's line. Laying the comments out as values put
+    /// `// one` on a line of its own below the `1` it describes, and appended a
+    /// comma that the line comment then swallowed.
+    #[test]
+    fn test_trailing_comment_in_tuple_struct_keeps_its_line() {
+        let expected = "Point(\n    // first\n    1, // one\n    2,\n)";
+        assert_eq!(format_ron("Point(// first\n1, // one\n2)"), expected);
         assert_eq!(format_ron(expected), expected);
     }
 
