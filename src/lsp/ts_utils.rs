@@ -478,6 +478,30 @@ pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
     results
 }
 
+/// `node`'s named children of a given kind, in document order.
+///
+/// Reached through tree-sitter's indexed accessor rather than a [`TreeCursor`].
+/// A cursor visits *every* child — each comma, colon and paren between the
+/// ones being looked for — and costs several times as much per visit as the
+/// indexed accessor does, which only ever stops on the named ones. The indexed
+/// accessor is in turn linear in the index, so this is for nodes whose children
+/// are few: a struct value's, which are its fields and their punctuation.
+/// A container of unbounded width — an array's elements — keeps the cursor,
+/// where walking the punctuation costs less than re-descending per element.
+///
+/// [`TreeCursor`]: tree_sitter::TreeCursor
+fn named_children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
+    let mut results = Vec::new();
+    for index in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(index)
+            && child.kind() == kind
+        {
+            results.push(child);
+        }
+    }
+    results
+}
+
 /// Get the first child of a node with a specific kind
 pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
@@ -525,17 +549,18 @@ pub fn field_value<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     }
 
     // Field structure: identifier ":" value — so the value is the child just
-    // past the colon. Walked with a cursor rather than collected into a
-    // `Vec`: this is asked of every field of every struct in the document, and
-    // a vector of each field's children is a whole document's worth of
-    // throwaway allocations.
-    let mut cursor = node.walk();
-    let mut children = node.children(&mut cursor);
-    while let Some(child) = children.next() {
+    // past the colon. Reached through the indexed accessor rather than a
+    // `TreeCursor`, which costs several times as much per child visited (see
+    // [`named_children_by_kind`]); a field has three children, so the
+    // accessor's linear scan never has anything to scan.
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            break;
+        };
         if child.kind() == ":" {
             // A trailing colon has no value after it; fall through to the
             // fallback rather than reporting the colon itself.
-            if let Some(value) = children.next() {
+            if let Some(value) = node.child(index + 1) {
                 return Some(value);
             }
             break;
@@ -552,7 +577,7 @@ pub fn struct_fields<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
         return Vec::new();
     }
 
-    children_by_kind(node, "field")
+    named_children_by_kind(node, "field")
 }
 
 /// Get all value children of a struct (for tuple-style structs), excluding the struct name identifier
@@ -874,6 +899,38 @@ mod tests {
             let fields = struct_fields(&struct_node);
             assert_eq!(fields.len(), 2);
         }
+    }
+
+    /// A struct's fields come back in document order with the punctuation and
+    /// the comments between them left out. Pinned because the fields are
+    /// collected by walking tree-sitter's *named* children, and a comment is a
+    /// named child too.
+    #[test]
+    fn test_struct_fields_in_order_past_comments() {
+        let content = "User(\n    // who\n    id: 1, // the id\n    /* and */ name: \"a\",\n)";
+        let tree = parse(content).unwrap();
+        let value = find_main_value(&tree).unwrap();
+
+        let names: Vec<_> = struct_fields(&value)
+            .iter()
+            .map(|field| field_name(field, content).unwrap())
+            .collect();
+        assert_eq!(names, ["id", "name"]);
+    }
+
+    /// A field's value is whatever its colon is followed by, at every field of
+    /// the struct and not just the first.
+    #[test]
+    fn test_field_value_follows_the_colon() {
+        let content = "User(id: 1, name: \"a\", tags: [1, 2])";
+        let tree = parse(content).unwrap();
+        let value = find_main_value(&tree).unwrap();
+
+        let values: Vec<_> = struct_fields(&value)
+            .iter()
+            .map(|field| node_text(&field_value(field).unwrap(), content).unwrap())
+            .collect();
+        assert_eq!(values, ["1", "\"a\"", "[1, 2]"]);
     }
 
     #[test]

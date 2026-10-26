@@ -49,6 +49,15 @@ fn unqualify_std_type(type_name: &str) -> &str {
     // arguments keep theirs and are unqualified when they are visited in turn.
     let head = &type_name[..type_name.find('<').unwrap_or(type_name.len())];
 
+    // A name with no `:` in it carries no path to drop, which is almost every
+    // name there is. One scan for the colon settles those, where the character
+    // walk below costs a Unicode class lookup per character and the substring
+    // search after it builds a searcher — and a type name is normalized
+    // several times per value in a document.
+    if !head.contains(':') {
+        return type_name;
+    }
+
     // A composite type — a tuple, a reference, an array — has no single head to
     // unqualify, and `rfind` below would otherwise cut it in half.
     if !head

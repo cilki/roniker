@@ -46,34 +46,49 @@ pub fn strip_outer_generic(type_name: &str) -> String {
 
 /// Check if a type is a primitive type (not a custom enum/struct)
 pub fn is_primitive_type(type_name: &str) -> bool {
-    let clean = normalize_type(type_name);
+    is_primitive_normalized(&normalize_type(type_name))
+}
 
-    let primitives = [
-        "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
-        "usize", "f32", "f64", "char", "String", "&str", "str",
-    ];
-
-    primitives.contains(&clean.as_ref())
+/// [`is_primitive_type`] on an already-normalized name.
+///
+/// A `match` rather than a scan of a 19-element array: the compiler turns it
+/// into a switch on the name's length and a handful of comparisons, where the
+/// array compared the name against every entry in turn.
+fn is_primitive_normalized(clean: &str) -> bool {
+    matches!(
+        clean,
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "char"
+            | "String"
+            | "&str"
+            | "str"
+    )
 }
 
 /// Standard-library generic wrappers the analyzer never resolves as a
-/// user-defined type. Each entry includes the opening `<` so a name only counts
-/// when it is actually used as a generic (e.g. `Option<T>`, not a struct named
-/// `Options`).
+/// user-defined type. A name only counts when it is actually used as a generic,
+/// i.e. immediately followed by `<` (e.g. `Option<T>`, not a struct named
+/// `Options`), which is what [`is_std_generic_normalized`] checks for.
 const STD_GENERIC_WRAPPERS: [&str; 10] = [
-    "Option<",
-    "Vec<",
-    "HashMap<",
-    "BTreeMap<",
-    "HashSet<",
-    "BTreeSet<",
-    "Result<",
-    "Box<",
-    "Rc<",
-    "Arc<",
+    "Option", "Vec", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "Result", "Box", "Rc", "Arc",
 ];
 
-/// Check if a type is a standard library generic type (Option, Vec, HashMap, etc.)
+/// Whether an already-normalized type name is a standard library generic
+/// (Option, Vec, HashMap, etc.).
 ///
 /// A wrapper counts anywhere it appears, not only at the start, so composite
 /// types that merely embed one — e.g. the tuple `(u8, Vec<Config>)` — are
@@ -81,21 +96,39 @@ const STD_GENERIC_WRAPPERS: [&str; 10] = [
 /// the map/set wrappers were matched this way, so a tuple embedding a `Vec` or
 /// `Box` was misclassified as a custom type and drew a spurious "Unknown type"
 /// diagnostic while the same tuple embedding a `HashMap` did not.
-pub fn is_std_generic_type(type_name: &str) -> bool {
-    let clean = normalize_type(type_name);
-
-    STD_GENERIC_WRAPPERS
-        .iter()
-        .any(|wrapper| clean.contains(wrapper))
+///
+/// Driven by where the `<`s are rather than by the wrapper list: a wrapper can
+/// only appear immediately in front of one, so a name holding no `<` at all is
+/// settled by a single scan for it. Asking the question once per wrapper
+/// instead meant ten substring searches — each building its own searcher — over
+/// every type name the validator classified, and most of those are a bare
+/// `Config` with no `<` anywhere in them.
+fn is_std_generic_normalized(clean: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = clean[from..].find('<') {
+        let before = &clean[..from + offset];
+        if STD_GENERIC_WRAPPERS
+            .iter()
+            .any(|wrapper| before.ends_with(wrapper))
+        {
+            return true;
+        }
+        from += offset + 1;
+    }
+    false
 }
 
 /// Check if a type is a user-defined struct or enum — i.e. something the
 /// analyzer should resolve and validate against. This is exactly the types that
 /// are neither a primitive ([`is_primitive_type`]) nor a standard-library
-/// generic wrapper ([`is_std_generic_type`]). Both of those normalize
-/// whitespace internally, so `type_name` may be passed raw or pre-normalized.
+/// generic wrapper ([`is_std_generic_normalized`]). The name is normalized
+/// here, so `type_name` may be passed raw or pre-normalized.
 pub fn is_custom_type(type_name: &str) -> bool {
-    !is_primitive_type(type_name) && !is_std_generic_type(type_name)
+    // Normalized once and asked of both classifiers rather than once each:
+    // every value in a document is classified, several times over, and the two
+    // were normalizing the same name twice to answer the one question.
+    let clean = normalize_type(type_name);
+    !is_primitive_normalized(&clean) && !is_std_generic_normalized(&clean)
 }
 
 /// Largest absolute edit distance we ever treat as a plausible typo. Real
@@ -252,6 +285,12 @@ mod tests {
         assert!(is_custom_type("crate::config::Server"));
     }
 
+    /// [`is_std_generic_normalized`] takes a name the way
+    /// [`is_custom_type`] hands it over, so the tests normalize first.
+    fn is_std_generic_type(type_name: &str) -> bool {
+        is_std_generic_normalized(&normalize_type(type_name))
+    }
+
     #[test]
     fn test_is_std_generic_type() {
         // Plain wrappers, including whitespace variants.
@@ -270,6 +309,47 @@ mod tests {
         // trailing `<` is required.
         assert!(!is_std_generic_type("Options"));
         assert!(!is_std_generic_type("Post"));
+    }
+
+    /// A wrapper only counts immediately in front of a `<`, and every `<` in
+    /// the name is a candidate rather than just the first — a wrapper nested
+    /// inside a user-defined generic, or sitting after one, counts the same.
+    #[test]
+    fn test_is_std_generic_type_scans_every_generic() {
+        assert!(is_std_generic_type("MyWrapper<Vec<u8>>"));
+        assert!(is_std_generic_type("(MyGeneric<u8>,Arc<Config>)"));
+
+        // A wrapper's name with no `<` behind it is just a name.
+        assert!(!is_std_generic_type("Vec"));
+        assert!(!is_std_generic_type("Option"));
+        // ... and a generic that is nobody's wrapper stays custom.
+        assert!(!is_std_generic_type("MyGeneric<u8>"));
+        assert!(is_custom_type("MyGeneric<u8>"));
+    }
+
+    /// A name that merely *ends* with a wrapper's name counts as that wrapper:
+    /// `MyVec<T>` reads as a `Vec`. That is what matching the substring `Vec<`
+    /// has always done, and either way such a type resolves to nothing, so the
+    /// behaviour is pinned here rather than quietly changed.
+    #[test]
+    fn test_is_std_generic_type_matches_a_name_ending_in_a_wrapper() {
+        assert!(is_std_generic_type("MyVec<u8>"));
+        assert!(!is_custom_type("MyVec<u8>"));
+    }
+
+    /// A composite type keeps its qualified names — the character walk in
+    /// `unqualify_std_type` is what decides that, and the cheaper check for a
+    /// colon that now runs in front of it must not reach a different answer.
+    #[test]
+    fn test_normalize_type_keeps_a_composite_holding_a_qualified_name() {
+        assert_eq!(
+            normalize_type("(u8, std::string::String)"),
+            "(u8,std::string::String)"
+        );
+        assert_eq!(
+            normalize_type("&std::string::String"),
+            "&std::string::String"
+        );
     }
 
     #[test]
