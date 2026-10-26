@@ -1,5 +1,7 @@
 use super::tree_sitter_parser;
-use super::type_utils::{extract_inner_type, normalize_type, short_name, strip_outer_generic};
+use super::type_utils::{
+    extract_inner_type, normalize_type, short_name, strip_outer_generic, tuple_element_types,
+};
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -488,7 +490,59 @@ fn generate_value_completions_by_type(
             insert_text: Some("false".to_string()),
             ..Default::default()
         });
-    } else if ["Vec<", "[", "HashSet<", "BTreeSet<"]
+    } else if clean_type == "char" {
+        completions.push(CompletionItem {
+            label: "''".to_string(),
+            kind: Some(CompletionItemKind::VALUE),
+            detail: Some("Character value".to_string()),
+            insert_text: Some("'$0'".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        });
+    } else if clean_type.starts_with(['(', '[']) {
+        // A tuple and a fixed-size array are both written as a parenthesized
+        // list of exactly as many values as the type declares — brackets
+        // belong to the sequence types, and `ron` refuses them here, so the
+        // `[]`/`[...]` these fields used to be offered could not be used.
+        let arity = tuple_element_types(&clean_type).map(|elements| elements.len());
+        completions.push(match arity {
+            // The unit type `()` takes exactly one value, and it is its own
+            // spelling.
+            Some(0) => CompletionItem {
+                label: "()".to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some("Unit value".to_string()),
+                insert_text: Some("()".to_string()),
+                ..Default::default()
+            },
+            // One tab stop per position, so the value can be filled in
+            // left to right without counting the commas out by hand.
+            Some(count) => CompletionItem {
+                label: "(...)".to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(format!("{field_type} as a tuple of {count}")),
+                insert_text: Some(format!(
+                    "({})",
+                    (1..=count)
+                        .map(|stop| format!("${stop}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+            // An arity the type name doesn't spell out — a slice, or an array
+            // whose length is a const generic. Still a tuple in RON.
+            None => CompletionItem {
+                label: "(...)".to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(format!("{field_type} as a tuple")),
+                insert_text: Some("($0)".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+        });
+    } else if ["Vec<", "HashSet<", "BTreeSet<"]
         .iter()
         .any(|prefix| clean_type.starts_with(prefix))
     {
@@ -820,6 +874,67 @@ mod tests {
         ] {
             assert_eq!(labels(type_name), expected, "type: {type_name}");
         }
+    }
+
+    /// A tuple field and a fixed-size array field are both written as a
+    /// parenthesized tuple in RON — brackets belong to the sequence types, and
+    /// `ron` refuses them here. A tuple field used to yield no values at all
+    /// and fall through to the "every registered type" fallback, and an array
+    /// field was offered the `[]`/`[...]` that cannot be used.
+    #[test]
+    fn test_value_completion_for_tuples_arrays_and_chars() {
+        let mut analyzer = crate::rust_analyzer::RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(Vec::new()),
+            ..Default::default()
+        });
+        let analyzer = std::sync::Arc::new(analyzer);
+
+        let completions = |type_name: &str| -> Vec<(String, String)> {
+            generate_value_completions_by_type(type_name, analyzer.clone())
+                .iter()
+                .map(|c| {
+                    (
+                        c.label.clone(),
+                        c.insert_text.clone().unwrap_or_else(|| c.label.clone()),
+                    )
+                })
+                .collect()
+        };
+
+        // One tab stop per position, so the value can be filled in left to
+        // right without counting the commas out by hand.
+        assert_eq!(
+            completions("(String, u16)"),
+            vec![("(...)".to_string(), "($1, $2)".to_string())]
+        );
+        assert_eq!(
+            completions("[u32; 3]"),
+            vec![("(...)".to_string(), "($1, $2, $3)".to_string())]
+        );
+        // The unit type takes the one value it has.
+        assert_eq!(
+            completions("()"),
+            vec![("()".to_string(), "()".to_string())]
+        );
+        // An arity the type name doesn't spell out is still a tuple.
+        assert_eq!(
+            completions("[u8; LEN]"),
+            vec![("(...)".to_string(), "($0)".to_string())]
+        );
+        assert_eq!(
+            completions("char"),
+            vec![("''".to_string(), "'$0'".to_string())]
+        );
+        // A sequence type keeps the bracket spelling.
+        assert_eq!(
+            completions("Vec<u8>")
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>(),
+            vec!["[]", "[...]"]
+        );
     }
 
     #[test]

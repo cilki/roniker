@@ -1,6 +1,6 @@
 use super::type_utils::{
     closest_name, extract_inner_type, is_custom_type, is_primitive_type, missing_required_fields,
-    normalize_type, short_name,
+    normalize_type, short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
@@ -509,6 +509,17 @@ fn validate_nested_value<'a>(
                 }
                 settled = true;
             }
+        } else if tuple_element_types(inner_type).is_some() && value_node.kind() == "array" {
+            // A `Vec` of tuples or fixed-size arrays. Those carry no fields,
+            // but they do carry a fixed shape, and checking it needs the parse
+            // tree for the reason given at the tuple branch below — so the
+            // elements are visited one at a time here too.
+            for element in super::ts_utils::array_elements(value_node) {
+                diagnostics.extend(validate_typed_value(
+                    &element, content, inner_type, analyzer,
+                ));
+            }
+            settled = true;
         }
     } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
         .iter()
@@ -549,6 +560,30 @@ fn validate_nested_value<'a>(
             } else {
                 diagnostics.push(unknown_type_diag(inner_type));
             }
+        } else if tuple_element_types(inner_type).is_some() {
+            // A wrapper around a tuple or a fixed-size array. Those carry a
+            // fixed shape rather than fields, and checking it needs the parse
+            // tree for the reason given at [`validate_tuple_value`], so the
+            // wrapped value is visited here too. `None` is the one spelling
+            // with nothing wrapped to look at, and the surface check reads it
+            // against the wrapper as before.
+            let wrapped = super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
+            if wrapped.kind() != "identifier" {
+                settled = true;
+                diagnostics.extend(validate_typed_value(
+                    &wrapped, content, inner_type, analyzer,
+                ));
+            }
+        }
+    } else if let Some(element_types) = tuple_element_types(&field_type_normalized) {
+        // A tuple or a fixed-size array, which RON writes the same way: a
+        // parenthesized list of a fixed number of values, each with a type of
+        // its own.
+        if let Some(found) =
+            validate_tuple_value(value_node, content, field_type, &element_types, analyzer)
+        {
+            settled = true;
+            diagnostics.extend(found);
         }
     } else if is_custom_type(&field_type_normalized) {
         // Plain custom struct/enum — validate the node directly
@@ -576,6 +611,75 @@ fn validate_nested_value<'a>(
         diagnostics,
         settled,
     }
+}
+
+/// Check a value written for a tuple or a fixed-size array against the types
+/// its positions declare — by arity, and then position by position, each
+/// against the type that position declares and at the position's own place in
+/// the document.
+///
+/// Driven by the parse tree rather than by the deserialized value, which is
+/// what makes the check possible at all: `ron` reads the sequence spelling
+/// `[1, 2]` into the very same `Value::Seq` as the tuple spelling `(1, 2)`, so
+/// a `Value` cannot tell a correct value from one `ron` refuses outright. The
+/// tree keeps the two apart.
+///
+/// `None` when the value is not written as a sequence of any kind — a bare
+/// literal, a struct, a `Some(..)`. There is nothing positional to check
+/// there, and the surface check in [`validate_typed_value`] already reports
+/// what such a value is in the same words it uses for every other type.
+fn validate_tuple_value(
+    value_node: &tree_sitter::Node,
+    content: &str,
+    field_type: &str,
+    element_types: &[&str],
+    analyzer: &Arc<RustAnalyzer>,
+) -> Option<Vec<Diagnostic>> {
+    let mismatch = |tail: String| {
+        vec![Diagnostic {
+            range: first_line_range(value_node, content),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Type mismatch: {tail}"),
+            code: code(codes::TYPE_MISMATCH),
+            ..Default::default()
+        }]
+    };
+
+    let elements = match value_node.kind() {
+        "tuple" => super::ts_utils::tuple_elements(value_node),
+        // `()` is the whole of how RON writes a tuple of no elements, and the
+        // only value the unit type takes.
+        "unit" => Vec::new(),
+        // Brackets are the sequence spelling, and `ron` refuses them for a
+        // tuple and for a fixed-size array alike — `(triple: [1, 2, 3])` for a
+        // `[u32; 3]` field fails to deserialize however many elements it
+        // holds, so the arity below is beside the point.
+        "array" => {
+            return Some(mismatch(format!(
+                "{field_type} is written as a tuple, not an array"
+            )));
+        }
+        _ => return None,
+    };
+
+    if elements.len() != element_types.len() {
+        return Some(mismatch(format!(
+            "expected {} element{} for {field_type}, got {}",
+            element_types.len(),
+            if element_types.len() == 1 { "" } else { "s" },
+            elements.len()
+        )));
+    }
+
+    Some(
+        elements
+            .iter()
+            .zip(element_types)
+            .flat_map(|(element, declared)| {
+                validate_typed_value(element, content, declared, analyzer)
+            })
+            .collect(),
+    )
 }
 
 /// The "unknown variant" diagnostic for a name the enum `type_info` does not
@@ -935,9 +1039,13 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             } else if clean_type.starts_with("Result<") {
                 // Result variants like Ok(...) and Err(...) are serialized as tuples/arrays
                 return None;
-            } else if clean_type.starts_with("[") {
-                // Array type
-                return None; // Arrays are similar to Vec, accept them
+            } else if clean_type.starts_with(['[', '(', '&']) {
+                // An array, a slice or a tuple. Where the type fixes the arity
+                // — `[T; N]` and `(A, B)` — that is checked from the parse
+                // tree in [`validate_tuple_value`], which can tell RON's
+                // tuple spelling from its array spelling where a `Value`
+                // cannot: both arrive here as the same `Seq`.
+                return None;
             } else {
                 return Some(format!("expected {}, got array", display_type));
             }
@@ -1695,6 +1803,157 @@ mod tests {
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// RON writes a Rust tuple and a fixed-size array alike as a parenthesized
+    /// tuple, and neither names a type the analyzer could have registered.
+    /// Both used to be classified as user-defined types, so a field declared
+    /// as one was resolved against the registered types, failed, and came back
+    /// `unknown-type` — whatever value was written for it, which made every
+    /// such field unusable on an otherwise correct file.
+    #[test]
+    fn test_tuple_and_array_fields_accept_the_values_ron_reads() {
+        for (type_name, literal) in [
+            ("(String, u16)", r#"("a", 2)"#),
+            ("[u32; 3]", "(1, 2, 3)"),
+            // The unit type takes the one value it has.
+            ("()", "()"),
+            // A composite is seen through to the types its positions declare,
+            // wrappers and all.
+            ("(Vec<u8>, HashMap<String, u8>)", r#"([1], {"a": 2})"#),
+            // ...and a wrapper around one is seen through to the composite.
+            ("Vec<(String, u16)>", r#"[("a", 1), ("b", 2)]"#),
+            ("Option<(String, u16)>", r#"Some(("a", 1))"#),
+            ("Option<(String, u16)>", "None"),
+            ("Box<[u32; 2]>", "(1, 2)"),
+            // A sequence type still takes the bracket spelling.
+            ("Vec<u8>", "[1, 2]"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// What a tuple or a fixed-size array field is checked *for* instead, now
+    /// that it is no longer reported as an unknown type. Every one of these is
+    /// a document `ron` refuses to deserialize, so letting it through means the
+    /// config looks clean in the editor and then fails to load.
+    #[test]
+    fn test_tuple_and_array_field_mismatches_are_reported() {
+        for (type_name, literal, expected) in [
+            // Brackets are the sequence spelling, and `ron` refuses them for
+            // a tuple and for a fixed-size array alike, however many elements
+            // they hold — which is the one thing `ron::Value` cannot see, both
+            // spellings reaching it as the same `Seq`.
+            ("[u32; 3]", "[1, 2, 3]", "written as a tuple, not an array"),
+            (
+                "(String, u16)",
+                r#"["a", 2]"#,
+                "written as a tuple, not an array",
+            ),
+            // Arity is the type's to fix, not the value's.
+            ("[u32; 3]", "(1, 2)", "expected 3 elements"),
+            ("(String, u16)", r#"("a", 2, 3)"#, "expected 2 elements"),
+            ("()", "(1, 2)", "expected 0 elements"),
+            // Each position is checked against the type it declares.
+            ("(String, u16)", "(1, 2)", "expected String, got number"),
+            ("(String, u16)", r#"("a", 99999)"#, "out of range for u16"),
+            ("[u32; 2]", r#"(1, "x")"#, "expected u32, got string"),
+            // A value that is no kind of sequence is reported as what it is.
+            ("(String, u16)", "5", "got number"),
+            ("(String, u16)", r#""x""#, "got string"),
+            ("(String, u16)", r#"(host: "h")"#, "got map/struct"),
+            // A wrapper around a composite is seen through to it.
+            (
+                "Vec<(String, u16)>",
+                r#"[("a", 1, 2)]"#,
+                "expected 2 elements",
+            ),
+            (
+                "Vec<(String, u16)>",
+                r#"[["a", 1]]"#,
+                "written as a tuple, not an array",
+            ),
+            ("Option<[u32; 2]>", "Some((1, 2, 3))", "expected 2 elements"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|m| m.contains("Unknown type")),
+                "{literal} in {type_name} is a std composite, not an unknown type: {errors:?}"
+            );
+        }
+    }
+
+    /// A struct nested inside a tuple is reached through the positional walk
+    /// and validated like any other value, rather than being skipped along
+    /// with the tuple around it.
+    #[test]
+    fn test_struct_inside_a_tuple_is_validated() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Endpoint".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+        let type_info = single_field_type("(String, Endpoint)");
+
+        let errors = |literal: &str| -> Vec<String> {
+            validate_ron_with_analyzer(
+                &format!("Cfg(n: {literal})"),
+                None,
+                &type_info,
+                analyzer.clone(),
+            )
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect()
+        };
+
+        assert!(
+            errors(r#"("t", Endpoint(host: "h", port: 1))"#).is_empty(),
+            "a complete value is accepted: {:?}",
+            errors(r#"("t", Endpoint(host: "h", port: 1))"#)
+        );
+        assert!(
+            errors(r#"("t", Endpoint(host: "h"))"#)
+                .iter()
+                .any(|m| m.contains("port")),
+            "the nested struct's missing field is reported: {:?}",
+            errors(r#"("t", Endpoint(host: "h"))"#)
+        );
+        assert!(
+            errors(r#"("t", Endpoint(host: "h", port: 1, bogus: 2))"#)
+                .iter()
+                .any(|m| m.contains("bogus")),
+            "the nested struct's unknown field is reported"
+        );
+        assert!(
+            errors(r#"("t", Ghost(host: "h", port: 1))"#)
+                .iter()
+                .any(|m| m.contains("Ghost")),
+            "a value naming a type nothing registered is still reported: {:?}",
+            errors(r#"("t", Ghost(host: "h", port: 1))"#)
+        );
     }
 
     /// An integer literal the field's type cannot hold makes `ron` refuse the

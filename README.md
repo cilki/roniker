@@ -200,6 +200,11 @@ Opening a RON file matched by the pattern above gets you:
     ServerMode`), or data given to a unit variant. Those last two matter if you
     filter by code: a message reading *unknown type* or *unknown variant* is
     still tagged `type-mismatch`, not `unknown-type` or `unknown-variant`.
+    Lastly it is the three ways a tuple or fixed-size array field can go wrong,
+    for which see [Tuples and arrays](#tuples-and-arrays) below: the bracket
+    spelling (`[u32; 3] is written as a tuple, not an array`), the wrong number
+    of elements (`expected 3 elements for [u32; 3], got 2`), and an element
+    that doesn't fit the type its position declares, reported on that element.
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file.
     This is about the *declaration*; a value naming a type nobody registered is
@@ -229,11 +234,30 @@ published as diagnostics too and carry none, so their `Information` severity is
 all that tells them apart.
 
 Where a mismatch inside a `Vec` is reported depends on the element type. A
-`Vec` of structs or enums is walked element by element, so each bad element is
-marked where it is written; a `Vec` of primitives is checked as a whole, and the
-one message lands on the array (`in Vec: expected u16, got string`). Either way
-a non-array written where a `Vec` belongs is reported as the mismatch it is
-(`expected Vec<String>, got number`).
+`Vec` of structs, enums or tuples is walked element by element, so each bad
+element is marked where it is written; a `Vec` of primitives is checked as a
+whole, and the one message lands on the array (`in Vec: expected u16, got
+string`). Either way a non-array written where a `Vec` belongs is reported as
+the mismatch it is (`expected Vec<String>, got number`).
+
+### Tuples and arrays
+
+RON writes a Rust tuple and a fixed-size array **both** as a parenthesized
+tuple. Brackets belong to the types whose length the value decides — `Vec`,
+slices, `HashSet`, `BTreeSet` — and `ron` refuses them for the other two, so a
+`(String, u16)` field is written `("a", 2)` and a `[u32; 3]` field is written
+`(1, 2, 3)`, not `[1, 2, 3]`.
+
+The server follows `ron` here. A field declared as either gets its arity and
+each of its positions checked against the type that position declares, and a
+struct or enum sitting in one of those positions is validated like any other
+value. Completion offers the tuple spelling with one tab stop per position, and
+the *Add N required fields* quick-fix fills the positions in from their types
+(`pair: ("", 0)`, `triple: (0, 0, 0)`).
+
+A composite with no arity for the type name to fix — a slice `[T]`, or an array
+whose length is a const generic — is still written as a tuple, but nothing
+checks how many elements it has.
 
 ### Formatting
 
@@ -349,11 +373,12 @@ What gets offered depends on where in the value the cursor sits:
   and doc comment. Where an enum is expected the variants are offered instead,
   and inside a variant's own parentheses, that variant's fields.
 - After a field's colon: values derived from the type the field is declared as.
-  `true`/`false` for a `bool`, `""` for a `String`, `0` for any integer or
-  float, `[]` and `[...]` for a `Vec` or array, `{}` and `{...}` for a
-  `HashMap` or `BTreeMap`, `Some(...)` and `None` for an `Option`, the variants
-  of an enum, and for a struct a snippet of the whole value with every field
-  laid out.
+  `true`/`false` for a `bool`, `""` for a `String`, `''` for a `char`, `0` for
+  any integer or float, `[]` and `[...]` for a `Vec`, a slice or a set, `(...)`
+  for a tuple or a fixed-size array (see [Tuples and
+  arrays](#tuples-and-arrays)), `{}` and `{...}` for a `HashMap` or
+  `BTreeMap`, `Some(...)` and `None` for an `Option`, the variants of an enum,
+  and for a struct a snippet of the whole value with every field laid out.
 - Every registered type, as a fallback, when the field's declared type yields
   none of the above — a `PathBuf` field, say, or anything else the build script
   was not given the source for.

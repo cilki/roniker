@@ -793,8 +793,9 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     if clean == "bool" {
         return "false".to_string();
     }
-    // A set serializes as a sequence, the same as a `Vec`.
-    if ["Vec", "[", "HashSet", "BTreeSet"]
+    // A set serializes as a sequence, the same as a `Vec`. A fixed-size array
+    // does not, despite the brackets in its name: see the tuple branch below.
+    if ["Vec", "HashSet", "BTreeSet"]
         .iter()
         .any(|prefix| clean.starts_with(prefix))
     {
@@ -806,9 +807,28 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     if clean == "String" || clean == "&str" || clean == "str" {
         return "\"\"".to_string();
     }
+    if clean == "char" {
+        // A `char` is a quoted character, and the one thing it is not is
+        // `char()` — which is what the opaque fallback below used to insert.
+        return "'a'".to_string();
+    }
     if is_numeric_type(&clean) {
         // Numeric types default to zero
         return "0".to_string();
+    }
+    // RON writes a tuple and a fixed-size array alike as a parenthesized list
+    // of exactly as many values as the type declares, each filled in from the
+    // type of its own position. Neither has a follow-up diagnostic to finish
+    // the job from, so both have to be emitted complete — `(String,u16)()` is
+    // not RON at all, and the `[]` a `[u32; 3]` used to get is RON that `ron`
+    // then refuses to read.
+    if let Some(element_types) = super::type_utils::tuple_element_types(&clean) {
+        let next = depth.saturating_sub(1);
+        let elements: Vec<String> = element_types
+            .iter()
+            .map(|element| generate_default_value_depth(element, analyzer, next))
+            .collect();
+        return format!("({})", elements.join(", "));
     }
 
     // A custom type is spelled by its last path segment: a field declared
@@ -1141,6 +1161,70 @@ mod tests {
             "Node(Node(Node()))",
             "the recursion is cut off, not followed"
         );
+    }
+
+    /// A tuple field, a fixed-size array field and a `char` field all used to
+    /// be given a placeholder `ron` cannot read: a tuple got the type name as
+    /// a constructor (`(String,u16)()`, which is not RON at all), a `char` got
+    /// `char()`, and an array got the `[]` its brackets suggest — RON that
+    /// `ron` then refuses to deserialize, since a fixed-size array is written
+    /// as a tuple.
+    #[test]
+    fn test_generate_default_value_for_std_composites() {
+        let analyzer = RustAnalyzer::new();
+
+        assert_eq!(
+            generate_default_value("(String, u16)", &analyzer),
+            "(\"\", 0)"
+        );
+        assert_eq!(generate_default_value("[u32; 3]", &analyzer), "(0, 0, 0)");
+        assert_eq!(generate_default_value("()", &analyzer), "()");
+        assert_eq!(generate_default_value("char", &analyzer), "'a'");
+        assert_eq!(
+            generate_default_value("(bool, Vec<u8>, Option<u8>)", &analyzer),
+            "(false, [], None)"
+        );
+        // A sequence whose length the value decides keeps the brackets.
+        assert_eq!(generate_default_value("Vec<u8>", &analyzer), "[]");
+        assert_eq!(generate_default_value("HashSet<u8>", &analyzer), "[]");
+    }
+
+    /// The point of the placeholders above: the document the quick-fix leaves
+    /// behind has to be one the configured application can actually load.
+    #[test]
+    fn test_missing_field_action_inserts_a_deserializable_document() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Cfg {
+            pair: (String, u16),
+            triple: [u32; 3],
+            initial: char,
+            tags: Vec<String>,
+        }
+
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let type_info = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("pair", "(String, u16)"),
+                field("triple", "[u32; 3]"),
+                field("initial", "char"),
+                field("tags", "Vec<String>"),
+            ]),
+            ..Default::default()
+        };
+
+        let actions = missing_field_actions("Cfg()", &type_info, Arc::new(RustAnalyzer::new()));
+        assert!(!actions.is_empty(), "the fields should be offered");
+        for (title, document) in actions {
+            ron::from_str::<Cfg>(&document).unwrap_or_else(|e| {
+                panic!("{title:?} produced {document:?}, which ron rejects: {e}")
+            });
+        }
     }
 
     #[test]

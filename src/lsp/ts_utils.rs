@@ -618,6 +618,25 @@ pub fn array_elements<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
         .collect()
 }
 
+/// The element values of a `tuple` node — `("a", 2)`, which is how RON writes
+/// both a Rust tuple and a fixed-size array — with punctuation and comments
+/// left out. Empty for any other node kind.
+///
+/// A `MISSING` node is left out too: an unfinished tuple such as `("a",)`
+/// parses as its one element plus a `MISSING unit` standing in for what the
+/// trailing comma promised, and counting that as an element would make the
+/// tuple look one element longer than it is.
+pub fn tuple_elements<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    if node.kind() != "tuple" {
+        return Vec::new();
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !is_comment(child) && !child.is_missing())
+        .collect()
+}
+
 /// Find the main value node (the actual RON data, skipping annotation and comments)
 pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
     let root = tree.root_node();

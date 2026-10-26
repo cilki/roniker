@@ -118,17 +118,101 @@ fn is_std_generic_normalized(clean: &str) -> bool {
     false
 }
 
+/// Whether an already-normalized type name is a standard-library *composite*:
+/// a tuple `(A, B)`, an array or slice `[T; N]`/`[T]`, or a reference `&T`.
+///
+/// None of these is a name the analyzer could ever have registered, and none
+/// of them is spelled with a `<`, so [`is_std_generic_normalized`] does not
+/// recognise them. Without this they were classified as user-defined types and
+/// every field declared as one drew an `unknown-type` error, however correct
+/// the value written for it — unless the composite happened to embed a generic
+/// wrapper, which is the one spelling [`is_std_generic_normalized`] already
+/// caught.
+fn is_std_composite_normalized(clean: &str) -> bool {
+    clean.starts_with(['(', '[', '&'])
+}
+
 /// Check if a type is a user-defined struct or enum — i.e. something the
 /// analyzer should resolve and validate against. This is exactly the types that
-/// are neither a primitive ([`is_primitive_type`]) nor a standard-library
-/// generic wrapper ([`is_std_generic_normalized`]). The name is normalized
-/// here, so `type_name` may be passed raw or pre-normalized.
+/// are none of a primitive ([`is_primitive_type`]), a standard-library generic
+/// wrapper ([`is_std_generic_normalized`]) or a standard-library composite
+/// ([`is_std_composite_normalized`]). The name is normalized here, so
+/// `type_name` may be passed raw or pre-normalized.
 pub fn is_custom_type(type_name: &str) -> bool {
-    // Normalized once and asked of both classifiers rather than once each:
-    // every value in a document is classified, several times over, and the two
+    // Normalized once and asked of every classifier rather than once each:
+    // every value in a document is classified, several times over, and they
     // were normalizing the same name twice to answer the one question.
     let clean = normalize_type(type_name);
-    !is_primitive_normalized(&clean) && !is_std_generic_normalized(&clean)
+    !is_primitive_normalized(&clean)
+        && !is_std_generic_normalized(&clean)
+        && !is_std_composite_normalized(&clean)
+}
+
+/// Largest number of positions [`tuple_element_types`] will enumerate. An
+/// array longer than this is not a value anybody writes out by hand, and
+/// enumerating `[u8; 1048576]` position by position would cost more than the
+/// checking it enables is worth.
+const MAX_TUPLE_ARITY: usize = 256;
+
+/// The declared type of each element of the RON tuple `clean` is written as,
+/// when `clean` — an already-normalized type name — names something RON spells
+/// that way.
+///
+/// RON writes a Rust tuple and a fixed-size array alike as a parenthesized
+/// tuple: a `(String, u16)` field is written `("a", 2)` and a `[u32; 3]` field
+/// `(1, 2, 3)`. Brackets belong to the sequence types — `Vec`, slices, sets —
+/// whose length the value decides rather than the type, and `ron` refuses them
+/// for either of these.
+///
+/// `None` for anything else, which includes the composites with no fixed list
+/// of positions to return: a slice `[T]`, an array whose length is a const
+/// generic rather than a literal, and one longer than [`MAX_TUPLE_ARITY`].
+pub fn tuple_element_types(clean: &str) -> Option<Vec<&str>> {
+    if let Some(inner) = clean.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        // `()` is the unit type: a tuple of no elements at all.
+        if inner.is_empty() {
+            return Some(Vec::new());
+        }
+        // A one-element tuple keeps the trailing comma Rust needs to tell
+        // `(T,)` from a parenthesized `T`, which leaves an empty last part.
+        return Some(
+            split_top_level(inner)
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect(),
+        );
+    }
+
+    let inner = clean.strip_prefix('[').and_then(|r| r.strip_suffix(']'))?;
+    let (element, length) = inner.rsplit_once(';')?;
+    match length.parse::<usize>() {
+        Ok(length) if length <= MAX_TUPLE_ARITY => Some(vec![element; length]),
+        _ => None,
+    }
+}
+
+/// Split a comma-separated list of type names, leaving alone the commas nested
+/// inside a generic argument list, a tuple or an array — `(Vec<(u8, u8)>, u16)`
+/// has two elements, not four.
+fn split_top_level(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+
+    for (offset, character) in list.char_indices() {
+        match character {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&list[start..offset]);
+                start = offset + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+
+    parts
 }
 
 /// Largest absolute edit distance we ever treat as a plausible typo. Real
@@ -359,6 +443,61 @@ mod tests {
         assert!(!is_custom_type("Vec<Post>"));
         // A tuple embedding a std wrapper is not a resolvable custom type.
         assert!(!is_custom_type("(u8, Vec<Config>)"));
+    }
+
+    /// A tuple, an array, a slice and a reference are standard-library
+    /// composites: the analyzer never registers one, and none of them is
+    /// spelled with a `<` for [`is_std_generic_normalized`] to catch. They
+    /// used to be classified as user-defined types, which meant resolving them
+    /// against the registered types, failing, and reporting `unknown-type` on
+    /// every field declared as one — however correct the value written for it.
+    #[test]
+    fn test_is_custom_type_excludes_std_composites() {
+        assert!(!is_custom_type("(String, u16)"));
+        assert!(!is_custom_type("[u32; 3]"));
+        assert!(!is_custom_type("[u8]"));
+        assert!(!is_custom_type("&[u8]"));
+        assert!(!is_custom_type("()"));
+        // A name that merely *contains* one is still a type of its own.
+        assert!(is_custom_type("Pair"));
+    }
+
+    /// RON writes a Rust tuple and a fixed-size array alike as a parenthesized
+    /// tuple, so both reduce to the same thing here: a fixed list of
+    /// positions, each with a declared type. The names are already normalized,
+    /// which is how [`is_custom_type`] hands them over.
+    #[test]
+    fn test_tuple_element_types() {
+        assert_eq!(
+            tuple_element_types("(String,u16)"),
+            Some(vec!["String", "u16"])
+        );
+        assert_eq!(
+            tuple_element_types("[u32;3]"),
+            Some(vec!["u32", "u32", "u32"])
+        );
+        // The unit type is a tuple of no elements.
+        assert_eq!(tuple_element_types("()"), Some(Vec::new()));
+        // A one-element tuple keeps the comma Rust needs to tell `(T,)` from a
+        // parenthesized `T`, which must not count as a second position.
+        assert_eq!(tuple_element_types("(u8,)"), Some(vec!["u8"]));
+        // The commas inside a nested type belong to it, not to the tuple.
+        assert_eq!(
+            tuple_element_types("(Vec<(u8,u8)>,HashMap<String,u8>)"),
+            Some(vec!["Vec<(u8,u8)>", "HashMap<String,u8>"])
+        );
+
+        // Not written as a tuple at all.
+        assert_eq!(tuple_element_types("Vec<u8>"), None);
+        assert_eq!(tuple_element_types("u8"), None);
+        assert_eq!(tuple_element_types("Server"), None);
+        // A sequence whose length the value decides, not the type, has no
+        // fixed list of positions — nor has one the name doesn't spell out.
+        assert_eq!(tuple_element_types("[u8]"), None);
+        assert_eq!(tuple_element_types("[u8;LEN]"), None);
+        // Nor one too long to be worth enumerating.
+        assert_eq!(tuple_element_types("[u8;257]"), None);
+        assert_eq!(tuple_element_types("[u8;256]").map(|e| e.len()), Some(256));
     }
 
     #[test]
