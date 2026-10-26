@@ -233,6 +233,73 @@ pub(crate) fn is_std_generic(clean: &str) -> bool {
     false
 }
 
+/// Whether an already-normalized type name is a Rust primitive — one of the
+/// scalars, or a string, which the type checks match by its bare spelling too.
+///
+/// A `match` rather than a scan of an array: the compiler turns it into a
+/// switch on the name's length and a handful of comparisons, where the array
+/// compared the name against every entry in turn.
+pub(crate) fn is_primitive(clean: &str) -> bool {
+    matches!(
+        clean,
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "char"
+            | "String"
+            | "&str"
+            | "str"
+    )
+}
+
+/// Whether an already-normalized type name is a standard-library *composite*:
+/// a tuple `(A, B)`, an array or slice `[T; N]`/`[T]`, a reference `&T`, or the
+/// unit `()`.
+///
+/// None of these is a name the analyzer could ever have registered, and none of
+/// them is spelled with a `<`, so [`is_std_generic`] does not recognise them —
+/// unless the composite happens to embed a generic wrapper, which is the one
+/// spelling [`is_std_generic`] already caught.
+fn is_std_composite(clean: &str) -> bool {
+    clean.starts_with(['(', '[', '&'])
+}
+
+/// Whether an already-normalized type name denotes a user-defined struct or
+/// enum — i.e. something the analyzer should have registered and that a value
+/// can be resolved and validated against. That is exactly the names that are
+/// none of a primitive ([`is_primitive`]), a standard-library generic
+/// ([`is_std_generic`]), a standard-library composite ([`is_std_composite`]) or
+/// one of the standard-library types that take no generic arguments at all
+/// ([`std_type`]).
+///
+/// This is the whole of what distinguishes "the build script forgot a source
+/// file" from "the name was never the build script's to see", so the LSP's
+/// diagnostics and [`RustAnalyzer::validate_field_types`] answer it from here
+/// rather than each carrying its own notion of a standard-library name.
+///
+/// The name is normalized once by the caller and asked of every classifier
+/// rather than once each: every value in a document is classified, several
+/// times over, and normalizing the same name four times to answer the one
+/// question is work nobody reads.
+pub(crate) fn is_custom_type(clean: &str) -> bool {
+    !is_primitive(clean)
+        && !is_std_generic(clean)
+        && !is_std_composite(clean)
+        && std_type(clean).is_none()
+}
+
 /// Drop the module path in front of a standard-library type name, so that the
 /// `std::collections::HashMap<String, u32>` a crate that doesn't import the
 /// type writes is recognised as the map it is.
@@ -867,46 +934,32 @@ impl RustAnalyzer {
 
     /// Check if a field type is known, returning the unknown type name if not.
     fn check_field_type_known(&self, type_name: &str) -> Option<String> {
-        let clean = normalize_type_name(type_name).into_owned();
+        let clean = normalize_type_name(type_name);
 
-        // Primitive types are always known
-        let primitives = [
-            "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
-            "usize", "f32", "f64", "char", "String", "&str", "str", "()",
-        ];
-        if primitives.contains(&clean.as_str()) {
+        // A wrapper whose argument a document writes out is only as known as
+        // that argument, so the question is asked of the type inside. Ahead of
+        // the classification below, which would settle the wrapper itself as a
+        // standard-library generic and never look in.
+        let wrapped = ["Option<", "Vec<", "Box<", "Rc<", "Arc<"]
+            .iter()
+            .find_map(|w| clean.strip_prefix(w).and_then(|r| r.strip_suffix('>')));
+        if let Some(inner) = wrapped {
+            return self.check_field_type_known(inner);
+        }
+
+        // Anything the crate doesn't read as a user-defined type — a primitive,
+        // a standard-library generic we don't recurse into, a composite, or a
+        // `PathBuf`-like type with no generic arguments — is not defined in the
+        // workspace this analyzer reads, so its absence from the cache says
+        // nothing about the build script.
+        if !is_custom_type(&clean) {
             return None;
         }
 
-        // A standard-library type with no generic arguments — a `PathBuf`, a
-        // `SocketAddr` — is not defined in the workspace this analyzer reads,
-        // so its absence from the cache says nothing about the build script.
-        if std_type(&clean).is_some() {
-            return None;
+        match self.get_type_info(&clean) {
+            Some(_) => None,
+            None => Some(clean.into_owned()),
         }
-
-        // Check generic wrappers and recurse into inner type
-        let wrappers = ["Option<", "Vec<", "Box<", "Rc<", "Arc<"];
-        for wrapper in wrappers {
-            if clean.starts_with(wrapper) && clean.ends_with('>') {
-                let inner = &clean[wrapper.len()..clean.len() - 1];
-                return self.check_field_type_known(inner);
-            }
-        }
-
-        // Every other standard-library generic, which we don't recurse into
-        // for now.
-        if is_std_generic(&clean) {
-            return None;
-        }
-
-        // Check if it's a known custom type
-        if self.get_type_info(&clean).is_some() {
-            return None;
-        }
-
-        // Unknown type
-        Some(clean)
     }
 }
 
@@ -1095,6 +1148,79 @@ mod tests {
         });
 
         assert_eq!(analyzer.validate_field_types(), Vec::new());
+    }
+
+    /// Same again for the composites: a tuple, a fixed-size array, a slice and
+    /// a reference are none of them names the analyzer could have registered,
+    /// and the LSP has classified them as standard-library types since it
+    /// stopped reporting `unknown-type` on the values written for them. The
+    /// build script's own check was still reading each as a user-defined type
+    /// it had failed to see, so a crate with a `(String, u16)` field was told
+    /// it had forgotten a source file it never had.
+    #[test]
+    fn test_validate_field_types_accepts_std_composites() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(
+                [
+                    "(String, u16)",
+                    "[u32; 3]",
+                    "[u8]",
+                    "&[u8]",
+                    "()",
+                    "&u32",
+                    "Option<(String, u16)>",
+                    "Vec<[u32; 3]>",
+                ]
+                .iter()
+                .enumerate()
+                .map(|(i, type_name)| FieldInfo {
+                    name: format!("f{i}"),
+                    type_name: type_name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ),
+            ..Default::default()
+        });
+
+        assert_eq!(analyzer.validate_field_types(), Vec::new());
+    }
+
+    /// The one thing the check is for is still reported, through the wrappers
+    /// whose argument a document writes out.
+    #[test]
+    fn test_validate_field_types_reports_an_unregistered_type() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "server".to_string(),
+                    type_name: "Server".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "backups".to_string(),
+                    type_name: "Vec<Option<Backup>>".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+
+        let unknown = |field: &str, type_name: &str| {
+            (
+                "crate::Config".to_string(),
+                field.to_string(),
+                type_name.to_string(),
+            )
+        };
+        assert_eq!(
+            analyzer.validate_field_types(),
+            vec![unknown("server", "Server"), unknown("backups", "Backup")]
+        );
     }
 
     /// A field declared `std::option::Option<T>` — the spelling a crate that
