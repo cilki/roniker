@@ -44,39 +44,11 @@ pub fn strip_outer_generic(type_name: &str) -> String {
     }
 }
 
-/// Check if a type is a primitive type (not a custom enum/struct)
+/// Check if a type is a primitive type (not a custom enum/struct). A thin
+/// wrapper over [`crate::rust_analyzer::is_primitive`] that normalizes the name
+/// first, so callers holding a raw type name don't each have to.
 pub fn is_primitive_type(type_name: &str) -> bool {
-    is_primitive_normalized(&normalize_type(type_name))
-}
-
-/// [`is_primitive_type`] on an already-normalized name.
-///
-/// A `match` rather than a scan of a 19-element array: the compiler turns it
-/// into a switch on the name's length and a handful of comparisons, where the
-/// array compared the name against every entry in turn.
-fn is_primitive_normalized(clean: &str) -> bool {
-    matches!(
-        clean,
-        "bool"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "f32"
-            | "f64"
-            | "char"
-            | "String"
-            | "&str"
-            | "str"
-    )
+    crate::rust_analyzer::is_primitive(&normalize_type(type_name))
 }
 
 /// Standard-library wrappers a value is written straight through: the document
@@ -99,36 +71,13 @@ pub const TRANSPARENT_WRAPPERS: [&str; 8] = [
 /// a whole rather than element by element, so they are not in this list.
 pub const SEQUENCE_WRAPPERS: [&str; 4] = ["Vec<", "VecDeque<", "LinkedList<", "BinaryHeap<"];
 
-/// Whether an already-normalized type name is a standard-library *composite*:
-/// a tuple `(A, B)`, an array or slice `[T; N]`/`[T]`, or a reference `&T`.
-///
-/// None of these is a name the analyzer could ever have registered, and none
-/// of them is spelled with a `<`, so [`crate::rust_analyzer::is_std_generic`]
-/// does not recognise them. Without this they were classified as user-defined
-/// types and every field declared as one drew an `unknown-type` error, however
-/// correct the value written for it — unless the composite happened to embed a
-/// generic wrapper, which is the one spelling
-/// [`crate::rust_analyzer::is_std_generic`] already caught.
-fn is_std_composite_normalized(clean: &str) -> bool {
-    clean.starts_with(['(', '[', '&'])
-}
-
 /// Check if a type is a user-defined struct or enum — i.e. something the
-/// analyzer should resolve and validate against. This is exactly the types that
-/// are none of a primitive ([`is_primitive_type`]), a standard-library generic
-/// ([`crate::rust_analyzer::is_std_generic`]), a standard-library composite
-/// ([`is_std_composite_normalized`]) or one of the standard-library types that
-/// take no generic arguments at all ([`crate::rust_analyzer::std_type`]). The
-/// name is normalized here, so `type_name` may be passed raw or pre-normalized.
+/// analyzer should resolve and validate against. A thin wrapper over
+/// [`crate::rust_analyzer::is_custom_type`], which spells out what that
+/// amounts to, that normalizes the name first — so `type_name` may be passed
+/// raw or pre-normalized.
 pub fn is_custom_type(type_name: &str) -> bool {
-    // Normalized once and asked of every classifier rather than once each:
-    // every value in a document is classified, several times over, and they
-    // were normalizing the same name twice to answer the one question.
-    let clean = normalize_type(type_name);
-    !is_primitive_normalized(&clean)
-        && !crate::rust_analyzer::is_std_generic(&clean)
-        && !is_std_composite_normalized(&clean)
-        && crate::rust_analyzer::std_type(&clean).is_none()
+    crate::rust_analyzer::is_custom_type(&normalize_type(type_name))
 }
 
 /// The standard-library type `type_name` names, if it is one of those that take
@@ -508,10 +457,11 @@ mod tests {
 
     /// A tuple, an array, a slice and a reference are standard-library
     /// composites: the analyzer never registers one, and none of them is
-    /// spelled with a `<` for [`is_std_generic_normalized`] to catch. They
-    /// used to be classified as user-defined types, which meant resolving them
-    /// against the registered types, failing, and reporting `unknown-type` on
-    /// every field declared as one — however correct the value written for it.
+    /// spelled with a `<` for [`crate::rust_analyzer::is_std_generic`] to
+    /// catch. They used to be classified as user-defined types, which meant
+    /// resolving them against the registered types, failing, and reporting
+    /// `unknown-type` on every field declared as one — however correct the
+    /// value written for it.
     #[test]
     fn test_is_custom_type_excludes_std_composites() {
         assert!(!is_custom_type("(String, u16)"));
