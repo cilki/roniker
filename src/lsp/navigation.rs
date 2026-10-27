@@ -6,23 +6,19 @@ use crate::rust_analyzer::{RustAnalyzer, TypeInfo};
 /// Navigate through nested type contexts to find the innermost type.
 /// The first context is the document's root value, which the caller has
 /// already resolved into `start`; navigation begins from the second context.
-pub fn navigate_type_contexts(
-    analyzer: &RustAnalyzer,
-    start: Option<TypeInfo>,
+///
+/// Every answer is one of the analyzer's own registered types, borrowed from
+/// it rather than copied: a type carries every field's name, type and docs,
+/// and a request used to copy all of that once per nesting level it stepped
+/// through.
+pub fn navigate_type_contexts<'a>(
+    analyzer: &'a RustAnalyzer,
+    start: Option<&'a TypeInfo>,
     contexts: &[TypeContext],
-) -> Option<TypeInfo> {
-    let mut current_type_info = start;
-
-    for context in contexts.iter().skip(1) {
-        // Once a step fails there is nothing left to navigate from, and `take`
-        // has already left the answer as `None`.
-        let Some(info) = current_type_info.take() else {
-            break;
-        };
-        current_type_info = step_type_context(analyzer, &info, context);
-    }
-
-    current_type_info
+) -> Option<&'a TypeInfo> {
+    contexts.iter().skip(1).try_fold(start?, |info, context| {
+        step_type_context(analyzer, info, context)
+    })
 }
 
 /// Resolve one step of the nesting path: the type of the struct value that
@@ -31,11 +27,11 @@ pub fn navigate_type_contexts(
 /// Callers that already know the enclosing struct's type — a walk down the
 /// document, say — can step with this instead of navigating the whole path from
 /// the root again.
-pub fn step_type_context(
-    analyzer: &RustAnalyzer,
+pub fn step_type_context<'a>(
+    analyzer: &'a RustAnalyzer,
     info: &TypeInfo,
     context: &TypeContext,
-) -> Option<TypeInfo> {
+) -> Option<&'a TypeInfo> {
     match &context.type_name {
         Some(type_name) => step_by_type_name(analyzer, info, type_name),
         // The value omitted its struct name, so there is no name to look the
@@ -48,11 +44,11 @@ pub fn step_type_context(
 }
 
 /// Resolve the type of a named struct value nested in `info`.
-fn step_by_type_name(
-    analyzer: &RustAnalyzer,
+fn step_by_type_name<'a>(
+    analyzer: &'a RustAnalyzer,
     info: &TypeInfo,
     context_name: &str,
-) -> Option<TypeInfo> {
+) -> Option<&'a TypeInfo> {
     // Try to find the context type as a field's type.
     // Use exact match on the last component of the type name to avoid
     // substring matches (e.g., don't match "Post" with "PostType").
@@ -64,12 +60,12 @@ fn step_by_type_name(
             field_type_base == context_name
         })
     {
-        return analyzer.get_type_info(&field.type_name).cloned();
+        return analyzer.get_type_info(&field.type_name);
     }
 
     // Try as direct type lookup
     if let Some(direct_lookup) = analyzer.get_type_info(context_name) {
-        return Some(direct_lookup.clone());
+        return Some(direct_lookup);
     }
 
     // The context name might be a variant name.
@@ -78,9 +74,7 @@ fn step_by_type_name(
         && variant.fields.len() == 1
     {
         // For tuple variants with one field, navigate to that field's type
-        return analyzer
-            .get_type_info(&variant.fields[0].type_name)
-            .cloned();
+        return analyzer.get_type_info(&variant.fields[0].type_name);
     }
 
     // If not found as a variant of the current type, try to find it in field types
@@ -89,7 +83,7 @@ fn step_by_type_name(
             if let Some(field_type_info) = analyzer.get_type_info(&field.type_name)
                 && field_type_info.find_variant(context_name).is_some()
             {
-                return Some(field_type_info.clone());
+                return Some(field_type_info);
             }
         }
     }
@@ -101,14 +95,13 @@ fn step_by_type_name(
 /// of. A single generic layer is stripped so that `Option<Server>` and
 /// `Vec<Server>` resolve to `Server`, matching how diagnostics recurse into
 /// field values.
-fn step_by_field_name(
-    analyzer: &RustAnalyzer,
+fn step_by_field_name<'a>(
+    analyzer: &'a RustAnalyzer,
     info: &TypeInfo,
     field_name: &str,
-) -> Option<TypeInfo> {
+) -> Option<&'a TypeInfo> {
     let field = info.find_field_serialized(field_name)?;
     analyzer
         .get_type_info(&field.type_name)
         .or_else(|| analyzer.get_type_info(&strip_outer_generic(&field.type_name)))
-        .cloned()
 }

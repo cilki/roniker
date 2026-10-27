@@ -260,25 +260,19 @@ impl LanguageServer for Backend {
             .to_string();
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let (content, tree) = {
-            let documents = self.documents.read().await;
-            match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.tree.clone()),
-                None => return Ok(None),
-            }
+        let documents = self.documents.read().await;
+        let Some(doc) = documents.get(&uri) else {
+            return Ok(None);
         };
+        let (content, tree) = (&doc.content, doc.tree.as_ref());
 
         // Get the word at cursor position - early return if none
-        let word = match get_word_at_position(&content, position) {
-            Some(w) => w,
-            None => return Ok(None),
+        let Some(word) = get_word_at_position(content, position) else {
+            return Ok(None);
         };
 
-        let owner = self.resolve_owner_type_at(&content, tree.as_ref(), position);
-        let Some(symbol) =
-            self.resolve_symbol(owner.as_ref(), tree.as_ref(), &content, position, &word)
-        else {
+        let owner = self.resolve_owner_type_at(content, tree, position);
+        let Some(symbol) = self.resolve_symbol(owner, tree, content, position, &word) else {
             return Ok(None);
         };
 
@@ -300,25 +294,19 @@ impl LanguageServer for Backend {
             .to_string();
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let (content, tree) = {
-            let documents = self.documents.read().await;
-            match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.tree.clone()),
-                None => return Ok(None),
-            }
+        let documents = self.documents.read().await;
+        let Some(doc) = documents.get(&uri) else {
+            return Ok(None);
         };
+        let (content, tree) = (&doc.content, doc.tree.as_ref());
 
         // Get the word at cursor position
-        let word = match get_word_at_position(&content, position) {
-            Some(w) => w,
-            None => return Ok(None),
+        let Some(word) = get_word_at_position(content, position) else {
+            return Ok(None);
         };
 
-        let owner = self.resolve_owner_type_at(&content, tree.as_ref(), position);
-        let Some(symbol) =
-            self.resolve_symbol(owner.as_ref(), tree.as_ref(), &content, position, &word)
-        else {
+        let owner = self.resolve_owner_type_at(content, tree, position);
+        let Some(symbol) = self.resolve_symbol(owner, tree, content, position, &word) else {
             return Ok(None);
         };
 
@@ -346,63 +334,51 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
 
-        // Get document content
-        let (content, tree) = {
-            let documents = self.documents.read().await;
-            match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.tree.clone()),
-                None => return Ok(None),
-            }
+        let documents = self.documents.read().await;
+        let Some(doc) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = doc.tree.as_ref() else {
+            return Ok(None);
         };
 
-        let current_type_info = self.resolve_owner_type_at(&content, tree.as_ref(), position);
-
-        if let (Some(type_info), Some(tree)) = (current_type_info, tree.as_ref()) {
-            let completions = completion::generate_completions_for_type(
-                tree,
-                &content,
-                position,
-                &type_info,
-                self.rust_analyzer.clone(),
-            );
-            return Ok(Some(CompletionResponse::Array(completions)));
-        }
-
-        Ok(None)
+        let Some(type_info) = self.resolve_owner_type_at(&doc.content, Some(tree), position) else {
+            return Ok(None);
+        };
+        let completions = completion::generate_completions_for_type(
+            tree,
+            &doc.content,
+            position,
+            type_info,
+            self.rust_analyzer.clone(),
+        );
+        Ok(Some(CompletionResponse::Array(completions)))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let url = params.text_document.uri;
         let uri = url.to_string();
 
-        // Get document content
-        let (content, tree) = {
-            let documents = self.documents.read().await;
-            match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.tree.clone()),
-                None => return Ok(None),
-            }
+        let documents = self.documents.read().await;
+        let Some(doc) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = doc.tree.as_ref() else {
+            return Ok(None);
+        };
+        let Some(type_info) = self.resolve_root_type_info(&doc.content, Some(tree)) else {
+            return Ok(None);
         };
 
-        if let Some(type_info) = self.resolve_root_type_info(&content, tree.as_ref()) {
-            let actions = match tree.as_ref() {
-                Some(tree) => code_actions::generate_code_actions(
-                    tree,
-                    &content,
-                    &type_info,
-                    &url,
-                    self.rust_analyzer.clone(),
-                    &params.context.diagnostics,
-                ),
-                None => Vec::new(),
-            };
-
-            if !actions.is_empty() {
-                return Ok(Some(actions));
-            }
-        }
-
-        Ok(None)
+        let actions = code_actions::generate_code_actions(
+            tree,
+            &doc.content,
+            type_info,
+            &url,
+            self.rust_analyzer.clone(),
+            &params.context.diagnostics,
+        );
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
@@ -555,44 +531,41 @@ impl LanguageServer for Backend {
             )));
         }
 
-        let (content, tree) = {
-            let documents = self.documents.read().await;
-            match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.tree.clone()),
-                None => return Ok(None),
-            }
-        };
-        let Some(tree) = tree else {
+        let documents = self.documents.read().await;
+        let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(name_node) = field_name_node_at(&tree, &content, position) else {
+        let Some(tree) = doc.tree.as_ref() else {
             return Ok(None);
         };
-        let Some(field_name) = ts_utils::node_text(&name_node, &content).map(str::to_string)
-        else {
+        let content = &doc.content;
+        let Some(name_node) = field_name_node_at(tree, content, position) else {
+            return Ok(None);
+        };
+        let Some(field_name) = ts_utils::node_text(&name_node, content) else {
             return Ok(None);
         };
 
         // Resolve the type that owns the field being renamed, so occurrences of
         // the same name under *other* types are left alone
-        let target_type = self.resolve_owner_type_at(&content, Some(&tree), position);
+        let target_type = self.resolve_owner_type_at(content, Some(tree), position);
 
         // Collect the exact name-node ranges of matching fields. Every
         // occurrence is one byte-offset-to-position conversion, and a document
         // can hold as many occurrences as it is long, so the long rows are
         // indexed once instead of being scanned again for every edit.
-        let lines = ts_utils::LineIndex::new(&content);
+        let lines = ts_utils::LineIndex::new(content);
         let mut changes = Vec::new();
-        for (node, owner) in self.fields_named(&tree, &content, &field_name) {
+        for (node, owner) in self.fields_named(tree, content, field_name) {
             // When either side can't be resolved, fall back to matching by name
-            if let (Some(target), Some(owner)) = (&target_type, &owner)
+            if let (Some(target), Some(owner)) = (target_type, owner)
                 && target.name != owner.name
             {
                 continue;
             }
 
             changes.push(TextEdit {
-                range: lines.node_range(&node, &content),
+                range: lines.node_range(&node, content),
                 new_text: new_name.clone(),
             });
         }
@@ -742,15 +715,19 @@ impl Backend {
 
     /// Resolve the root TypeInfo for a document, either from the configured root type
     /// or by inferring it from the struct name at the top of the RON content.
+    ///
+    /// Either way the answer is one of the analyzer's registered types, so it
+    /// is borrowed from the analyzer — as is everything resolved from it below
+    /// — rather than copied, fields, docs and all, once per request.
     fn resolve_root_type_info(
         &self,
         content: &str,
         tree: Option<&tree_sitter::Tree>,
-    ) -> Option<rust_analyzer::TypeInfo> {
-        self.rust_analyzer.root_type_info().cloned().or_else(|| {
+    ) -> Option<&rust_analyzer::TypeInfo> {
+        self.rust_analyzer.root_type_info().or_else(|| {
             let main_value = ts_utils::find_main_value(tree?)?;
             let name = ts_utils::struct_name(&main_value, content)?;
-            self.rust_analyzer.get_type_info(name).cloned()
+            self.rust_analyzer.get_type_info(name)
         })
     }
 
@@ -821,7 +798,7 @@ impl Backend {
         content: &str,
         tree: Option<&tree_sitter::Tree>,
         position: Position,
-    ) -> Option<rust_analyzer::TypeInfo> {
+    ) -> Option<&rust_analyzer::TypeInfo> {
         let root = self.resolve_root_type_info(content, tree)?;
         let contexts = tree
             .map(|t| tree_sitter_parser::find_type_context_at_position(t, content, position))
@@ -840,18 +817,18 @@ impl Backend {
     /// the document costs time proportional to its size *squared*. The type of
     /// a struct value follows from the type of the value it sits in, so walking
     /// the document downwards instead resolves each of them exactly once.
-    fn fields_named<'a>(
-        &self,
-        tree: &'a tree_sitter::Tree,
+    fn fields_named<'a, 't>(
+        &'a self,
+        tree: &'t tree_sitter::Tree,
         content: &str,
         field_name: &str,
-    ) -> Vec<(tree_sitter::Node<'a>, Option<rust_analyzer::TypeInfo>)> {
+    ) -> Vec<(tree_sitter::Node<'t>, Option<&'a rust_analyzer::TypeInfo>)> {
         let root = self.resolve_root_type_info(content, Some(tree));
         // The type owning each struct value's fields, by node id, filled in as
         // the walk descends. Nodes carry the id of the struct value enclosing
         // them rather than the type itself, which keeps what the walk passes
         // around to one `usize`.
-        let mut owners: HashMap<usize, Option<rust_analyzer::TypeInfo>> = HashMap::new();
+        let mut owners: HashMap<usize, Option<&rust_analyzer::TypeInfo>> = HashMap::new();
         let mut found = Vec::new();
         // Children are pushed in reverse so that they pop in document order.
         // Each carries the field its value belongs to, for the same reason it
@@ -861,20 +838,17 @@ impl Backend {
 
         while let Some((node, enclosing, owning_field)) = stack.pop() {
             let enclosing = if node.kind() == "struct" {
-                let owner = match enclosing
-                    .and_then(|id| owners.get(&id))
-                    .and_then(Option::as_ref)
-                {
+                let owner = match enclosing.map(|id| owners[&id]) {
                     // One step down from the value this one sits in.
-                    Some(outer) => navigation::step_type_context(
+                    Some(Some(outer)) => navigation::step_type_context(
                         &self.rust_analyzer,
                         outer,
                         &tree_sitter_parser::struct_type_context(&node, content, owning_field),
                     ),
                     // Nothing encloses it, so it is the document's root value.
-                    None if enclosing.is_none() => root.clone(),
+                    None => root,
                     // The value it sits in didn't resolve, so neither can it.
-                    None => None,
+                    Some(None) => None,
                 };
                 owners.insert(node.id(), owner);
                 Some(node.id())
@@ -886,11 +860,7 @@ impl Backend {
                 && let Some(name) = node.child(0)
                 && ts_utils::node_text(&name, content) == Some(field_name)
             {
-                let owner = enclosing
-                    .and_then(|id| owners.get(&id))
-                    .and_then(Option::as_ref)
-                    .cloned();
-                found.push((name, owner));
+                found.push((name, enclosing.and_then(|id| owners[&id])));
             }
 
             let child_field = ts_utils::owning_field_for_children(&node, content, owning_field);
@@ -977,17 +947,14 @@ impl Backend {
             }
         };
 
-        let type_info = self.resolve_root_type_info(content, doc.tree.as_ref());
-
-        let diagnostics = if let Some(type_info) = type_info {
-            diagnostics::validate_ron_with_analyzer(
+        let diagnostics = match self.resolve_root_type_info(content, doc.tree.as_ref()) {
+            Some(type_info) => diagnostics::validate_ron_with_analyzer(
                 content,
                 doc.tree.as_ref(),
-                &type_info,
+                type_info,
                 self.rust_analyzer.clone(),
-            )
-        } else {
-            vec![]
+            ),
+            None => vec![],
         };
 
         let diagnostics: Vec<_> = if self.info_diagnostics {
