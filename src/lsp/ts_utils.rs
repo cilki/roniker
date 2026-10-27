@@ -1,5 +1,6 @@
 /// Tree-sitter utilities for RON LSP
 /// This module provides high-level helpers for working with tree-sitter AST nodes
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use tower_lsp::lsp_types::{Position, Range};
@@ -21,13 +22,147 @@ impl RonParser {
 
     /// Parse RON content and return the tree
     pub fn parse(&mut self, content: &str) -> Option<Tree> {
-        self.parser.parse(content, None)
+        self.parse_with(content, None).0
     }
 
-    /// Re-parse content reusing a previous (edited) tree for incremental parsing
-    pub fn parse_with(&mut self, content: &str, old_tree: Option<&Tree>) -> Option<Tree> {
-        self.parser.parse(content, old_tree)
+    /// Re-parse content reusing a previous (edited) tree for incremental
+    /// parsing.
+    ///
+    /// Alongside the tree comes whether it may be handed back here as
+    /// `old_tree` after the next edit. It may not when `content` holds a raw
+    /// string: tree-sitter was then shown [masked](mask_raw_strings) text, and
+    /// an edit can change the masking of bytes well outside the edited range
+    /// (opening a `"` earlier on turns a later raw string into string
+    /// contents), which an incremental re-parse would never look at again.
+    /// For the same reason `old_tree` is ignored when `content` holds one.
+    pub fn parse_with(&mut self, content: &str, old_tree: Option<&Tree>) -> (Option<Tree>, bool) {
+        match mask_raw_strings(content) {
+            Cow::Borrowed(text) => (self.parser.parse(text, old_tree), true),
+            Cow::Owned(text) => (self.parser.parse(&text, None), false),
+        }
     }
+}
+
+/// `content` with every raw string (`r"..."`, `r#"..."#`, ...) rewritten as an
+/// ordinary quoted string of exactly the same length, for tree-sitter to parse
+/// in its place.
+///
+/// The RON grammar lexes a raw string as `r`, any `#`s, `"`, as much as it can
+/// of the rest of the line, and a last `"`. That is the longest match, not the
+/// first closing delimiter, so `host: r"h", user: "u"` reads as one field whose
+/// value runs to the last quote on the line — `user` vanishes from the tree and
+/// is reported missing — and a raw string spanning lines does not lex at all.
+///
+/// Masking keeps every byte offset, row and column where it was, so the nodes
+/// tree-sitter returns still line up with `content`, and their text is still
+/// read from `content`: only the tree's shape comes from the masked text. Only
+/// ASCII bytes are rewritten, so the result stays valid UTF-8. The opening
+/// `r`/`#`s/`"` become `"` and filler, the contents keep everything but the
+/// `"`s and `\`s that would end or escape a quoted string, and the closing
+/// `"`/`#`s become filler and `"`.
+///
+/// Comments, strings and chars are skipped the way RON lexes them, so an `r"`
+/// inside one is left alone. Borrowed when there is nothing to mask, which is
+/// almost always.
+pub fn mask_raw_strings(content: &str) -> Cow<'_, str> {
+    let bytes = content.as_bytes();
+    let mut masked: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr(b'\n', bytes, i).unwrap_or(bytes.len());
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                // RON's block comments nest.
+                let mut depth = 1;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            quote @ (b'"' | b'\'') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                // `r"..."`, or `br"..."`, whose `b` the grammar handles as it
+                // does on any byte string.
+                let r = match &bytes[start..i] {
+                    b"r" => start,
+                    b"br" => start + 1,
+                    _ => continue,
+                };
+                let hashes = bytes[i..].iter().take_while(|&&b| b == b'#').count();
+                let open_quote = i + hashes;
+                if bytes.get(open_quote) != Some(&b'"') {
+                    // A raw identifier such as `r#type`, or a plain `r`.
+                    continue;
+                }
+                let body = open_quote + 1;
+                let mut close = None;
+                let mut j = body;
+                while let Some(quote) = memchr(b'"', bytes, j) {
+                    let end = quote + 1 + hashes;
+                    if bytes.len() >= end && bytes[quote + 1..end].iter().all(|&b| b == b'#') {
+                        close = Some(quote);
+                        break;
+                    }
+                    j = quote + 1;
+                }
+                // Unterminated: everything after it is its contents, so there is
+                // nothing further to find, and nothing that masking would help.
+                let Some(close) = close else { break };
+                let end = close + 1 + hashes;
+
+                let out = masked.get_or_insert_with(|| bytes.to_vec());
+                out[r] = b'"';
+                for b in &mut out[r + 1..body] {
+                    *b = b'x';
+                }
+                for b in &mut out[body..close] {
+                    if matches!(*b, b'"' | b'\\') {
+                        *b = b'x';
+                    }
+                }
+                for b in &mut out[close..end - 1] {
+                    *b = b'x';
+                }
+                out[end - 1] = b'"';
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    match masked {
+        // Only ASCII bytes were replaced, and only with ASCII bytes.
+        Some(out) => Cow::Owned(String::from_utf8(out).expect("masking keeps UTF-8 valid")),
+        None => Cow::Borrowed(content),
+    }
+}
+
+/// The index of the first `needle` in `bytes` at or after `from`.
+fn memchr(needle: u8, bytes: &[u8], from: usize) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .iter()
+        .position(|&b| b == needle)
+        .map(|at| from + at)
 }
 
 impl Default for RonParser {
@@ -49,8 +184,9 @@ pub fn parse(content: &str) -> Option<Tree> {
 }
 
 /// Re-parse content reusing a previous (edited) tree for incremental parsing,
-/// backed by the thread-local reusable parser.
-pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> Option<Tree> {
+/// backed by the thread-local reusable parser. See [`RonParser::parse_with`]
+/// for what the `bool` says.
+pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> (Option<Tree>, bool) {
     PARSER.with(|parser| parser.borrow_mut().parse_with(content, old_tree))
 }
 
@@ -885,6 +1021,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Each raw string becomes a quoted string of the same length, and nothing
+    /// else moves: the tree's offsets, rows and columns all index `content`.
+    #[test]
+    fn test_mask_raw_strings() {
+        let cases = [
+            (r#"(a: r"h", b: "u")"#, r#"(a: "xh", b: "u")"#),
+            (r##"(a: r#"q"x"#, b: 1)"##, r#"(a: "xxqxxx", b: 1)"#),
+            (r##"(a: r#"\"#)"##, r#"(a: "xxxx")"#),
+            (r##"(a: br#"z"#)"##, r#"(a: b"xxzx")"#),
+            ("(a: r\"x\ny\")", "(a: \"xx\ny\")"),
+            // Non-ASCII contents are left alone.
+            ("(a: r\"é🚀\")", "(a: \"xé🚀\")"),
+        ];
+        for (content, expected) in cases {
+            let masked = mask_raw_strings(content);
+            assert_eq!(masked, expected, "masking {content}");
+            assert_eq!(masked.len(), content.len());
+        }
+    }
+
+    /// What only looks like a raw string is left as it is, and the common case
+    /// of no raw string at all costs no copy.
+    #[test]
+    fn test_mask_raw_strings_leaves_lookalikes() {
+        for content in [
+            r#"(a: "r\"x\"", b: 1)"#,
+            r#"(a: "x", // r"y"
+                b: 1)"#,
+            r#"(a: /* /* r"y" */ r"z" */ 1)"#,
+            r#"(a: '"', b: r#type)"#,
+            r#"(bar: 1, var: "x")"#,
+            r#"(a: r"unterminated, b: 1)"#,
+        ] {
+            assert!(
+                matches!(mask_raw_strings(content), Cow::Borrowed(_)),
+                "{content} was masked"
+            );
+        }
+    }
+
+    /// The tree parsed from masked text has the shape the real text has: one
+    /// field per field, each value a `string` spanning exactly its literal.
+    #[test]
+    fn test_parse_raw_string_fields() {
+        let content = r##"User(a: r#"x"#, b: "y", c: r"z")"##;
+        let tree = parse(content).unwrap();
+        let value = find_main_value(&tree).unwrap();
+        let values: Vec<_> = struct_fields(&value)
+            .iter()
+            .map(|field| {
+                let value = field_value(field).unwrap();
+                (
+                    field_name(field, content).unwrap(),
+                    value.kind(),
+                    node_text(&value, content).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("a", "string", r##"r#"x"#"##),
+                ("b", "string", r#""y""#),
+                ("c", "string", r#"r"z""#),
+            ]
+        );
     }
 
     #[test]

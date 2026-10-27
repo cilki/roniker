@@ -36,12 +36,19 @@ pub struct Document {
     // Parsed once per change and shared by all request handlers.
     // Cloning a Tree is cheap (tree-sitter trees are copy-on-write).
     tree: Option<tree_sitter::Tree>,
+    // Whether `tree` can seed an incremental re-parse after an edit; see
+    // `ts_utils::RonParser::parse_with`.
+    tree_reusable: bool,
 }
 
 impl Document {
     pub fn new(content: String) -> Self {
-        let tree = ts_utils::parse(&content);
-        Self { content, tree }
+        let (tree, tree_reusable) = ts_utils::parse_with(&content, None);
+        Self {
+            content,
+            tree,
+            tree_reusable,
+        }
     }
 
     /// Apply a single LSP content change: incremental when a range is given,
@@ -80,6 +87,9 @@ impl Document {
             },
         };
 
+        if !self.tree_reusable {
+            self.tree = None;
+        }
         if let Some(tree) = self.tree.as_mut() {
             tree.edit(&tree_sitter::InputEdit {
                 start_byte,
@@ -90,7 +100,7 @@ impl Document {
                 new_end_position,
             });
         }
-        self.tree = ts_utils::parse_with(&self.content, self.tree.as_ref());
+        (self.tree, self.tree_reusable) = ts_utils::parse_with(&self.content, self.tree.as_ref());
     }
 }
 
@@ -2407,6 +2417,39 @@ PostReference(
             tree.root_node().to_sexp(),
             ts_utils::parse(&doc.content).unwrap().root_node().to_sexp()
         );
+    }
+
+    /// tree-sitter parses raw strings from masked text, and an edit can change
+    /// that masking far from where it lands: here, opening a string at the start
+    /// turns a later raw string into ordinary string contents. Reusing the old
+    /// tree would keep the raw string's node, which no longer exists.
+    #[test]
+    fn test_incremental_change_around_raw_strings() {
+        let mut doc = Document::new("User(a: 1, b: r\"x\")".to_string());
+        let edits = [
+            // Open a string before the raw string: everything after is in it.
+            (Position::new(0, 8), Position::new(0, 9), "\""),
+            // Close it again.
+            (Position::new(0, 8), Position::new(0, 9), "1"),
+            // Drop the `r`: no longer a raw string.
+            (Position::new(0, 14), Position::new(0, 15), ""),
+            // Put it back.
+            (Position::new(0, 14), Position::new(0, 14), "r"),
+        ];
+        for (start, end, text) in edits {
+            doc.apply_change(TextDocumentContentChangeEvent {
+                range: Some(Range::new(start, end)),
+                range_length: None,
+                text: text.to_string(),
+            });
+            assert_eq!(
+                doc.tree.as_ref().unwrap().root_node().to_sexp(),
+                ts_utils::parse(&doc.content).unwrap().root_node().to_sexp(),
+                "after editing to {:?}",
+                doc.content
+            );
+        }
+        assert_eq!(doc.content, "User(a: 1, b: r\"x\")");
     }
 
     /// Same for a reversed range spanning lines, which is the case that reaches

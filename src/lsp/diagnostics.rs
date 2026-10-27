@@ -3478,6 +3478,64 @@ mod tests {
         );
     }
 
+    /// A raw string is a string. The grammar used to lex `r"h"` on to the last
+    /// quote on its line, swallowing every field after it there, so a document
+    /// `ron` accepts was told those fields were missing; and a raw string
+    /// spanning lines didn't lex at all.
+    #[test]
+    fn test_raw_string_values_are_strings() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Db".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "user".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        for content in [
+            r#"Db(host: r"h", user: "u", port: 1)"#,
+            r##"Db(host: r#"say "hi""#, user: "u", port: 1)"##,
+            r##"Db(host: r#"a\"#, user: r"b", port: 1)"##,
+            "Db(\n    host: r#\"line one\nline \"two\"\"#,\n    user: \"u\", port: 1,\n)",
+        ] {
+            ron::from_str::<ron::Value>(content).expect("valid RON");
+            let errors: Vec<_> =
+                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
+                    .into_iter()
+                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                    .collect();
+            assert!(
+                errors.is_empty(),
+                "{content}: expected no errors, got {errors:?}"
+            );
+        }
+
+        // ...and the fields after one are still checked.
+        let content = r#"Db(host: r"h", user: "u", port: "x")"#;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected u16, got string")),
+            "got {diagnostics:?}"
+        );
+    }
+
     #[test]
     fn test_unknown_field_suggests_closest() {
         let analyzer = Arc::new(RustAnalyzer::new());
