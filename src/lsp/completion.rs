@@ -238,7 +238,7 @@ fn generate_field_completions(
     match &type_info.kind {
         TypeKind::Struct(_) => {
             // Get fields already used in the RON file
-            let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
+            let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
 
             // Generate completions for unused fields, using serialized names
             type_info
@@ -259,7 +259,7 @@ fn generate_field_completions(
                 && let Some(variant) = type_info.find_variant(&variant_name)
             {
                 // Complete the variant's fields
-                let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
+                let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
                 return variant
                     .effective_fields()
                     .iter()
@@ -1265,15 +1265,13 @@ mod tests {
         }
     }
 
-    /// The "already written" filter is read off the document's root value at
-    /// every depth, while the fields being filtered come from the innermost
-    /// type. Below the root the two disagree, both ways at once: a nested field
-    /// whose name the root value also uses is filtered out, and a field this
-    /// value really has written survives. Documented in the README's
-    /// Completions section; see
+    /// The "already written" filter has to be read off the same value the
+    /// offered fields come from: the innermost one. Reading it off the root
+    /// value hid a nested field whose name the root also uses and re-offered
+    /// one the nested value had already written; see
     /// <https://git.cilki.net/cilki/roniker/issues/101>.
     #[test]
-    fn test_nested_field_filter_uses_the_root_values_field_names() {
+    fn test_nested_field_filter_uses_the_nested_values_field_names() {
         let database = TypeInfo {
             name: "DatabaseConfig".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1328,16 +1326,69 @@ mod tests {
             labels
         );
         assert!(
-            !labels.contains(&"port".to_string()),
-            "the root value's `port` masks the nested one: {:?}",
+            labels.contains(&"port".to_string()),
+            "the root value's `port` must not mask the nested one: {:?}",
             labels
         );
         assert!(
-            labels.contains(&"host".to_string()),
-            "a field this value has written is offered again, \
-             because the root value has no `host`: {:?}",
+            !labels.contains(&"host".to_string()),
+            "a field this value has already written must not be offered again: {:?}",
             labels
         );
+    }
+
+    /// The same filter inside an enum variant's fields: the variant value is
+    /// the innermost struct, so what it has written is what gets filtered, not
+    /// what the root value has.
+    #[test]
+    fn test_variant_field_filter_uses_the_variants_field_names() {
+        let kind = TypeInfo {
+            name: "Kind".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Detailed".to_string(),
+                fields: vec![
+                    FieldInfo {
+                        name: "name".to_string(),
+                        type_name: "String".to_string(),
+                        ..Default::default()
+                    },
+                    FieldInfo {
+                        name: "length".to_string(),
+                        type_name: "u32".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "kind".to_string(),
+                    type_name: "Kind".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(root);
+        analyzer.add_type(kind.clone());
+        let analyzer = Arc::new(analyzer);
+
+        let content =
+            "Post(\n    name: \"x\",\n    kind: Detailed(\n        length: 1,\n        \n    ),\n)\n";
+        let labels = labels_at(content, Position::new(4, 8), &kind, analyzer);
+
+        assert_eq!(labels, vec!["name".to_string()]);
     }
 
     #[test]

@@ -1843,14 +1843,21 @@ Document::new(content.to_string()),
         });
         analyzer.add_type(TypeInfo {
             name: "crate::Server".to_string(),
-            kind: TypeKind::Struct(vec![FieldInfo {
-                name: "port".to_string(),
-                type_name: "u16".to_string(),
-                docs: Some("Port to bind".to_string()),
-                line: Some(7),
-                column: Some(4),
-                ..Default::default()
-            }]),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    docs: Some("Port to bind".to_string()),
+                    line: Some(7),
+                    column: Some(4),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
             source_file: Some(std::path::PathBuf::from("/test/src/config.rs")),
             ..Default::default()
         });
@@ -1917,7 +1924,8 @@ Document::new(content.to_string()),
             );
 
             // Completion on a fresh line inside the nested value must offer
-            // Server's fields, not Config's.
+            // Server's fields, not Config's — and of those, only the ones the
+            // nested value hasn't written yet.
             let with_blank_line =
                 format!("{root}(\n    server: {nested}(\n        port: 80,\n        \n    ),\n)");
             backend
@@ -1942,8 +1950,13 @@ Document::new(content.to_string()),
             };
             let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
             assert!(
-                labels.contains(&"port"),
+                labels.contains(&"host"),
                 "completion should offer Server's own fields ({label}). Got: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"port"),
+                "completion should not offer a field the value has written ({label}). \
+                 Got: {labels:?}"
             );
             assert!(
                 !labels.contains(&"server"),
@@ -2314,7 +2327,7 @@ PostReference(
             Position::new(2, 6),
         );
         assert_eq!(field, Some("name".to_string()));
-        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
+        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert!(fields.contains(&"id".to_string()));
         assert!(fields.contains(&"name".to_string()));
     }
@@ -2343,7 +2356,7 @@ PostReference(
 
         // The reused tree must still agree with the content.
         let tree = doc.tree.as_ref().unwrap();
-        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
+        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert!(fields.contains(&"name".to_string()), "got {fields:?}");
         assert!(fields.contains(&"id".to_string()), "got {fields:?}");
         assert_eq!(
@@ -2378,7 +2391,7 @@ PostReference(
         });
         assert_eq!(doc.content, "User(id: 1, name: \"X\")");
         let tree = doc.tree.as_ref().unwrap();
-        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
+        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert!(fields.contains(&"name".to_string()));
 
         // A change without a range replaces the whole document
@@ -2389,7 +2402,7 @@ PostReference(
         });
         assert_eq!(doc.content, "Post(title: \"hi\")");
         let tree = doc.tree.as_ref().unwrap();
-        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content);
+        let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert_eq!(fields, vec!["title".to_string()]);
     }
 

@@ -155,13 +155,21 @@ pub fn find_current_variant_context(
     })
 }
 
-/// Parse RON structure to get all field names present at the top level
-pub fn extract_fields_from_ron(tree: &Tree, content: &str) -> Vec<String> {
+/// The field names already written in the struct value the cursor is inside —
+/// the innermost one, which is the value whose type completion offers fields
+/// from. Reading them off the document's root value instead, whatever the
+/// depth, hid a nested field whenever the root happened to share its name and
+/// re-offered the ones the nested value had already written.
+///
+/// A cursor inside no struct at all (in whitespace around the root value) falls
+/// back to the root value's fields.
+pub fn extract_fields_from_ron(tree: &Tree, content: &str, position: Position) -> Vec<String> {
     let mut fields = std::collections::HashSet::new();
-    let root = tree.root_node();
 
-    // Find the first struct node (the top-level value)
-    if let Some(struct_node) = child_by_kind(&root, "struct") {
+    let enclosing = node_at_position(tree, content, position)
+        .and_then(|node| ancestors(tree, node).find(|n| n.kind() == "struct"))
+        .or_else(|| child_by_kind(&tree.root_node(), "struct"));
+    if let Some(struct_node) = enclosing {
         // Collect only direct child fields of this struct
         collect_direct_field_names(&struct_node, content, &mut fields);
     }
@@ -356,7 +364,7 @@ mod tests {
     age: 30,
     items: [],
 )"#;
-        let fields = extract_fields_from_ron(&parse(content), content);
+        let fields = extract_fields_from_ron(&parse(content), content, Position::new(1, 4));
         assert!(fields.contains(&"name".to_string()));
         assert!(fields.contains(&"age".to_string()));
         assert!(fields.contains(&"items".to_string()));

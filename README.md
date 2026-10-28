@@ -438,12 +438,9 @@ What gets offered depends on where in the value the cursor sits:
   none of the above — anything the build script was not given the source for.
 
 Fields the value has already written are left out of the field-name
-completions, with one caveat: the names consulted are always the *root* value's,
-whichever value the cursor is actually in. So inside a nested value, a field
-whose name the root value also uses is never offered — `DatabaseConfig`'s
-`port` goes missing as soon as the root value has a `port` of its own — and a
-field already written there is offered a second time. See
-[#101](https://git.cilki.net/cilki/roniker/issues/101).
+completions. That is the value the cursor is in, at whatever depth: inside a
+nested `DatabaseConfig(...)` it is that value's `port` that counts, not the root
+value's.
 
 ### Runnable examples
 
