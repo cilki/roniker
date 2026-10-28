@@ -225,12 +225,12 @@ Opening a RON file matched by the pattern above gets you:
     [Standard-library types](#standard-library-types) is the spelling listed
     there: `""` for a `PathBuf`, `1` for a `NonZeroU32`,
     `(secs: 0, nanos: 0)` for a `Duration`
-  - *Add N required fields to `path`* for any value nested below it — a struct,
-    an enum variant, an element of a `Vec`, or the contents of a `Some(...)` —
-    naming it the way the file spells it (`server.tls`, `mode::Prod`,
-    `certs[1]`). The fields go into that value's own parentheses. Only the
-    required-field form is offered here; there is no *Add all* counterpart below
-    the root
+  - *Add N required fields to `path`* for any value nested below it that the
+    cursor (or selection) is in — a struct, an enum variant, an element of a
+    `Vec`, or the contents of a `Some(...)` — naming it the way the file spells
+    it (`server.tls`, `mode::Prod`, `certs[1]`). The fields go into that value's
+    own parentheses. Only the required-field form is offered here; there is no
+    *Add all* counterpart below the root
   - *Remove field '...'*, offered as a quick-fix on `unknown-field` and
     `duplicate-field`, at whatever depth the diagnostic was reported
   - *Make struct name explicit: Configuration* and *Make field type explicit:

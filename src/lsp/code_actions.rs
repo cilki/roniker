@@ -1,15 +1,18 @@
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Tree;
 
-/// Generate all code actions for a RON document
+/// Generate the code actions for `range` of a RON document: the ones for the
+/// root, and the ones for every nested value that `range` touches.
 pub fn generate_code_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
     url: &Url,
     analyzer: Arc<RustAnalyzer>,
+    range: Range,
     context_diagnostics: &[Diagnostic],
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
@@ -26,8 +29,9 @@ pub fn generate_code_actions(
     actions.extend(generate_explicit_type_actions(tree, content, type_info, url));
 
     // Add actions for missing fields, at the root and at every depth below it
+    // that `range` reaches
     actions.extend(generate_missing_field_actions(
-        tree, content, type_info, url, &analyzer,
+        tree, content, type_info, url, &analyzer, range,
     ));
 
     actions
@@ -132,12 +136,18 @@ pub fn generate_remove_field_actions(
 /// required fields. The validator reports `missing-required-field` at every
 /// depth, so anything this walk doesn't reach is a diagnostic naming fields the
 /// user then has to type out by hand.
+///
+/// Only the values `range` touches are visited below the root. An editor asks
+/// for code actions wherever the cursor lands, and walking every value in the
+/// document to answer made each of those requests cost as much as a full
+/// diagnostics pass, while offering actions for values nowhere near the cursor.
 fn generate_missing_field_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
     url: &Url,
     analyzer: &RustAnalyzer,
+    range: Range,
 ) -> Vec<CodeActionOrCommand> {
     let Some(root) = root_struct_node(tree) else {
         return Vec::new();
@@ -151,6 +161,10 @@ fn generate_missing_field_actions(
         content,
         url,
         analyzer,
+        span: (
+            super::ts_utils::position_to_byte_offset(content, range.start),
+            super::ts_utils::position_to_byte_offset(content, range.end),
+        ),
     };
     walk.offer_missing_fields(&root, &target, true, &mut actions);
     // The root's children are named by their field alone, not by the variant
@@ -171,14 +185,18 @@ struct NestedWalk<'a> {
     content: &'a str,
     url: &'a Url,
     analyzer: &'a RustAnalyzer,
+    /// The requested range, as byte offsets. Values it doesn't touch are not
+    /// descended into.
+    span: (usize, usize),
 }
 
 /// What a nested value is expected to contain, once the type its field declares
 /// has been resolved.
-struct NestedTarget {
+struct NestedTarget<'a> {
     /// The names serde accepts, as `(serialized_name, field)` pairs — the same
-    /// shape the root is compared against.
-    fields: Vec<(String, FieldInfo)>,
+    /// shape the root is compared against. A struct's are borrowed from the
+    /// analyzer's cache, since the walk resolves one per value in the document.
+    fields: Cow<'a, [(String, FieldInfo)]>,
     /// The container carries `#[serde(default)]`, so nothing is required of it.
     has_default: bool,
     /// How an action title names this value: a dotted field path, with `::` in
@@ -187,7 +205,14 @@ struct NestedTarget {
     path: String,
 }
 
-impl NestedWalk<'_> {
+impl<'a> NestedWalk<'a> {
+    /// Whether `node` overlaps the requested range. The ends count, so that a
+    /// cursor just past a value's closing paren still sees that value.
+    fn touches(&self, node: &tree_sitter::Node) -> bool {
+        let (start, end) = self.span;
+        node.start_byte() <= end && start <= node.end_byte()
+    }
+
     /// Visit each named field of `node` — a value expected to contain
     /// `expected` — and descend into the field's value. `path` names `node`
     /// itself, and is empty for the document root.
@@ -206,6 +231,9 @@ impl NestedWalk<'_> {
         }
 
         for field_node in ts_utils::struct_fields(node) {
+            if !self.touches(&field_node) {
+                continue;
+            }
             let Some(field_name) = ts_utils::field_name(&field_node, self.content) else {
                 continue;
             };
@@ -249,6 +277,9 @@ impl NestedWalk<'_> {
         if value.kind() == "array" {
             let element_type = super::type_utils::strip_outer_generic(declared_type);
             for (index, element) in ts_utils::array_elements(value).iter().enumerate() {
+                if !self.touches(element) {
+                    continue;
+                }
                 self.walk_value(
                     element,
                     &element_type,
@@ -367,7 +398,7 @@ impl NestedWalk<'_> {
         value: &tree_sitter::Node,
         declared_type: &str,
         path: &str,
-    ) -> Option<NestedTarget> {
+    ) -> Option<NestedTarget<'a>> {
         // One generic layer is stripped so `Option<Server>` and `Vec<Server>`
         // resolve to `Server`, matching how the validator recurses.
         let info = self.analyzer.get_type_info(declared_type).or_else(|| {
@@ -377,7 +408,7 @@ impl NestedWalk<'_> {
 
         match &info.kind {
             TypeKind::Struct(_) => Some(NestedTarget {
-                fields: info.effective_fields(self.analyzer),
+                fields: self.analyzer.effective_fields(info),
                 has_default: info.has_default,
                 path: path.to_string(),
             }),
@@ -387,7 +418,7 @@ impl NestedWalk<'_> {
                 let variant_name = super::ts_utils::struct_name(value, self.content)?;
                 let variant = info.find_variant(variant_name)?;
                 Some(NestedTarget {
-                    fields: variant.effective_fields(),
+                    fields: Cow::Owned(variant.effective_fields()),
                     has_default: info.has_default,
                     path: format!("{path}::{variant_name}"),
                 })
@@ -449,19 +480,19 @@ fn generate_explicit_type_actions(
 /// known variant — an unknown-variant error rather than a set of absent fields —
 /// or a tuple/newtype, whose fields are positional (`"0"`, `"1"`, ...) and so
 /// have no name that could be inserted.
-fn expected_root_fields(
+fn expected_root_fields<'a>(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    analyzer: &RustAnalyzer,
-) -> Option<NestedTarget> {
+    analyzer: &'a RustAnalyzer,
+) -> Option<NestedTarget<'a>> {
     let (fields, path) = match &type_info.kind {
         TypeKind::Enum(_) => {
             let name = root_variant_name(tree, content)?;
             let variant = type_info.find_variant(&name)?;
-            (variant.effective_fields(), name)
+            (Cow::Owned(variant.effective_fields()), name)
         }
-        TypeKind::Struct(_) => (type_info.effective_fields(analyzer), String::new()),
+        TypeKind::Struct(_) => (analyzer.effective_fields(type_info), String::new()),
     };
 
     match fields.iter().any(|(_, field)| field.is_positional()) {
@@ -962,6 +993,19 @@ mod tests {
             .unwrap()
     }
     use crate::rust_analyzer::{EnumVariant, TypeKind};
+
+    /// A requested range that touches every value in any document, for tests
+    /// about what is offered rather than where.
+    const WHOLE_DOCUMENT: Range = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: u32::MAX,
+            character: u32::MAX,
+        },
+    };
 
     #[test]
     fn test_generate_default_value() {
@@ -1612,8 +1656,15 @@ mod tests {
 
         let analyzer = Arc::new(RustAnalyzer::new());
 
-        let actions =
-            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let actions = generate_code_actions(
+            &parse(content),
+            content,
+            &type_info,
+            &url,
+            analyzer,
+            WHOLE_DOCUMENT,
+            &[],
+        );
 
         // Should suggest adding missing field_b
         assert!(!actions.is_empty());
@@ -1684,6 +1735,7 @@ mod tests {
                 type_info,
                 &url,
                 analyzer.clone(),
+                WHOLE_DOCUMENT,
                 &[],
             )
             .iter()
@@ -1742,8 +1794,15 @@ mod tests {
         let url = Url::parse("file:///test.ron").unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
 
-        let actions =
-            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let actions = generate_code_actions(
+            &parse(content),
+            content,
+            &type_info,
+            &url,
+            analyzer,
+            WHOLE_DOCUMENT,
+            &[],
+        );
         let titles: Vec<&str> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1882,17 +1941,97 @@ mod tests {
         type_info: &TypeInfo,
         analyzer: Arc<RustAnalyzer>,
     ) -> Vec<(String, String)> {
+        missing_field_actions_in(content, type_info, analyzer, WHOLE_DOCUMENT)
+    }
+
+    /// [`missing_field_actions`] for an editor asking about `range` only.
+    fn missing_field_actions_in(
+        content: &str,
+        type_info: &TypeInfo,
+        analyzer: Arc<RustAnalyzer>,
+        range: Range,
+    ) -> Vec<(String, String)> {
         let url = Url::parse("file:///test.ron").unwrap();
-        generate_code_actions(&parse(content), content, type_info, &url, analyzer, &[])
-            .iter()
-            .filter_map(|a| match a {
-                CodeActionOrCommand::CodeAction(a) if a.title.contains("field") => {
-                    let edits = a.edit.as_ref()?.changes.as_ref()?.get(&url)?;
-                    Some((a.title.clone(), apply(content, edits)))
-                }
-                _ => None,
-            })
-            .collect()
+        generate_code_actions(
+            &parse(content),
+            content,
+            type_info,
+            &url,
+            analyzer,
+            range,
+            &[],
+        )
+        .iter()
+        .filter_map(|a| match a {
+            CodeActionOrCommand::CodeAction(a) if a.title.contains("field") => {
+                let edits = a.edit.as_ref()?.changes.as_ref()?.get(&url)?;
+                Some((a.title.clone(), apply(content, edits)))
+            }
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// An editor asks for code actions wherever the cursor lands, so the
+    /// nested missing-field actions are the ones for the values under the
+    /// cursor. Walking every value in the document to answer cost as much as a
+    /// full diagnostics pass per request, and filled the menu with fixes for
+    /// values nowhere near it.
+    #[test]
+    fn test_nested_actions_are_offered_for_the_values_the_range_touches() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Item".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "a".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "b".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "items".to_string(),
+                type_name: "Vec<Item>".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let analyzer = Arc::new(analyzer);
+        let content = "Cfg(\n    items: [\n        Item(a: 1),\n        Item(b: \"x\"),\n    ],\n)";
+        let at = |line, character| {
+            Range::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            )
+        };
+        let titles = |range| -> Vec<String> {
+            missing_field_actions_in(content, &root, analyzer.clone(), range)
+                .into_iter()
+                .map(|(title, _)| title)
+                .collect()
+        };
+
+        assert_eq!(titles(at(2, 14)), ["Add 1 required field to items[0]"]);
+        assert_eq!(titles(at(3, 14)), ["Add 1 required field to items[1]"]);
+        // A selection spanning both elements is offered both.
+        assert_eq!(
+            titles(Range::new(Position::new(2, 8), Position::new(3, 8))),
+            [
+                "Add 1 required field to items[0]",
+                "Add 1 required field to items[1]"
+            ]
+        );
+        // On the root's own name, neither element is under the cursor.
+        assert!(titles(at(0, 1)).is_empty());
     }
 
     /// Fields missing from an enum variant nested under a root field have to be
@@ -2310,8 +2449,15 @@ mod tests {
         let url = Url::parse("file:///test.ron").unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
 
-        let actions =
-            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let actions = generate_code_actions(
+            &parse(content),
+            content,
+            &type_info,
+            &url,
+            analyzer,
+            WHOLE_DOCUMENT,
+            &[],
+        );
         let edit_sets: Vec<&Vec<TextEdit>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2360,6 +2506,7 @@ mod tests {
             &config,
             &url,
             Arc::new(analyzer),
+            WHOLE_DOCUMENT,
             &[],
         );
         let nested: Vec<(&String, &Vec<TextEdit>)> = actions

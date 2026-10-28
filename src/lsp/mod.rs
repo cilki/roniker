@@ -386,6 +386,7 @@ impl LanguageServer for Backend {
             type_info,
             &url,
             self.rust_analyzer.clone(),
+            params.range,
             &params.context.diagnostics,
         );
         Ok((!actions.is_empty()).then_some(actions))
