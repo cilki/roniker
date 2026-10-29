@@ -687,9 +687,12 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
 
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
 
-    // If the cursor sits just after a non-word character, step back one so a
-    // word ending at the cursor is still found.
-    let actual_col = if col > 0 && !is_word(chars[col - 1]) {
+    // If the cursor isn't on a word character but sits just after one, step
+    // back so a word ending at the cursor is still found. A cursor on the
+    // first character of a word stays put: stepping back from there lands on
+    // the separator before it and finds nothing.
+    let on_word = chars.get(col).is_some_and(|&c| is_word(c));
+    let actual_col = if !on_word && col > 0 && is_word(chars[col - 1]) {
         col - 1
     } else {
         col
@@ -2231,6 +2234,23 @@ User(
 
         let word = get_word_at_position(content, position);
         assert_eq!(word, Some("length".to_string()));
+    }
+
+    /// A cursor on the first character of a word — where an editor puts it
+    /// after a double-click or a jump to the start of the word — names that
+    /// word, not the indentation or separator before it.
+    #[test]
+    fn test_get_word_at_position_on_first_character() {
+        let content = "    length: Some(Detailed),";
+        for (column, expected) in [(4, "length"), (12, "Some"), (17, "Detailed")] {
+            assert_eq!(
+                get_word_at_position(content, Position::new(0, column)),
+                Some(expected.to_string()),
+                "column {column}"
+            );
+        }
+        // Between two separators there is no word to find.
+        assert_eq!(get_word_at_position(content, Position::new(0, 2)), None);
     }
 
     #[test]
