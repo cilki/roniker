@@ -2,7 +2,7 @@
 //! cached tree-sitter parse tree.
 use super::ts_utils;
 use super::ts_utils::LineIndex;
-use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind};
+use tower_lsp_server::ls_types::{DocumentSymbol, SymbolKind};
 use tree_sitter::{Node, Tree};
 
 /// Build the document outline for a RON file.

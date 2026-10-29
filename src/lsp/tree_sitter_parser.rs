@@ -2,7 +2,7 @@ use super::ts_utils::{
     ancestor_chain, ancestors, child_by_kind, field_name, node_at_position, node_text,
     owning_field_for_children, position_to_byte_offset, struct_name,
 };
-use tower_lsp::lsp_types::Position;
+use tower_lsp_server::ls_types::Position;
 use tree_sitter::{Node, Tree};
 
 /// One struct value the cursor is inside, i.e. one step of the nesting path

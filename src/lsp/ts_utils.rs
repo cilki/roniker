@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 use tree_sitter::{Node, Parser, Point, Tree};
 
 /// Wrapper around tree-sitter parser for RON files

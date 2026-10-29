@@ -1,7 +1,7 @@
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::borrow::Cow;
 use std::sync::Arc;
-use tower_lsp::lsp_types::*;
+use tower_lsp_server::ls_types::*;
 use tree_sitter::Tree;
 
 /// Generate the code actions for `range` of a RON document: the ones for the
@@ -10,7 +10,7 @@ pub fn generate_code_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    url: &Url,
+    url: &Uri,
     analyzer: Arc<RustAnalyzer>,
     range: Range,
     context_diagnostics: &[Diagnostic],
@@ -43,7 +43,7 @@ pub fn generate_remove_field_actions(
     tree: &Tree,
     content: &str,
     diagnostics: &[Diagnostic],
-    url: &Url,
+    url: &Uri,
 ) -> Vec<CodeActionOrCommand> {
     use super::diagnostics::codes;
     use super::ts_utils;
@@ -145,7 +145,7 @@ fn generate_missing_field_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    url: &Url,
+    url: &Uri,
     analyzer: &RustAnalyzer,
     range: Range,
 ) -> Vec<CodeActionOrCommand> {
@@ -183,7 +183,7 @@ const MAX_NESTING: usize = 32;
 /// as it descends.
 struct NestedWalk<'a> {
     content: &'a str,
-    url: &'a Url,
+    url: &'a Uri,
     analyzer: &'a RustAnalyzer,
     /// The requested range, as byte offsets. Values it doesn't touch are not
     /// descended into.
@@ -445,7 +445,7 @@ fn generate_explicit_type_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    url: &Url,
+    url: &Uri,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
 
@@ -519,7 +519,7 @@ fn create_explicit_root_type_action(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    url: &Url,
+    url: &Uri,
 ) -> Option<CodeActionOrCommand> {
     use super::ts_utils;
 
@@ -551,7 +551,7 @@ fn create_explicit_field_type_action(
     content: &str,
     field: &FieldInfo,
     rename_all: Option<&str>,
-    url: &Url,
+    url: &Uri,
 ) -> Option<CodeActionOrCommand> {
     use super::ts_utils;
 
@@ -962,7 +962,7 @@ fn plural(count: usize) -> &'static str {
 /// edits in the same single-entry `changes` map and `WorkspaceEdit`; this
 /// centralizes that boilerplate.
 fn single_file_action(
-    url: &Url,
+    url: &Uri,
     title: String,
     kind: CodeActionKind,
     edits: Vec<TextEdit>,
@@ -1362,7 +1362,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
         assert!(action.is_some());
@@ -1392,7 +1392,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
         assert!(action.is_some());
@@ -1421,7 +1421,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action =
             create_explicit_field_type_action(&parse(content), content, &field, None, &url);
@@ -1458,7 +1458,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action =
             create_explicit_field_type_action(&parse(content), content, &field, None, &url);
@@ -1489,7 +1489,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action =
             create_explicit_field_type_action(&parse(content), content, &field, None, &url);
@@ -1517,7 +1517,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         // Should not offer action since type is already explicit
         let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
@@ -1536,7 +1536,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         // Should not offer action since field type is already explicit
         let action =
@@ -1576,7 +1576,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let action =
             create_explicit_field_type_action(&parse(content), content, &field, None, &url);
@@ -1648,7 +1648,7 @@ mod tests {
         // `Enum::Variant(...)` form this used to be written with is a RON syntax
         // error, so it never exercised the feature on a real document.
         let content = "StructVariant(\n    field_a: \"test\"\n)";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         // Create mock analyzer and client for the test
         use crate::rust_analyzer::RustAnalyzer;
@@ -1725,7 +1725,7 @@ mod tests {
         };
 
         let content = "Prod(\n    a: 1,\n)";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
 
         let edit_sets = |type_info: &TypeInfo| -> Vec<Vec<TextEdit>> {
@@ -1791,7 +1791,7 @@ mod tests {
         };
 
         let content = "Port(80)";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
 
         let actions = generate_code_actions(
@@ -1951,7 +1951,7 @@ mod tests {
         analyzer: Arc<RustAnalyzer>,
         range: Range,
     ) -> Vec<(String, String)> {
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         generate_code_actions(
             &parse(content),
             content,
@@ -2198,7 +2198,7 @@ mod tests {
     #[test]
     fn test_remove_unknown_field_action() {
         let content = "(\n    name: \"a\",\n    bogus: 1,\n)";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let diagnostic = Diagnostic {
             range: Range::new(Position::new(2, 4), Position::new(2, 9)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -2229,7 +2229,7 @@ mod tests {
     #[test]
     fn test_remove_field_action_columns_are_utf16() {
         let content = "(host: \"münchen\", bogus: 1, port: 80)";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let start = content.chars().position(|c| c == 'b').unwrap() as u32;
         let diagnostic = Diagnostic {
             range: Range::new(Position::new(0, start), Position::new(0, start + 5)),
@@ -2275,7 +2275,7 @@ mod tests {
     #[test]
     fn test_remove_field_action_ignores_other_codes() {
         let content = "(name: \"a\")";
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let diagnostic = Diagnostic {
             range: Range::new(Position::new(0, 1), Position::new(0, 5)),
             message: "Type mismatch: expected u32".to_string(),
@@ -2446,7 +2446,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
 
         let actions = generate_code_actions(
@@ -2497,7 +2497,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         let content = "Cfg(\n    srv: (),\n)";
         let actions = generate_code_actions(

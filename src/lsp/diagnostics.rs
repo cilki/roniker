@@ -8,7 +8,7 @@ use crate::rust_analyzer::{
 use ron::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Tree;
 
 /// Stable diagnostic codes. Clients and code actions can match on these

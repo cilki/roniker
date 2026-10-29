@@ -20,15 +20,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tower_service::Service;
 
 /// The JSON-RPC message types the server loop deals in, named out of the way of
-/// the `lsp_types` glob above.
-type RpcRequest = tower_lsp::jsonrpc::Request;
-type RpcResponse = tower_lsp::jsonrpc::Response;
+/// the `ls_types` glob above.
+type RpcRequest = tower_lsp_server::jsonrpc::Request;
+type RpcResponse = tower_lsp_server::jsonrpc::Response;
 
 #[derive(Clone)]
 pub struct Document {
@@ -144,7 +144,6 @@ impl Backend {
 
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Log workspace info (types are now added via add_file/add_source methods)
@@ -536,7 +535,7 @@ impl LanguageServer for Backend {
         let new_name = params.new_name;
 
         if !is_valid_identifier(&new_name) {
-            return Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params(format!(
                 "'{}' is not a valid identifier",
                 new_name
             )));
@@ -662,9 +661,8 @@ fn create_location_response(
     let line = line.unwrap_or(1).saturating_sub(1) as u32;
     let column = column.unwrap_or(0) as u32;
 
-    let uri = match tower_lsp::lsp_types::Url::from_file_path(source_file) {
-        Ok(u) => u,
-        Err(_) => return Ok(None),
+    let Some(uri) = Uri::from_file_path(source_file) else {
+        return Ok(None);
     };
 
     Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -945,7 +943,7 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &str, doc: &Document) {
         let content = &doc.content;
-        let url: Url = match uri.parse() {
+        let url: Uri = match uri.parse() {
             Ok(url) => url,
             Err(_) => {
                 self.client
@@ -1105,7 +1103,7 @@ where
         exited: Some(exited_tx),
     };
 
-    // `tower_lsp`'s loop only learns that the service has exited when it tries
+    // `tower_lsp_server`'s loop only learns that the service has exited when it tries
     // to dispatch the *next* message, and after `exit` there is no next message:
     // it parks on the input stream forever. A client that sends `exit` and then
     // waits for the process to go away — which is what the protocol says `exit`
@@ -1120,7 +1118,7 @@ where
 /// Wraps the LSP service to signal `exited` once the client's `exit`
 /// notification has been handled.
 ///
-/// `exit` is answered by `tower_lsp`'s own router rather than by [`Backend`],
+/// `exit` is answered by `tower_lsp_server`'s own router rather than by [`Backend`],
 /// so this is the only place the request is visible to us.
 struct ExitNotifier<S> {
     inner: S,
@@ -1345,7 +1343,7 @@ mod tests {
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
         // Simulate opening a document
-        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        let uri: Uri = "file:///test/user.ron".parse().unwrap();
         let content = r#"User(
     id: 42,
     name: "Alice",
@@ -1468,7 +1466,7 @@ Document::new(content.to_string()),
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
         // Simulate opening a document with an enum variant
-        let uri: Url = "file:///test/status.ron".parse().unwrap();
+        let uri: Uri = "file:///test/status.ron".parse().unwrap();
         let content = r#"Inactive(
     reason: "On vacation",
 )"#;
@@ -1543,7 +1541,7 @@ Document::new(content.to_string()),
             ("on_vacation", 3, "The user is away"),
             ("legacy", 1, "The user is never coming back"),
         ] {
-            let uri: Url = "file:///test/status.ron".parse().unwrap();
+            let uri: Uri = "file:///test/status.ron".parse().unwrap();
             backend
                 .documents
                 .write()
@@ -1603,7 +1601,7 @@ Document::new(content.to_string()),
         analyzer.add_type(config_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
-        let uri: Url = "file:///test/config.ron".parse().unwrap();
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
         let content = r#"Config(
     debug: true,
 )"#;
@@ -1668,7 +1666,7 @@ Document::new(content.to_string()),
         analyzer.add_type(simple_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
-        let uri: Url = "file:///test/simple.ron".parse().unwrap();
+        let uri: Uri = "file:///test/simple.ron".parse().unwrap();
         let content = r#"Simple(
 
 )"#;
@@ -1731,7 +1729,7 @@ Document::new(content.to_string()),
         analyzer.add_type(user_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
-        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        let uri: Uri = "file:///test/user.ron".parse().unwrap();
         // Content with cursor position where we want completions
         let content = r#"User(
 
@@ -1795,7 +1793,7 @@ Document::new(content.to_string()),
         });
 
         let backend = create_test_backend_with_analyzer(analyzer).await;
-        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        let uri: Uri = "file:///test/user.ron".parse().unwrap();
         let content = "User(\n    id: 42,\n)";
         backend
             .documents
@@ -1872,7 +1870,7 @@ Document::new(content.to_string()),
         ] {
             let content = format!("{root}(\n    server: {nested}(\n        port: 80,\n    ),\n)");
             let label = format!("root {:?}, nested {:?}", root, nested);
-            let uri: Url = "file:///test/config.ron".parse().unwrap();
+            let uri: Uri = "file:///test/config.ron".parse().unwrap();
             backend
                 .documents
                 .write()
@@ -1975,7 +1973,7 @@ Document::new(content.to_string()),
     async fn formatting_a_document_matches_formatting_its_text() {
         let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
 
-        let uri: Url = "file:///test/format.ron".parse().unwrap();
+        let uri: Uri = "file:///test/format.ron".parse().unwrap();
         let content = "#![enable(implicit_some)]\n// leading\nConfig(port:8080,hosts:[\"a\",\"b\"],\nnested:Inner(x:1),)\n";
         backend
             .documents
@@ -2493,7 +2491,7 @@ PostReference(
     #[tokio::test]
     async fn test_range_formatting_with_reversed_range() {
         let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
-        let url = Url::parse("file:///test.ron").unwrap();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
         let content = "User(\n   id:1,\n   name:\"Bob\",\n)";
 
         backend
@@ -2597,7 +2595,7 @@ PostReference(
             .rename(RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
-                        uri: Url::parse(uri).unwrap(),
+                        uri: uri.parse::<Uri>().unwrap(),
                     },
                     position: Position::new(3, 9),
                 },
@@ -2609,7 +2607,7 @@ PostReference(
 
         let edit = result.expect("rename should produce an edit");
         let changes = edit.changes.unwrap();
-        let edits = &changes[&Url::parse(uri).unwrap()];
+        let edits = &changes[&uri.parse::<Uri>().unwrap()];
         assert_eq!(
             edits.len(),
             1,
@@ -2678,7 +2676,7 @@ PostReference(
             .rename(RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
-                        uri: Url::parse(uri).unwrap(),
+                        uri: uri.parse::<Uri>().unwrap(),
                     },
                     // the outermost `host`
                     position: Position::new(0, 7),
@@ -2694,7 +2692,7 @@ PostReference(
             .expect("rename should produce edits")
             .changes
             .unwrap();
-        let edits = &changes[&Url::parse(uri).unwrap()];
+        let edits = &changes[&uri.parse::<Uri>().unwrap()];
         assert_eq!(
             edits.len(),
             depth + 1,
@@ -2745,7 +2743,7 @@ PostReference(
         let position = Position::new(0, (level.len() * depth + "Server(h".len()) as u32);
         let text_document_position = TextDocumentPositionParams {
             text_document: TextDocumentIdentifier {
-                uri: Url::parse(uri).unwrap(),
+                uri: uri.parse::<Uri>().unwrap(),
             },
             position,
         };
@@ -2836,7 +2834,7 @@ PostReference(
             .rename(RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
-                        uri: Url::parse(uri).unwrap(),
+                        uri: uri.parse::<Uri>().unwrap(),
                     },
                     // the `host` of the middle entry
                     position: Position::new(3, 16),
@@ -2851,7 +2849,7 @@ PostReference(
             .expect("rename should produce edits")
             .changes
             .unwrap();
-        let edits = &changes[&Url::parse(uri).unwrap()];
+        let edits = &changes[&uri.parse::<Uri>().unwrap()];
         let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
         assert_eq!(lines, vec![2, 3, 4], "all three entries: {edits:?}");
     }
@@ -2906,7 +2904,7 @@ PostReference(
             .rename(RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
-                        uri: Url::parse(uri).unwrap(),
+                        uri: uri.parse::<Uri>().unwrap(),
                     },
                     // the `host` of the first entry
                     position: Position::new(0, 24),
@@ -2922,7 +2920,7 @@ PostReference(
             .expect("rename should produce edits")
             .changes
             .unwrap();
-        let edits = &changes[&Url::parse(uri).unwrap()];
+        let edits = &changes[&uri.parse::<Uri>().unwrap()];
         assert_eq!(
             edits.len(),
             entries,
@@ -3014,7 +3012,7 @@ PostReference(
     #[tokio::test]
     async fn test_hover_and_definition_resolve_the_same_words() {
         let backend = create_test_backend_with_analyzer(post_analyzer()).await;
-        let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "Post(\n    id: 42,\n    post_type: Detailed(\n        length: 1,\n    ),\n)";
         backend
             .documents
@@ -3088,7 +3086,7 @@ PostReference(
     #[tokio::test]
     async fn test_hover_and_definition_on_a_bare_variant_value() {
         let backend = create_test_backend_with_analyzer(post_analyzer()).await;
-        let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "Post(\n    id: 42,\n    post_type: Short,\n)";
         backend
             .documents
@@ -3146,7 +3144,7 @@ PostReference(
     #[tokio::test]
     async fn test_hover_and_definition_fall_back_to_a_named_type() {
         let backend = create_test_backend_with_analyzer(post_analyzer()).await;
-        let uri: Url = "file:///test/post.ron".parse().unwrap();
+        let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "// see Tag\nPost(\n    id: 42,\n)";
         backend
             .documents
@@ -3206,7 +3204,7 @@ PostReference(
             .rename(RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
-                        uri: Url::parse("file:///test.ron").unwrap(),
+                        uri: "file:///test.ron".parse::<Uri>().unwrap(),
                     },
                     position: Position::new(0, 0),
                 },

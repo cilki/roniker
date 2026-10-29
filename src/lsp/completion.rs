@@ -5,7 +5,7 @@ use super::type_utils::{
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
     Position,
 };
@@ -570,7 +570,7 @@ fn generate_value_completions_by_type(
             kind: Some(CompletionItemKind::VALUE),
             detail: Some("Vector/array with elements".to_string()),
             insert_text: Some("[$0]".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         });
     } else if clean_type.starts_with("HashMap<") || clean_type.starts_with("BTreeMap<") {
@@ -586,7 +586,7 @@ fn generate_value_completions_by_type(
             kind: Some(CompletionItemKind::VALUE),
             detail: Some("Map with entries".to_string()),
             insert_text: Some("{$0}".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         });
     } else if let Some(std) = std_type(&clean_type) {
@@ -638,7 +638,7 @@ fn generate_value_completions_by_type(
             kind: Some(CompletionItemKind::VALUE),
             detail: Some("String value".to_string()),
             insert_text: Some("\"$0\"".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         });
     } else if clean_type.starts_with("i")
