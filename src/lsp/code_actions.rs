@@ -26,7 +26,9 @@ pub fn generate_code_actions(
     ));
 
     // Add actions for making struct names explicit
-    actions.extend(generate_explicit_type_actions(tree, content, type_info, url));
+    actions.extend(generate_explicit_type_actions(
+        tree, content, type_info, url,
+    ));
 
     // Add actions for missing fields, at the root and at every depth below it
     // that `range` reaches
@@ -440,33 +442,104 @@ fn matching_field<'a>(
         .map(|(_, field)| field)
 }
 
-/// Generate code actions for making implicit struct names explicit
+/// Code actions that write out the type name an unnamed struct leaves to be
+/// inferred: the root value's — `(id: 1)` → `User(id: 1)` — and that of each of
+/// the root's field values — `author: (..)` → `author: Author(..)`.
+///
+/// One pass over the root's field nodes, each matched to the field it supplies
+/// the way the validator matches it: under its serialized name, its Rust name
+/// or any alias.
 fn generate_explicit_type_actions(
     tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
     url: &Uri,
 ) -> Vec<CodeActionOrCommand> {
-    let mut actions = Vec::new();
+    use super::ts_utils;
 
-    // Check if the root level uses unnamed struct syntax
-    if let Some(action) = create_explicit_root_type_action(tree, content, type_info, url) {
-        actions.push(action);
+    let Some(main_value) = ts_utils::find_main_value(tree) else {
+        return Vec::new();
+    };
+    if main_value.kind() != "struct" {
+        return Vec::new();
     }
 
-    // Check for nested unnamed structs in field values
-    if let Some(fields) = type_info.fields() {
-        let rename_all = type_info.rename_all.as_deref();
-        for field in fields {
-            if let Some(action) =
-                create_explicit_field_type_action(tree, content, field, rename_all, url)
-            {
-                actions.push(action);
-            }
+    let mut actions = Vec::new();
+    if ts_utils::struct_name(&main_value, content).is_none() {
+        let type_name = super::type_utils::short_name(&type_info.name);
+        actions.push(insert_type_name_action(
+            url,
+            format!("Make struct name explicit: {type_name}"),
+            &main_value,
+            content,
+            type_name,
+        ));
+    }
+
+    let Some(fields) = type_info.fields() else {
+        return actions;
+    };
+    let rename_all = type_info.rename_all.as_deref();
+    for field_node in ts_utils::struct_fields(&main_value) {
+        if let Some(field_name) = ts_utils::field_name(&field_node, content)
+            && let Some(field) = fields
+                .iter()
+                .find(|f| f.accepts_name(field_name, rename_all))
+            && let Some(value_node) = ts_utils::field_value(&field_node)
+            && value_node.kind() == "struct"
+            && ts_utils::struct_name(&value_node, content).is_none()
+        {
+            let type_name = written_type_name(&field.type_name);
+            actions.push(insert_type_name_action(
+                url,
+                format!("Make field type explicit: {} {type_name}", field.name),
+                &value_node,
+                content,
+                type_name,
+            ));
         }
     }
 
     actions
+}
+
+/// The name a RON document spells a struct value of `type_name` by: the last
+/// path segment of the type the field holds once the `Option` and the smart
+/// pointers RON writes straight through are peeled off, without its generic
+/// arguments. `Option<crate::models::Author>` is written `Author(..)`.
+fn written_type_name(type_name: &str) -> String {
+    use super::type_utils::{TRANSPARENT_WRAPPERS, extract_inner_type, normalize_type, short_name};
+
+    let mut clean = normalize_type(type_name).into_owned();
+    while let Some(inner) = std::iter::once(&"Option<")
+        .chain(TRANSPARENT_WRAPPERS.iter())
+        .find_map(|wrapper| extract_inner_type(&clean, wrapper))
+    {
+        clean = normalize_type(inner).into_owned();
+    }
+    let head = clean.split('<').next().unwrap_or(&clean);
+    short_name(head).to_string()
+}
+
+/// A refactor inserting `type_name` in front of the unnamed struct `value`.
+fn insert_type_name_action(
+    url: &Uri,
+    title: String,
+    value: &tree_sitter::Node,
+    content: &str,
+    type_name: impl Into<String>,
+) -> CodeActionOrCommand {
+    let pos = super::ts_utils::node_start_position(value, content);
+    single_file_action(
+        url,
+        title,
+        CodeActionKind::REFACTOR,
+        vec![TextEdit {
+            range: Range::new(pos, pos),
+            new_text: type_name.into(),
+        }],
+        None,
+    )
 }
 
 /// What the document root is expected to contain, named in a code action's
@@ -511,84 +584,6 @@ fn expected_root_fields<'a>(
 fn root_variant_name(tree: &Tree, content: &str) -> Option<String> {
     let main_value = super::ts_utils::find_main_value(tree)?;
     super::ts_utils::extract_enum_variant(&main_value, content).map(|variant| variant.name)
-}
-
-/// Create action to make root-level struct name explicit using tree-sitter
-/// Converts: `(field: value)` → `StructName(field: value)`
-fn create_explicit_root_type_action(
-    tree: &Tree,
-    content: &str,
-    type_info: &TypeInfo,
-    url: &Uri,
-) -> Option<CodeActionOrCommand> {
-    use super::ts_utils;
-
-    let main_value = ts_utils::find_main_value(tree)?;
-
-    if main_value.kind() == "struct" && ts_utils::struct_name(&main_value, content).is_none() {
-        let type_name = super::type_utils::short_name(&type_info.name);
-        let pos = ts_utils::node_start_position(&main_value, content);
-
-        return Some(single_file_action(
-            url,
-            format!("Make struct name explicit: {}", type_name),
-            CodeActionKind::REFACTOR,
-            vec![TextEdit {
-                range: Range::new(pos, pos),
-                new_text: type_name.to_string(),
-            }],
-            None,
-        ));
-    }
-
-    None
-}
-
-/// Create action to make nested field type explicit using tree-sitter
-/// Converts: `foo: (value)` → `foo: TypeName(value)`
-fn create_explicit_field_type_action(
-    tree: &Tree,
-    content: &str,
-    field: &FieldInfo,
-    rename_all: Option<&str>,
-    url: &Uri,
-) -> Option<CodeActionOrCommand> {
-    use super::ts_utils;
-
-    let main_value = ts_utils::find_main_value(tree)?;
-
-    if main_value.kind() == "struct" {
-        let field_nodes = ts_utils::struct_fields(&main_value);
-        let serialized = field.serialized_name(rename_all);
-
-        for field_node in field_nodes {
-            if let Some(field_name) = ts_utils::field_name(&field_node, content)
-                && (field_name == serialized || field_name == field.name)
-                && let Some(value_node) = ts_utils::field_value(&field_node)
-                && value_node.kind() == "struct"
-                && ts_utils::struct_name(&value_node, content).is_none()
-            {
-                let short = super::type_utils::short_name(&field.type_name);
-                let type_name = super::type_utils::normalize_type(short);
-                let clean_type = super::type_utils::extract_inner_type(&type_name, "Option<")
-                    .unwrap_or(&type_name);
-
-                let pos = ts_utils::node_start_position(&value_node, content);
-                return Some(single_file_action(
-                    url,
-                    format!("Make field type explicit: {} {}", field.name, clean_type),
-                    CodeActionKind::REFACTOR,
-                    vec![TextEdit {
-                        range: Range::new(pos, pos),
-                        new_text: clean_type.to_string(),
-                    }],
-                    None,
-                ));
-            }
-        }
-    }
-
-    None
 }
 
 /// The `struct` node holding the document's root value, i.e. the one whose
@@ -1349,6 +1344,34 @@ mod tests {
         );
     }
 
+    /// The one "make ... explicit" action, among those offered for `content`
+    /// as a document of `type_info`, whose title starts with `title`.
+    fn explicit_type_action(
+        content: &str,
+        type_info: &TypeInfo,
+        title: &str,
+    ) -> Option<CodeActionOrCommand> {
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let mut actions: Vec<_> =
+            generate_explicit_type_actions(&parse(content), content, type_info, &url)
+                .into_iter()
+                .filter(|action| {
+                    matches!(action, CodeActionOrCommand::CodeAction(a) if a.title.starts_with(title))
+                })
+                .collect();
+        assert!(actions.len() <= 1, "more than one action titled {title}");
+        actions.pop()
+    }
+
+    /// A root struct type holding `field` alone.
+    fn owning(field: FieldInfo) -> TypeInfo {
+        TypeInfo {
+            name: "Root".to_string(),
+            kind: TypeKind::Struct(vec![field]),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_explicit_root_type_same_line() {
         let content = "(id: 1, name: \"test\")";
@@ -1362,9 +1385,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
+        let action = explicit_type_action(content, &type_info, "Make struct name explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -1392,9 +1414,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
+        let action = explicit_type_action(content, &type_info, "Make struct name explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -1421,10 +1442,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action =
-            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action = explicit_type_action(content, &owning(field), "Make field type explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -1458,10 +1477,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action =
-            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action = explicit_type_action(content, &owning(field), "Make field type explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -1489,10 +1506,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action =
-            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action = explicit_type_action(content, &owning(field), "Make field type explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -1502,6 +1517,58 @@ mod tests {
             let text_edits = changes.values().next().unwrap();
             assert_eq!(text_edits[0].new_text, "Author"); // Should strip Option wrapper
         }
+    }
+
+    /// RON names a struct value by its type's last path segment, after the
+    /// `Option` and any smart pointer it is written straight through. Taking
+    /// the last segment of the whole declared type instead inserted `Author>`
+    /// for an `Option<crate::models::Author>`, and `Box<Author>` for a boxed
+    /// one, neither of which RON can parse.
+    #[test]
+    fn test_explicit_field_type_names_the_wrapped_type() {
+        let content = "User(author: (id: 1))";
+        for declared in [
+            "Option<crate::models::Author>",
+            "Option < crate :: models :: Author >",
+            "Box<Author>",
+            "Option<Arc<models::Author>>",
+            "crate::models::Author",
+        ] {
+            let field = FieldInfo {
+                name: "author".to_string(),
+                type_name: declared.to_string(),
+                ..Default::default()
+            };
+            let Some(CodeActionOrCommand::CodeAction(action)) =
+                explicit_type_action(content, &owning(field), "Make field type explicit")
+            else {
+                panic!("no action for {declared}");
+            };
+            assert_eq!(
+                action.title, "Make field type explicit: author Author",
+                "{declared}"
+            );
+            let edits =
+                &action.edit.unwrap().changes.unwrap()[&"file:///test.ron".parse::<Uri>().unwrap()];
+            assert_eq!(edits[0].new_text, "Author", "{declared}");
+        }
+    }
+
+    /// A field written under one of its `#[serde(alias)]` names is the same
+    /// field the validator accepts it as, so its value is offered the type
+    /// name all the same.
+    #[test]
+    fn test_explicit_field_type_under_an_alias() {
+        let content = "User(writer: (id: 1))";
+        let field = FieldInfo {
+            name: "author".to_string(),
+            type_name: "Author".to_string(),
+            aliases: vec!["writer".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            explicit_type_action(content, &owning(field), "Make field type explicit").is_some()
+        );
     }
 
     #[test]
@@ -1517,10 +1584,9 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         // Should not offer action since type is already explicit
-        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
+        let action = explicit_type_action(content, &type_info, "Make struct name explicit");
         assert!(action.is_none());
     }
 
@@ -1536,11 +1602,9 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
         // Should not offer action since field type is already explicit
-        let action =
-            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action = explicit_type_action(content, &owning(field), "Make field type explicit");
         assert!(action.is_none());
     }
 
@@ -1576,10 +1640,8 @@ mod tests {
             has_default: false,
             ..Default::default()
         };
-        let url = "file:///test.ron".parse::<Uri>().unwrap();
 
-        let action =
-            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action = explicit_type_action(content, &owning(field), "Make field type explicit");
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
