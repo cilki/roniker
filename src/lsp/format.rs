@@ -151,6 +151,16 @@ pub fn format_tree(tree: &Tree, content: &str) -> String {
         return content.to_string();
     }
 
+    // So is a tree tree-sitter had to recover from a syntax error. Its ERROR
+    // and MISSING nodes don't sit where the text has them — a half-typed
+    // `timeout: ` has its name and its colon split into separate values — so
+    // laying one out writes back something other than what was there:
+    // `timeout,\n:,`. Editors format on save, which is exactly when a document
+    // is most often half-typed, so the text is left alone until it parses.
+    if tree.root_node().has_error() {
+        return content.to_string();
+    }
+
     let Some(main_value) = ts_utils::find_main_value(tree) else {
         return String::new();
     };
@@ -704,15 +714,29 @@ Post(
         );
     }
 
-    /// With no value in the document `find_main_value` returns `None` and the
-    /// whole layout — leading comments included, since they are emitted inside
-    /// that branch — is skipped, so the result is empty. The server turns that
-    /// into an edit spanning the document, which empties the file. Pinned
-    /// alongside the cases above; see
-    /// https://git.cilki.net/cilki/roniker/issues/103.
+    /// A document with no value in it is one tree-sitter reports a missing
+    /// value for, so it is left alone like any other that doesn't parse. It
+    /// used to be laid out as nothing at all, and the server turned that into
+    /// an edit emptying the file.
     #[test]
-    fn test_document_with_no_value_formats_to_nothing() {
-        assert_eq!(format_ron("// TODO: fill this in\n"), "");
+    fn test_document_with_no_value_is_left_alone() {
+        let input = "// TODO: fill this in\n";
+        assert_eq!(format_ron(input), input);
+    }
+
+    /// A half-typed document doesn't parse, and the tree tree-sitter recovers
+    /// for it has its pieces in the wrong places: laying it out turned
+    /// `timeout: ` into `timeout,\n:,`. Format-on-save hands the server exactly
+    /// these documents, so they come back unchanged.
+    #[test]
+    fn test_document_with_syntax_error_is_left_alone() {
+        for input in [
+            "AppConfig(\n    server: ServerConfig(timeout: ),\n)\n",
+            "AppConfig(\n    port: 1,\n    host: \n)\n",
+            "Config(port: 8080\n",
+        ] {
+            assert_eq!(format_ron(input), input);
+        }
     }
 
     /// Laying out a document is recursive, so a document nested far enough

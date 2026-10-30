@@ -330,13 +330,20 @@ hold either:
   server accepts that spelling whether the extension is enabled or not.
 - Any comment *after* the root value, such as a note at the end of the file.
 
-A document holding no value at all — one that is still only a comment, say — is
-emptied rather than left alone. All three are
-[#103](https://git.cilki.net/cilki/roniker/issues/103).
+Both are [#103](https://git.cilki.net/cilki/roniker/issues/103).
 
-Range formatting ("format selection") is advertised by the server but does not
-work: it replaces the selection with a shorter string, dropping everything after
-the first value in it, which usually leaves the file unparseable
+A document that doesn't parse — a half-typed `timeout: `, an unclosed
+parenthesis, or one that is still only a comment — is left exactly as it is, so
+formatting on save never rewrites a file you are in the middle of editing. Note
+that this includes an empty struct written with space inside it, `( )`: the
+grammar only knows `()`, so a document holding one is not formatted.
+
+Range formatting ("format selection") is advertised by the server but only
+does anything when the selection is exactly one whole value, such as a single
+nested struct from its name to its closing parenthesis — and then it lays that
+value out as though it were the root, so a nested one loses its indentation.
+Any other selection — a few fields, a few elements of an array — doesn't parse
+on its own and is left unchanged
 ([#67](https://git.cilki.net/cilki/roniker/issues/67)). Format the whole
 document instead.
 
