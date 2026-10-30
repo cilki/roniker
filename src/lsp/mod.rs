@@ -402,7 +402,7 @@ impl LanguageServer for Backend {
             // than the layout itself.
             let formatted = match doc.tree.as_ref() {
                 Some(tree) => format::format_tree(tree, &doc.content),
-                None => Backend::format_ron(&doc.content),
+                None => format::format_ron(&doc.content),
             };
 
             if formatted != doc.content {
@@ -433,56 +433,28 @@ impl LanguageServer for Backend {
         let range = Range::new(range_start, range_end);
 
         let documents = self.documents.read().await;
-        if let Some(doc) = documents.get(&uri) {
-            // Extract the text in the range
-            let lines: Vec<&str> = doc.content.lines().collect();
-            let start_line = range.start.line as usize;
-            let end_line = range.end.line as usize;
-
-            if start_line < lines.len() && end_line < lines.len() {
-                // Get the selected text
-                let mut selected_text = String::new();
-                for (i, line) in lines
-                    .iter()
-                    .enumerate()
-                    .skip(start_line)
-                    .take(end_line - start_line + 1)
-                {
-                    if i == start_line && i == end_line {
-                        // Single line selection
-                        let start_byte =
-                            ts_utils::utf16_column_to_byte(line, range.start.character as usize);
-                        let end_byte =
-                            ts_utils::utf16_column_to_byte(line, range.end.character as usize);
-                        selected_text.push_str(&line[start_byte..end_byte.max(start_byte)]);
-                    } else if i == start_line {
-                        let start_byte =
-                            ts_utils::utf16_column_to_byte(line, range.start.character as usize);
-                        selected_text.push_str(&line[start_byte..]);
-                        selected_text.push('\n');
-                    } else if i == end_line {
-                        let end_byte =
-                            ts_utils::utf16_column_to_byte(line, range.end.character as usize);
-                        selected_text.push_str(&line[..end_byte]);
-                    } else {
-                        selected_text.push_str(line);
-                        selected_text.push('\n');
-                    }
-                }
-
-                // Format the selected text
-                let formatted = Backend::format_ron(&selected_text);
-
-                if formatted != selected_text {
-                    return Ok(Some(vec![TextEdit {
-                        range,
-                        new_text: formatted,
-                    }]));
-                }
-            }
+        let Some(doc) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        // A selection reaching past the last line names text that isn't there.
+        if range.end.line as usize >= doc.content.lines().count() {
+            return Ok(None);
         }
 
-        Ok(None)
+        // The selection is exactly the document's text between its two ends,
+        // each clamped to the end of its line.
+        let start = ts_utils::position_to_byte_offset(&doc.content, range.start);
+        let end = ts_utils::position_to_byte_offset(&doc.content, range.end);
+        let selected_text = &doc.content[start..end];
+
+        let formatted = format::format_ron(selected_text);
+        if formatted == selected_text {
+            return Ok(None);
+        }
+        Ok(Some(vec![TextEdit {
+            range,
+            new_text: formatted,
+        }]))
     }
 
     async fn document_symbol(
@@ -721,10 +693,6 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
 }
 
 impl Backend {
-    fn format_ron(content: &str) -> String {
-        format::format_ron(content)
-    }
-
     /// Resolve the root TypeInfo for a document, either from the configured root type
     /// or by inferring it from the struct name at the top of the RON content.
     ///
@@ -1997,7 +1965,7 @@ Document::new(content.to_string()),
         assert_eq!(edits.len(), 1, "the whole document is replaced at once");
         assert_eq!(
             edits[0].new_text,
-            Backend::format_ron(content),
+            format::format_ron(content),
             "the cached tree and a fresh parse must lay out identically"
         );
         assert_eq!(
@@ -2035,7 +2003,7 @@ Document::new(content.to_string()),
     name: "Alice",
     age: 28
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = format::format_ron(input);
 
         // Should be able to parse the result
         let parsed = ron::from_str::<ron::Value>(&formatted);
@@ -2067,7 +2035,7 @@ User(
     id: 1,
     name: "Alice"
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = format::format_ron(input);
 
         // Should be parseable
         let parsed = ron::from_str::<ron::Value>(&formatted);
@@ -2086,7 +2054,7 @@ User(
     name: "Alice",
     roles: ["admin", "user"]
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = format::format_ron(input);
 
         // Should be able to parse both
         let original_parsed: ron::Value = ron::from_str(input).expect("Original should parse");
@@ -2121,7 +2089,7 @@ User(
     roles: ["admin", "developer"],
 )"#;
 
-        let formatted = Backend::format_ron(input);
+        let formatted = format::format_ron(input);
 
         // Both should parse
         let original_parsed: ron::Value = ron::from_str(input).expect("Original should parse");
@@ -2165,7 +2133,7 @@ User(
     post_type: Short,
 )"#;
 
-        let formatted = Backend::format_ron(input);
+        let formatted = format::format_ron(input);
 
         println!("===== FORMATTED OUTPUT =====");
         println!("{}", formatted);
@@ -2545,6 +2513,49 @@ PostReference(
             "the fixture should have something to reformat"
         );
         assert_eq!(forwards, backwards);
+    }
+
+    /// Range formatting lays out exactly the selected text: a selection that
+    /// starts and ends mid-line, past a multibyte character, is cut at the
+    /// UTF-16 columns the editor sent and the edit covers only that span.
+    #[tokio::test]
+    async fn test_range_formatting_formats_only_the_selection() {
+        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "Post(\n    title: \"é\", author: User(id:1,\nname:\"Bob\"), likes: 2,\n)";
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: url.clone(),
+                    language_id: "ron".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+
+        // `User(id:1,\nname:"Bob")`: from column 24 on line 1 to column 11 on line 2.
+        let range = Range::new(Position::new(1, 24), Position::new(2, 11));
+        let edits = backend
+            .range_formatting(DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri: url },
+                range,
+                options: Default::default(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("the selected value should be reformatted");
+
+        assert_eq!(
+            edits,
+            vec![TextEdit {
+                range,
+                new_text: format::format_ron("User(id:1,\nname:\"Bob\")"),
+            }]
+        );
+        assert_eq!(edits[0].new_text, "User(\n    id: 1,\n    name: \"Bob\",\n)");
     }
 
     #[test]
