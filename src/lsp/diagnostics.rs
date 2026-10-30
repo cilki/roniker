@@ -131,13 +131,11 @@ pub fn validate_ron_with_analyzer(
     // down, validating each value against the type it is declared as. Each
     // value is visited once, so nothing is reported twice.
     if let Some(main_value) = super::ts_utils::find_main_value(tree) {
-        let implicit_some = super::ts_utils::enables_implicit_some(tree, content);
         diagnostics.extend(validate_node_with_type_info(
             &main_value,
             content,
             type_info,
             &analyzer,
-            implicit_some,
             true,
         ));
     }
@@ -157,7 +155,6 @@ fn validate_struct_node(
     content: &str,
     expected: &ExpectedStruct<'_>,
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
@@ -250,7 +247,6 @@ fn validate_struct_node(
             content,
             &field_info.type_name,
             analyzer,
-            implicit_some,
         ));
     }
 
@@ -291,37 +287,19 @@ fn validate_typed_value(
     content: &str,
     declared_type: &str,
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
 ) -> Vec<Diagnostic> {
-    let mismatch = |error_msg: String| {
-        vec![Diagnostic {
-            range: first_line_range(value_node, content),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("Type mismatch: {}", error_msg),
-            code: code(codes::TYPE_MISMATCH),
-            ..Default::default()
-        }]
-    };
-
-    // An `Option` written as the bare value it holds, which `ron` only reads
-    // when the document enables `implicit_some`. Without the extension it
-    // refuses the whole document, however well the value fits the type inside.
-    if !implicit_some && let Some(error_msg) = bare_option(value_node, content, declared_type) {
-        return mismatch(error_msg);
-    }
-
     // A literal written straight into a primitive field — most of what a
     // configuration file is made of — needs none of the work below: the parse
     // tree has already classified the literal, and a kind that satisfies the
     // declared type settles the question on its own.
-    if literal_satisfies(value_node, content, declared_type, implicit_some) {
+    if literal_satisfies(value_node, content, declared_type) {
         return Vec::new();
     }
 
     // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
     // validate_nested_value handles all generic-wrapper cases uniformly, so
     // there are no per-container special cases here.
-    let deep = validate_nested_value(value_node, content, declared_type, analyzer, implicit_some);
+    let deep = validate_nested_value(value_node, content, declared_type, analyzer);
     if !deep.diagnostics.is_empty() {
         return deep.diagnostics;
     }
@@ -348,42 +326,19 @@ fn validate_typed_value(
         value_text.and_then(|text| ron::from_str::<Value>(text).ok())
     };
 
-    match check_declared_type(
-        parsed_value.as_ref(),
-        declared_type,
-        value_text,
-        analyzer,
-        implicit_some,
-    ) {
-        Some(error_msg) => mismatch(error_msg),
-        None => Vec::new(),
-    }
-}
-
-/// What is wrong with `node` as a value of `declared_type` when that is an
-/// `Option` the document writes as the bare value it holds — neither `None`
-/// nor `Some(..)` — or `None` when the type is no `Option` or the value is
-/// spelled as one.
-///
-/// Only meaningful for a document without `implicit_some`, which is the one
-/// place `ron` refuses that spelling.
-fn bare_option(node: &tree_sitter::Node, content: &str, declared_type: &str) -> Option<String> {
-    let declared = normalize_type(declared_type);
-    extract_inner_type(&declared, "Option<")?;
-    let text = super::ts_utils::node_text(node, content)?;
-    if text == "None" || super::ts_utils::unwrap_some(node, content).is_some() {
-        return None;
-    }
-    // A struct written there can run to many lines, and quoting it whole would
-    // bury the advice.
-    let shown = if text.len() <= 32 && !text.contains('\n') {
-        text
-    } else {
-        "..."
+    let Some(error_msg) =
+        check_declared_type(parsed_value.as_ref(), declared_type, value_text, analyzer)
+    else {
+        return Vec::new();
     };
-    Some(format!(
-        "expected {declared}, got a bare value: write Some({shown}), or enable implicit_some"
-    ))
+
+    vec![Diagnostic {
+        range: first_line_range(value_node, content),
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!("Type mismatch: {}", error_msg),
+        code: code(codes::TYPE_MISMATCH),
+        ..Default::default()
+    }]
 }
 
 /// Whether the parse tree on its own settles that this value fits
@@ -399,35 +354,25 @@ fn bare_option(node: &tree_sitter::Node, content: &str, declared_type: &str) -> 
 /// Answering `false` is always safe: the value then goes through
 /// [`validate_nested_value`] and [`check_declared_type`] exactly as before, so
 /// this can only ever skip a check that would have found nothing.
-fn literal_satisfies(
-    node: &tree_sitter::Node,
-    content: &str,
-    declared_type: &str,
-    implicit_some: bool,
-) -> bool {
-    tree_satisfies(node, content, &normalize_type(declared_type), implicit_some)
+fn literal_satisfies(node: &tree_sitter::Node, content: &str, declared_type: &str) -> bool {
+    tree_satisfies(node, content, &normalize_type(declared_type))
 }
 
 /// [`literal_satisfies`] on an already-normalized type name, so that the
 /// recursion through generic wrappers doesn't renormalize at every layer.
 ///
-/// The wrappers are seen *through*: a document writes `Option<T>` as `Some(v)`
-/// or `None` — or, with `implicit_some` enabled, as a bare `v` — and
-/// `Box<T>`/`Rc<T>`/`Arc<T>` as the inner value outright, so in each case the
-/// question is the one the wrapped type asks of the value the tree already
-/// holds. A `Vec<T>` is an array whose every element has to answer it.
+/// The wrappers are seen *through*: a document writes `Option<T>` as `Some(v)`,
+/// `None` or a bare `v`, and `Box<T>`/`Rc<T>`/`Arc<T>` as the inner value
+/// outright, so in each case the question is the one the wrapped type asks of
+/// the value the tree already holds. A `Vec<T>` is an array whose every element
+/// has to answer it.
 ///
 /// Only while the wrapped type is not a custom struct or enum, though. Those
 /// are [`validate_nested_value`]'s business: it reports things no amount of
 /// looking at the tree can — a `Vec<T>` whose `T` the analyzer never
 /// registered, say — from the very same spellings, so a wrapper around one is
 /// never settled here.
-fn tree_satisfies(
-    node: &tree_sitter::Node,
-    content: &str,
-    declared: &str,
-    implicit_some: bool,
-) -> bool {
+fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bool {
     if let Some(inner) = extract_inner_type(declared, "Option<") {
         if is_custom_type(inner) {
             return false;
@@ -436,20 +381,14 @@ fn tree_satisfies(
         if node.kind() == "identifier" {
             return super::ts_utils::node_text(node, content) == Some("None");
         }
-        let inner_node = match super::ts_utils::unwrap_some(node, content) {
-            Some(inner_node) => inner_node,
-            None if implicit_some => *node,
-            // A bare value `ron` will refuse: not settled here, so the full
-            // check gets to report it.
-            None => return false,
-        };
-        return tree_satisfies(&inner_node, content, inner, implicit_some);
+        let inner_node = super::ts_utils::unwrap_some(node, content).unwrap_or(*node);
+        return tree_satisfies(&inner_node, content, inner);
     }
     if let Some(inner) = TRANSPARENT_WRAPPERS
         .iter()
         .find_map(|wrapper| extract_inner_type(declared, wrapper))
     {
-        return !is_custom_type(inner) && tree_satisfies(node, content, inner, implicit_some);
+        return !is_custom_type(inner) && tree_satisfies(node, content, inner);
     }
     if let Some(element) = SEQUENCE_WRAPPERS
         .iter()
@@ -459,7 +398,7 @@ fn tree_satisfies(
             && node.kind() == "array"
             && super::ts_utils::array_elements(node)
                 .iter()
-                .all(|value| tree_satisfies(value, content, element, implicit_some));
+                .all(|value| tree_satisfies(value, content, element));
     }
 
     // A standard-library type with no generic arguments is settled by the
@@ -548,7 +487,6 @@ fn validate_nested_value<'a>(
     content: &str,
     field_type: &str,
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
 ) -> Nested {
     let mut diagnostics = Vec::new();
     let mut settled = false;
@@ -583,11 +521,7 @@ fn validate_nested_value<'a>(
             } else if value_node.kind() == "array" {
                 for element in super::ts_utils::array_elements(value_node) {
                     diagnostics.extend(validate_typed_value(
-                        &element,
-                        content,
-                        inner_type,
-                        analyzer,
-                        implicit_some,
+                        &element, content, inner_type, analyzer,
                     ));
                 }
                 settled = true;
@@ -599,11 +533,7 @@ fn validate_nested_value<'a>(
             // elements are visited one at a time here too.
             for element in super::ts_utils::array_elements(value_node) {
                 diagnostics.extend(validate_typed_value(
-                    &element,
-                    content,
-                    inner_type,
-                    analyzer,
-                    implicit_some,
+                    &element, content, inner_type, analyzer,
                 ));
             }
             settled = true;
@@ -628,14 +558,12 @@ fn validate_nested_value<'a>(
                 // check in [`validate_typed_value`] has nothing left to add.
                 //
                 // A bare value written for the `Option`, which RON accepts
-                // under `implicit_some` — without it, [`bare_option`] has
-                // already reported the value before the walk got here — is
-                // the inner type's own value with no wrapper to see through,
-                // and is checked against the inner type the same way. Handing
-                // it to the surface check instead read it against the
-                // wrapper, where `ron` parses a unit variant such as `Fast`
-                // into `()` and the check reported a correct value as
-                // `expected Mode, got ()`.
+                // under `implicit_some`, is the inner type's own value with no
+                // wrapper to see through, and is checked against the inner
+                // type the same way. Leaving it to the surface check instead
+                // read it against the wrapper, where `ron` parses a unit
+                // variant such as `Fast` into `()` and a correct value came
+                // back as `expected Mode, got ()`.
                 //
                 // An `Option`'s `None` is the one spelling with nothing wrapped
                 // to look at.
@@ -645,13 +573,7 @@ fn validate_nested_value<'a>(
                 if !is_none {
                     let inner =
                         super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
-                    diagnostics.extend(validate_typed_value(
-                        &inner,
-                        content,
-                        inner_type,
-                        analyzer,
-                        implicit_some,
-                    ));
+                    diagnostics.extend(validate_typed_value(&inner, content, inner_type, analyzer));
                 }
             } else {
                 diagnostics.push(unknown_type_diag(inner_type));
@@ -667,11 +589,7 @@ fn validate_nested_value<'a>(
             if wrapped.kind() != "identifier" {
                 settled = true;
                 diagnostics.extend(validate_typed_value(
-                    &wrapped,
-                    content,
-                    inner_type,
-                    analyzer,
-                    implicit_some,
+                    &wrapped, content, inner_type, analyzer,
                 ));
             }
         }
@@ -679,14 +597,9 @@ fn validate_nested_value<'a>(
         // A tuple or a fixed-size array, which RON writes the same way: a
         // parenthesized list of a fixed number of values, each with a type of
         // its own.
-        if let Some(found) = validate_tuple_value(
-            value_node,
-            content,
-            field_type,
-            &element_types,
-            analyzer,
-            implicit_some,
-        ) {
+        if let Some(found) =
+            validate_tuple_value(value_node, content, field_type, &element_types, analyzer)
+        {
             settled = true;
             diagnostics.extend(found);
         }
@@ -701,7 +614,6 @@ fn validate_nested_value<'a>(
             content,
             nested_type_info,
             analyzer,
-            implicit_some,
             false,
         ));
     } else if is_custom_type(&field_type_normalized) {
@@ -745,7 +657,6 @@ fn validate_tuple_value(
     field_type: &str,
     element_types: &[&str],
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
 ) -> Option<Vec<Diagnostic>> {
     let mismatch = |tail: String| {
         vec![Diagnostic {
@@ -788,7 +699,7 @@ fn validate_tuple_value(
             .iter()
             .zip(element_types)
             .flat_map(|(element, declared)| {
-                validate_typed_value(element, content, declared, analyzer, implicit_some)
+                validate_typed_value(element, content, declared, analyzer)
             })
             .collect(),
     )
@@ -831,7 +742,6 @@ fn validate_node_with_type_info<'a>(
     content: &str,
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
     at_root: bool,
 ) -> Vec<Diagnostic> {
     match &type_info.kind {
@@ -845,9 +755,9 @@ fn validate_node_with_type_info<'a>(
                 variant: None,
                 at_root,
             };
-            validate_struct_node(node, content, &expected, analyzer, implicit_some)
+            validate_struct_node(node, content, &expected, analyzer)
         }
-        TypeKind::Enum(_) => validate_enum_node(node, content, type_info, analyzer, implicit_some),
+        TypeKind::Enum(_) => validate_enum_node(node, content, type_info, analyzer),
     }
 }
 
@@ -862,7 +772,6 @@ fn validate_enum_node(
     content: &str,
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
-    implicit_some: bool,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
 
@@ -912,7 +821,6 @@ fn validate_enum_node(
                 content,
                 &field.type_name,
                 analyzer,
-                implicit_some,
             ));
         }
         return diagnostics;
@@ -925,7 +833,7 @@ fn validate_enum_node(
         variant: Some(&named.name),
         at_root: false,
     };
-    validate_struct_node(node, content, &expected, analyzer, implicit_some)
+    validate_struct_node(node, content, &expected, analyzer)
 }
 
 /// What is wrong with a value declared to be `expected_type`, worded as the
@@ -941,10 +849,9 @@ fn check_declared_type(
     expected_type: &str,
     value_text: Option<&str>,
     analyzer: &RustAnalyzer,
-    implicit_some: bool,
 ) -> Option<String> {
     if !is_custom_type(expected_type) {
-        return check_type_mismatch(value?, expected_type, implicit_some);
+        return check_type_mismatch(value?, expected_type);
     }
 
     let expected = normalize_type(expected_type);
@@ -1046,7 +953,7 @@ fn integer_value(n: &ron::Number) -> Option<i128> {
 }
 
 /// Check if a RON value matches the expected Rust type
-fn check_type_mismatch(value: &Value, expected_type: &str, implicit_some: bool) -> Option<String> {
+fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     let clean_type = normalize_type(expected_type);
     // Use clean_type for error messages to avoid extra spaces
     let display_type = &clean_type;
@@ -1056,21 +963,14 @@ fn check_type_mismatch(value: &Value, expected_type: &str, implicit_some: bool) 
         if matches!(value, Value::Option(None)) {
             return None;
         }
-        // Unwrap Some(value) to its inner value; a bare value is fine too
-        // under `implicit_some` (it will be wrapped). Either way, validate
-        // against Option's inner type.
+        // Unwrap Some(value) to its inner value; a bare value is fine too (it
+        // will be wrapped). Either way, validate against Option's inner type.
         if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
             let value = match value {
                 Value::Option(Some(inner)) => inner,
-                _ if !implicit_some => {
-                    return Some(format!(
-                        "expected {}, got a bare value: write Some(...), or enable implicit_some",
-                        display_type
-                    ));
-                }
                 other => other,
             };
-            return check_type_mismatch(value, inner_type, implicit_some);
+            return check_type_mismatch(value, inner_type);
         }
     }
 
@@ -1080,7 +980,7 @@ fn check_type_mismatch(value: &Value, expected_type: &str, implicit_some: bool) 
         .iter()
         .find_map(|w| extract_inner_type(&clean_type, w))
     {
-        return check_type_mismatch(value, inner_type, implicit_some);
+        return check_type_mismatch(value, inner_type);
     }
 
     // What a standard-library type with no generic arguments accepts. These are
@@ -1139,7 +1039,7 @@ fn check_type_mismatch(value: &Value, expected_type: &str, implicit_some: bool) 
             {
                 // Check element types if possible
                 for elem in seq {
-                    if let Some(err) = check_type_mismatch(elem, elem_type, implicit_some) {
+                    if let Some(err) = check_type_mismatch(elem, elem_type) {
                         return Some(format!("in Vec: {}", err));
                     }
                 }
@@ -2324,6 +2224,7 @@ mod tests {
     fn test_integer_range_checked_through_wrappers() {
         for (type_name, literal) in [
             ("Option<u8>", "Some(300)"),
+            ("Option<u8>", "300"),
             ("Box<u8>", "300"),
             ("Vec<u8>", "[1, 300]"),
         ] {
@@ -2347,6 +2248,73 @@ mod tests {
             assert!(
                 errors.is_empty(),
                 "{literal} is valid for {type_name}, got {errors:?}"
+            );
+        }
+    }
+
+    /// An `Option` of a custom type written as the bare value it holds, which
+    /// `ron` reads under `implicit_some`. The value belongs to the inner type
+    /// and has to be checked against it, not against the `Option` around it:
+    /// read as the wrapper's, `ron` parses a unit variant such as `Fast` into
+    /// `()` and the check reported `expected Mode, got ()`.
+    #[test]
+    fn test_bare_value_for_option_of_custom_type() {
+        let errors_for = |type_name: &str, literal: &str| -> Vec<String> {
+            let mut analyzer = RustAnalyzer::new();
+            analyzer.add_type(TypeInfo {
+                name: "Retry".to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "attempts".to_string(),
+                    type_name: "u8".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            analyzer.add_type(TypeInfo {
+                name: "Mode".to_string(),
+                kind: TypeKind::Enum(vec![EnumVariant {
+                    name: "Fast".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            let config = single_field_type(type_name);
+            validate_ron_with_analyzer(
+                &format!("Cfg(n: {literal})"),
+                None,
+                &config,
+                Arc::new(analyzer),
+            )
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect()
+        };
+
+        for (type_name, literal) in [
+            ("Option<Mode>", "Fast"),
+            ("Option<Mode>", "Some(Fast)"),
+            ("Option<Mode>", "None"),
+            ("Option<Retry>", "Retry(attempts: 3)"),
+            ("Option<Retry>", "(attempts: 3)"),
+            ("Option<Retry>", "Some((attempts: 3))"),
+        ] {
+            let errors = errors_for(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is valid for {type_name}, got {errors:?}"
+            );
+        }
+
+        // The bare value is still checked against the inner type.
+        for (type_name, literal, expected) in [
+            ("Option<Mode>", "Slow", "Slow"),
+            ("Option<Retry>", "(attempts: 300)", "out of range"),
+        ] {
+            let errors = errors_for(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} for {type_name} should report {expected:?}, got {errors:?}"
             );
         }
     }
@@ -2454,115 +2422,6 @@ mod tests {
                     .collect();
             assert!(errors.is_empty(), "{literal} is valid, got {errors:?}");
         }
-    }
-
-    /// The analyzer and root type for the `implicit_some` tests: `n` is
-    /// declared as `type_name`, and `Retry` and `Mode` are registered so that
-    /// an `Option` of a struct and of an enum can be written.
-    fn implicit_some_errors(type_name: &str, content: &str) -> Vec<String> {
-        let mut analyzer = RustAnalyzer::new();
-        analyzer.add_type(TypeInfo {
-            name: "Retry".to_string(),
-            kind: TypeKind::Struct(vec![FieldInfo {
-                name: "attempts".to_string(),
-                type_name: "u8".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        });
-        analyzer.add_type(TypeInfo {
-            name: "Mode".to_string(),
-            kind: TypeKind::Enum(vec![EnumVariant {
-                name: "Fast".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        });
-        let config = single_field_type(type_name);
-        validate_ron_with_analyzer(content, None, &config, Arc::new(analyzer))
-            .into_iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-            .map(|d| d.message)
-            .collect()
-    }
-
-    /// The `Option` spellings below hold a value without the `Some(..)` around
-    /// it. `ron` reads that only when the document enables `implicit_some`, and
-    /// otherwise refuses the whole file with "Expected option" — so each of
-    /// them, every one a value of the right type inside, used to come back
-    /// clean in the editor and then fail to load.
-    const BARE_OPTIONS: &[(&str, &str)] = &[
-        ("Option<u64>", "30"),
-        ("Option<String>", r#""localhost""#),
-        ("Option<Retry>", "Retry(attempts: 3)"),
-        ("Option<Retry>", "(attempts: 3)"),
-        ("Option<Mode>", "Fast"),
-        ("Option<(u8, u8)>", "(1, 2)"),
-        ("Vec<Option<u32>>", "[Some(1), 2]"),
-        ("Option<Option<u8>>", "Some(1)"),
-    ];
-
-    #[test]
-    fn test_bare_option_value_reported_without_implicit_some() {
-        for (type_name, literal) in BARE_OPTIONS {
-            let content = format!("Cfg(n: {literal})");
-            let errors = implicit_some_errors(type_name, &content);
-            assert!(
-                errors
-                    .iter()
-                    .any(|m| m.contains("got a bare value") && m.contains("implicit_some")),
-                "{literal} for {type_name} needs Some(..) without implicit_some, got {errors:?}"
-            );
-        }
-
-        // The spellings `ron` does read stay clean.
-        for (type_name, literal) in [
-            ("Option<u64>", "Some(30)"),
-            ("Option<u64>", "None"),
-            ("Option<Retry>", "Some(Retry(attempts: 3))"),
-            ("Option<Mode>", "Some(Fast)"),
-            ("Option<(u8, u8)>", "Some((1, 2))"),
-            ("Vec<Option<u32>>", "[Some(1), None]"),
-            ("Option<Option<u8>>", "Some(Some(1))"),
-        ] {
-            let content = format!("Cfg(n: {literal})");
-            let errors = implicit_some_errors(type_name, &content);
-            assert!(errors.is_empty(), "{literal} is valid, got {errors:?}");
-        }
-    }
-
-    #[test]
-    fn test_bare_option_value_accepted_with_implicit_some() {
-        for header in [
-            "#![enable(implicit_some)]\n",
-            "#![enable(unwrap_newtypes, implicit_some)]\n",
-            "// leading comment\n#![enable(implicit_some)]\n",
-        ] {
-            for (type_name, literal) in BARE_OPTIONS {
-                let content = format!("{header}Cfg(n: {literal})");
-                let errors = implicit_some_errors(type_name, &content);
-                assert!(
-                    errors.is_empty(),
-                    "{literal} for {type_name} is valid under {header:?}, got {errors:?}"
-                );
-            }
-        }
-
-        // The value is still checked against the type it is wrapped into.
-        let errors = implicit_some_errors("Option<u8>", "#![enable(implicit_some)]\nCfg(n: 300)");
-        assert!(
-            errors
-                .iter()
-                .any(|m| m.contains("300 is out of range for u8")),
-            "got {errors:?}"
-        );
-
-        // An extension other than `implicit_some` doesn't license the spelling.
-        let errors = implicit_some_errors("Option<u8>", "#![enable(unwrap_newtypes)]\nCfg(n: 3)");
-        assert!(
-            errors.iter().any(|m| m.contains("got a bare value")),
-            "got {errors:?}"
-        );
     }
 
     #[test]
