@@ -773,6 +773,34 @@ pub fn tuple_elements<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
         .collect()
 }
 
+/// Whether the document's `#![enable(...)]` header turns on RON's
+/// `implicit_some` extension, which lets an `Option` field hold a bare value
+/// (`timeout: 30`) instead of an explicit `Some(30)`. Without it `ron` refuses
+/// the bare spelling.
+pub fn enables_implicit_some(tree: &Tree, content: &str) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let headers: Vec<Node> = root
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "extensions")
+        .collect();
+    headers.iter().any(|extensions| {
+        let mut cursor = extensions.walk();
+        extensions
+            .named_children(&mut cursor)
+            .filter(|extension| extension.kind() == "extension")
+            .any(|extension| {
+                let mut cursor = extension.walk();
+                let names: Vec<&str> = extension
+                    .named_children(&mut cursor)
+                    .filter(|name| name.kind() == "identifier")
+                    .filter_map(|name| node_text(&name, content))
+                    .collect();
+                matches!(names.split_first(), Some((&"enable", rest)) if rest.contains(&"implicit_some"))
+            })
+    })
+}
+
 /// Find the main value node (the actual RON data, skipping annotation and comments)
 pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
     let root = tree.root_node();

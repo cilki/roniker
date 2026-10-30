@@ -197,9 +197,14 @@ Opening a RON file matched by the pattern above gets you:
     That is a primitive of the wrong shape, e.g. a string where a `u16` is
     expected, or an integer the field's type can't hold (`port: -1` for a
     `u16`), which `ron` refuses to deserialize. An integer literal in a float
-    field is fine — serde widens it — and is not reported. It is also every way
-    a value can contradict a struct or enum it is written for: naming a
-    different type (`expected ServerConfig, got ServerMode`), naming a type
+    field is fine — serde widens it — and is not reported. An `Option` field
+    written as the bare value it holds (`timeout: 30` rather than
+    `timeout: Some(30)`) is reported too, unless the document carries the
+    `#![enable(implicit_some)]` header that makes `ron` read that spelling. The
+    server only sees the header: an application that turns the extension on in
+    code instead, through `ron::Options`, will see those reported anyway. It is
+    also every way a value can contradict a struct or enum it is written for:
+    naming a different type (`expected ServerConfig, got ServerMode`), naming a type
     nothing in the workspace defines (`unknown type 'Bogus'`), a literal where
     a struct belongs (`expected ServerConfig, got integer`), a value that names
     no variant at all in an enum field (`unknown variant '42' for enum
@@ -326,8 +331,8 @@ hold either:
 - RON's extension header: `#![enable(implicit_some)]` and friends. It isn't a
   comment, and the formatter only writes out the root value and the comments
   above it, so it goes. With `implicit_some` gone every `Option` written as a
-  bare value stops deserializing, and nothing in the editor says so — the
-  server accepts that spelling whether the extension is enabled or not.
+  bare value stops deserializing; the diagnostics published for the formatted
+  document then report each one as a `type-mismatch`.
 - Any comment *after* the root value, such as a note at the end of the file.
 
 Both are [#103](https://git.cilki.net/cilki/roniker/issues/103).
