@@ -4,6 +4,7 @@ use super::type_utils::{
     std_type, strip_outer_generic, tuple_element_types,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
@@ -235,71 +236,67 @@ fn generate_field_completions(
     type_info: &TypeInfo,
     analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
-    match &type_info.kind {
-        TypeKind::Struct(_) => {
-            // Get fields already used in the RON file
-            let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
-
-            // Generate completions for unused fields, using serialized names
-            type_info
-                .effective_fields(analyzer)
-                .iter()
-                .filter(|(name, field)| {
-                    !used_fields.contains(name)
-                        && !used_fields.contains(&field.name)
-                        && !field.aliases.iter().any(|a| used_fields.contains(a))
-                })
-                .map(|(name, field)| field_completion(name, field))
-                .collect()
-        }
+    // The fields serde accepts here, as `(serialized_name, field)` pairs: the
+    // struct's own, or those of the enum variant the cursor is spelling out.
+    let fields = match &type_info.kind {
+        TypeKind::Struct(_) => analyzer.effective_fields(type_info),
         TypeKind::Enum(variants) => {
-            // Check if we're inside a specific variant's fields
-            if let Some(variant_name) =
-                tree_sitter_parser::find_current_variant_context(tree, content, position)
-                && let Some(variant) = type_info.find_variant(&variant_name)
+            match tree_sitter_parser::find_current_variant_context(tree, content, position)
+                .and_then(|variant_name| type_info.find_variant(&variant_name))
             {
-                // Complete the variant's fields
-                let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
-                return variant
-                    .effective_fields()
-                    .iter()
-                    .filter(|(name, field)| {
-                        !used_fields.contains(name) && !used_fields.contains(&field.name)
-                    })
-                    .map(|(name, field)| field_completion(name, field))
-                    .collect();
+                Some(variant) => Cow::Owned(variant.effective_fields()),
+                // Not inside a variant's fields: complete the variant names.
+                None => return enum_variant_name_completions(type_info, variants),
             }
-
-            // Otherwise, complete variant names (serialized, honoring rename/rename_all)
-            let rename_all = type_info.rename_all.as_deref();
-            variants
-                .iter()
-                .map(|variant| {
-                    let name = variant.serialized_name(rename_all);
-                    let value = match &variant.docs {
-                        Some(docs) => format!("```rust\n{}\n```\n\n{}", name, docs),
-                        None => format!("```rust\n{}\n```", name),
-                    };
-                    let documentation = Some(markdown_docs(value));
-
-                    let insert_text = if variant.fields.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{}($0)", name)
-                    };
-
-                    CompletionItem {
-                        label: name.into_owned(),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: Some(format!("Variant of {}", type_info.name)),
-                        documentation,
-                        insert_text: Some(insert_text),
-                        ..Default::default()
-                    }
-                })
-                .collect()
         }
-    }
+    };
+
+    // Offer only the fields not already written, under any name serde
+    // accepts for them.
+    let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
+    fields
+        .iter()
+        .filter(|(name, field)| {
+            !used_fields.contains(name)
+                && !used_fields.contains(&field.name)
+                && !field.aliases.iter().any(|a| used_fields.contains(a))
+        })
+        .map(|(name, field)| field_completion(name, field))
+        .collect()
+}
+
+/// Completion items offering an enum's variant names where a variant is being
+/// named, serialized (honoring rename/rename_all), with a snippet opening the
+/// parens of a variant that carries data.
+fn enum_variant_name_completions(
+    type_info: &TypeInfo,
+    variants: &[EnumVariant],
+) -> Vec<CompletionItem> {
+    let rename_all = type_info.rename_all.as_deref();
+    variants
+        .iter()
+        .map(|variant| {
+            let name = variant.serialized_name(rename_all);
+            let value = match &variant.docs {
+                Some(docs) => format!("```rust\n{}\n```\n\n{}", name, docs),
+                None => format!("```rust\n{}\n```", name),
+            };
+            let insert_text = if variant.fields.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}($0)", name)
+            };
+
+            CompletionItem {
+                label: name.into_owned(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(format!("Variant of {}", type_info.name)),
+                documentation: Some(markdown_docs(value)),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Find the field name for the current cursor position using tree-sitter
@@ -417,30 +414,50 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
     }
 }
 
+/// A completion offering a RON value, inserted exactly as written.
+fn value_item(
+    label: impl Into<String>,
+    detail: impl Into<String>,
+    insert_text: impl Into<String>,
+) -> CompletionItem {
+    CompletionItem {
+        label: label.into(),
+        kind: Some(CompletionItemKind::VALUE),
+        detail: Some(detail.into()),
+        insert_text: Some(insert_text.into()),
+        ..Default::default()
+    }
+}
+
+/// A [`value_item`] whose insert text is a snippet, with tab stops (`$0`,
+/// `$1`, ...) for the editor to put the caret at.
+fn snippet_item(
+    label: impl Into<String>,
+    detail: impl Into<String>,
+    insert_text: impl Into<String>,
+) -> CompletionItem {
+    CompletionItem {
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..value_item(label, detail, insert_text)
+    }
+}
+
 /// Generate value completions based on field type
 fn generate_value_completions_by_type(
     field_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    let mut completions = Vec::new();
-
     // Clean up the type string (remove spaces)
     let clean_type = normalize_type(field_type);
 
-    // First check if this is a custom type (struct or enum) in the workspace
+    // First check if this is a custom type (struct or enum) in the workspace:
+    // an enum's values are its variants (serialized names), a struct's is the
+    // struct itself, as a snippet.
     if let Some(type_info) = analyzer.get_type_info(field_type) {
-        match &type_info.kind {
-            TypeKind::Enum(variants) => {
-                // For enums, provide completions for each variant (serialized names)
-                completions.extend(enum_variant_value_completions(type_info, variants));
-                return completions;
-            }
-            TypeKind::Struct(_) => {
-                // For structs, provide the type with snippet
-                completions.push(create_type_completion(type_info));
-                return completions;
-            }
-        }
+        return match &type_info.kind {
+            TypeKind::Enum(variants) => enum_variant_value_completions(type_info, variants),
+            TypeKind::Struct(_) => vec![create_type_completion(type_info)],
+        };
     }
 
     // A wrapper the document writes straight through — `Box<T>`, `Cow<T>`,
@@ -455,146 +472,76 @@ fn generate_value_completions_by_type(
     // Check for generic types and try to provide completions for the inner type
     if clean_type.starts_with("Option<") {
         let inner = extract_inner_type(&clean_type, "Option<").unwrap_or(&clean_type);
-        if let Some(type_info) = analyzer.get_type_info(inner) {
-            completions.push(CompletionItem {
-                label: format!("Some({})", short_name(&type_info.name)),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some("Some variant with nested type".to_string()),
-                insert_text: Some(format!("Some({}($0))", short_name(&type_info.name))),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            });
-        } else {
-            completions.push(CompletionItem {
-                label: "Some()".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some("Some variant".to_string()),
-                insert_text: Some("Some($0)".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            });
-        }
-        completions.push(CompletionItem {
-            label: "None".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("None variant".to_string()),
-            insert_text: Some("None".to_string()),
-            ..Default::default()
-        });
-        return completions;
+        let some = match analyzer.get_type_info(inner) {
+            Some(type_info) => {
+                let name = short_name(&type_info.name);
+                snippet_item(
+                    format!("Some({name})"),
+                    "Some variant with nested type",
+                    format!("Some({name}($0))"),
+                )
+            }
+            None => snippet_item("Some()", "Some variant", "Some($0)"),
+        };
+        return vec![some, value_item("None", "None variant", "None")];
     }
 
     // Handle primitive types
     if clean_type == "bool" {
-        completions.push(CompletionItem {
-            label: "true".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Boolean value".to_string()),
-            insert_text: Some("true".to_string()),
-            ..Default::default()
-        });
-        completions.push(CompletionItem {
-            label: "false".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Boolean value".to_string()),
-            insert_text: Some("false".to_string()),
-            ..Default::default()
-        });
+        vec![
+            value_item("true", "Boolean value", "true"),
+            value_item("false", "Boolean value", "false"),
+        ]
     } else if clean_type == "char" {
-        completions.push(CompletionItem {
-            label: "''".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Character value".to_string()),
-            insert_text: Some("'$0'".to_string()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
-            ..Default::default()
-        });
+        vec![snippet_item("''", "Character value", "'$0'")]
     } else if clean_type.starts_with(['(', '[']) {
         // A tuple and a fixed-size array are both written as a parenthesized
         // list of exactly as many values as the type declares — brackets
         // belong to the sequence types, and `ron` refuses them here, so the
         // `[]`/`[...]` these fields used to be offered could not be used.
         let arity = tuple_element_types(&clean_type).map(|elements| elements.len());
-        completions.push(match arity {
+        vec![match arity {
             // The unit type `()` takes exactly one value, and it is its own
             // spelling.
-            Some(0) => CompletionItem {
-                label: "()".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some("Unit value".to_string()),
-                insert_text: Some("()".to_string()),
-                ..Default::default()
-            },
+            Some(0) => value_item("()", "Unit value", "()"),
             // One tab stop per position, so the value can be filled in
             // left to right without counting the commas out by hand.
-            Some(count) => CompletionItem {
-                label: "(...)".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some(format!("{field_type} as a tuple of {count}")),
-                insert_text: Some(format!(
+            Some(count) => snippet_item(
+                "(...)",
+                format!("{field_type} as a tuple of {count}"),
+                format!(
                     "({})",
                     (1..=count)
                         .map(|stop| format!("${stop}"))
                         .collect::<Vec<_>>()
                         .join(", ")
-                )),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
+                ),
+            ),
             // An arity the type name doesn't spell out — a slice, or an array
             // whose length is a const generic. Still a tuple in RON.
-            None => CompletionItem {
-                label: "(...)".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some(format!("{field_type} as a tuple")),
-                insert_text: Some("($0)".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-        });
+            None => snippet_item("(...)", format!("{field_type} as a tuple"), "($0)"),
+        }]
     } else if SEQUENCE_WRAPPERS
         .iter()
         .chain(["HashSet<", "BTreeSet<"].iter())
         .any(|prefix| clean_type.starts_with(prefix))
     {
         // A set is written as a sequence too, so it takes the same values.
-        completions.push(CompletionItem {
-            label: "[]".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Empty vector/array".to_string()),
-            insert_text: Some("[]".to_string()),
-            ..Default::default()
-        });
-        completions.push(CompletionItem {
-            label: "[...]".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Vector/array with elements".to_string()),
-            insert_text: Some("[$0]".to_string()),
-            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        });
+        vec![
+            value_item("[]", "Empty vector/array", "[]"),
+            snippet_item("[...]", "Vector/array with elements", "[$0]"),
+        ]
     } else if clean_type.starts_with("HashMap<") || clean_type.starts_with("BTreeMap<") {
-        completions.push(CompletionItem {
-            label: "{}".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Empty map".to_string()),
-            insert_text: Some("{}".to_string()),
-            ..Default::default()
-        });
-        completions.push(CompletionItem {
-            label: "{...}".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Map with entries".to_string()),
-            insert_text: Some("{$0}".to_string()),
-            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        });
+        vec![
+            value_item("{}", "Empty map", "{}"),
+            snippet_item("{...}", "Map with entries", "{$0}"),
+        ]
     } else if let Some(std) = std_type(&clean_type) {
         // A standard-library type the analyzer never registers. There is no
         // definition to offer a snippet from, but its RON spelling is known,
         // and offering it is what keeps a `PathBuf` field from falling through
         // to "every type in the workspace".
-        completions.push(match std.shape {
+        vec![match std.shape {
             StdShape::Text => {
                 // A type whose placeholder spells out a value — an `IpAddr`'s
                 // `"0.0.0.0"` — offers it pre-selected, as a starting point to
@@ -602,60 +549,40 @@ fn generate_value_completions_by_type(
                 // nothing to seed (`PathBuf`) just puts the caret in the
                 // quotes, exactly as a `String` field does.
                 let seed = std.placeholder.trim_matches('"');
-                CompletionItem {
-                    label: std.placeholder.to_string(),
-                    kind: Some(CompletionItemKind::VALUE),
-                    detail: Some(format!("{field_type} as a string")),
-                    insert_text: Some(match seed.is_empty() {
+                snippet_item(
+                    std.placeholder,
+                    format!("{field_type} as a string"),
+                    match seed.is_empty() {
                         true => "\"$0\"".to_string(),
                         false => format!("\"${{1:{seed}}}\""),
-                    }),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                }
+                    },
+                )
             }
-            StdShape::Integer => CompletionItem {
-                label: std.placeholder.to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some(format!("{field_type} value")),
-                insert_text: Some(std.placeholder.to_string()),
-                ..Default::default()
-            },
-            StdShape::Record => CompletionItem {
-                label: std.placeholder.to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some(format!("{field_type} as serde writes it")),
-                insert_text: Some(std.placeholder.to_string()),
-                ..Default::default()
-            },
-        });
+            StdShape::Integer => value_item(
+                std.placeholder,
+                format!("{field_type} value"),
+                std.placeholder,
+            ),
+            StdShape::Record => value_item(
+                std.placeholder,
+                format!("{field_type} as serde writes it"),
+                std.placeholder,
+            ),
+        }]
     } else if clean_type == "String" || clean_type == "&str" || clean_type == "str" {
         // `str` reaches here through a wrapper: a `Cow<'a, str>` field is
         // written as the string it borrows. Leaving it out sent those fields to
         // the "every type in the workspace" fallback.
-        completions.push(CompletionItem {
-            label: "\"\"".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("String value".to_string()),
-            insert_text: Some("\"$0\"".to_string()),
-            insert_text_format: Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        });
+        vec![snippet_item("\"\"", "String value", "\"$0\"")]
     } else if clean_type.starts_with("i")
         || clean_type.starts_with("u")
         || clean_type.starts_with("f")
     {
         // Numeric types (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64)
-        completions.push(CompletionItem {
-            label: "0".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some(format!("{} value", field_type)),
-            insert_text: Some("0".to_string()),
-            ..Default::default()
-        });
+        vec![value_item("0", format!("{field_type} value"), "0")]
+    } else {
+        Vec::new()
     }
-
-    completions
 }
 
 #[cfg(test)]
