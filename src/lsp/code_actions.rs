@@ -676,8 +676,9 @@ fn generate_field_insertions(
         body.push_str(&one_line_fields(missing_fields, analyzer));
     } else {
         let indent = field_indent(content, struct_node);
+        let newline = ts_utils::line_ending(content);
         for (name, field) in missing_fields {
-            body.push('\n');
+            body.push_str(newline);
             body.push_str(&indent);
             body.push_str(name);
             body.push_str(": ");
@@ -689,13 +690,13 @@ fn generate_field_insertions(
     // Step over whatever is left on the anchor's line — a trailing comment, say
     // — so the new fields start on a line of their own instead of landing
     // inside it. The separator still has to go right after the anchor, which is
-    // why this can need two edits.
+    // why this can need two edits. The line ends before a `\r\n`'s `\r`.
     let bytes = content.as_bytes();
     let anchor_end = anchor.end_byte();
     let mut body_byte = anchor_end;
     if !on_one_line {
         let limit = close.start_byte().max(anchor_end);
-        while body_byte < limit && bytes[body_byte] != b'\n' {
+        while body_byte < limit && !matches!(bytes[body_byte], b'\n' | b'\r') {
             body_byte += 1;
         }
     }
@@ -2331,6 +2332,29 @@ mod tests {
                 &[("port", "u16")]
             ),
             "Config(\n    host: \"münchen\", // the office\n    port: 0,\n)"
+        );
+    }
+
+    /// A CRLF document gets CRLF lines. The field used to be inserted between
+    /// the anchor line's `\r` and its `\n`, at a column past the end of the
+    /// line, and to end in a bare `\n`.
+    #[test]
+    fn test_field_insertion_keeps_crlf() {
+        let content = "Config(\r\n    host: \"x\", // c\r\n    a: 1,\r\n)\r\n";
+        let tree = parse(content);
+        let edits = root_insertions(&tree, content, &[("port", "u16")]);
+        assert!(
+            edits.iter().all(|e| e.range.end.character
+                <= super::super::ts_utils::line_width(content, e.range.end.line as usize)),
+            "an edit reached past the end of its line: {edits:?}"
+        );
+        assert_eq!(
+            insert(content, &[("port", "u16")]),
+            "Config(\r\n    host: \"x\", // c\r\n    a: 1,\r\n    port: 0,\r\n)\r\n"
+        );
+        assert_eq!(
+            insert("Config(\r\n    host: \"x\" // c\r\n)", &[("port", "u16")]),
+            "Config(\r\n    host: \"x\", // c\r\n    port: 0,\r\n)"
         );
     }
 

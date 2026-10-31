@@ -447,7 +447,12 @@ impl LanguageServer for Backend {
         let end = ts_utils::position_to_byte_offset(&doc.content, range.end);
         let selected_text = &doc.content[start..end];
 
-        let formatted = format::format_ron(selected_text);
+        // Lines end the way the document's do: a selection on one line has no
+        // line break of its own to go by.
+        let formatted = format::format_ron_with_line_ending(
+            selected_text,
+            ts_utils::line_ending(&doc.content),
+        );
         if formatted == selected_text {
             return Ok(None);
         }

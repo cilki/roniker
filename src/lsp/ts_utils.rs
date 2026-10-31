@@ -259,7 +259,7 @@ pub fn utf16_column_to_byte(line: &str, utf16_column: usize) -> usize {
 /// last character. Counts rows from the start of `content`; prefer
 /// [`line_end_column`] where a byte offset on the row is already to hand.
 pub fn line_width(content: &str, row: usize) -> u32 {
-    let line = line_at(content, row);
+    let line = strip_cr(line_at(content, row));
     utf16_column(line, line.len())
 }
 
@@ -271,7 +271,30 @@ pub fn line_end_column(content: &str, byte_offset: usize) -> u32 {
         .find('\n')
         .map(|newline| start + newline)
         .unwrap_or(content.len());
-    utf16_len(&content[start..end])
+    utf16_len(strip_cr(&content[start..end]))
+}
+
+/// A row with the `\r` of a `\r\n` terminator taken off.
+///
+/// LSP counts the terminator as part of no line, so the end of a row in a CRLF
+/// document is before its `\r`. A position past it lands inside the line break:
+/// the spec has a client clamp it back, and one that doesn't splits the `\r\n`.
+fn strip_cr(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// The line terminator `content` uses: `\r\n` if its first line ends in one,
+/// `\n` otherwise (including when it has no line break at all).
+///
+/// Text the server writes into a document — a formatted layout, an inserted
+/// field — has to end its lines the way the document already does. An edit
+/// that writes `\n` into a CRLF file leaves it with mixed line endings, which
+/// a client applying the edit verbatim keeps.
+pub fn line_ending(content: &str) -> &'static str {
+    match content.find('\n') {
+        Some(newline) if content[..newline].ends_with('\r') => "\r\n",
+        _ => "\n",
+    }
 }
 
 /// Convert a byte offset into `content` to an LSP `Position` (line + UTF-16
@@ -335,7 +358,8 @@ pub fn position_to_byte_offset(content: &str, position: Position) -> usize {
 
     for (row, line) in content.split('\n').enumerate() {
         if row == position.line as usize {
-            return offset + utf16_column_to_byte(line, position.character as usize);
+            // Clamped to the end of the line, which is before a `\r\n`'s `\r`.
+            return offset + utf16_column_to_byte(strip_cr(line), position.character as usize);
         }
         offset += line.len() + 1; // + the '\n' that split consumed
     }
@@ -1396,6 +1420,40 @@ mod tests {
 
         assert_eq!(line_end_column(content, 3), 4, "`ab` plus a surrogate pair");
         assert_eq!(line_end_column(content, content.len()), 2);
+    }
+
+    /// In a CRLF document a row ends before its `\r`: the terminator belongs to
+    /// no line, so a column past it would point into the line break.
+    #[test]
+    fn test_line_end_excludes_carriage_return() {
+        let content = "ab\r\nü\r\nxy";
+        assert_eq!(line_width(content, 0), 2);
+        assert_eq!(line_width(content, 1), 1);
+        assert_eq!(line_end_column(content, 0), 2);
+        assert_eq!(line_end_column(content, 4), 1);
+        assert_eq!(line_end_column(content, content.len()), 2);
+
+        // A position past the end of a row clamps to before its `\r`.
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 99)), 2);
+        assert_eq!(position_to_byte_offset(content, Position::new(1, 99)), 6);
+    }
+
+    #[test]
+    fn test_line_ending() {
+        assert_eq!(line_ending("a\r\nb\r\n"), "\r\n");
+        assert_eq!(
+            line_ending("a\nb\r\n"),
+            "\n",
+            "the first line break decides"
+        );
+        assert_eq!(
+            line_ending("a\r\nb\n"),
+            "\r\n",
+            "the first line break decides"
+        );
+        assert_eq!(line_ending("a\n"), "\n");
+        assert_eq!(line_ending("a\r"), "\n", "a lone \\r is not a line break");
+        assert_eq!(line_ending(""), "\n");
     }
 
     /// Node positions are derived from the byte column tree-sitter reports for

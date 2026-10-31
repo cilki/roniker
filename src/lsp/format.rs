@@ -10,6 +10,8 @@ const INDENT: &str = "    ";
 /// Represents a comment found in the source
 #[derive(Debug, Clone)]
 struct Comment {
+    /// The comment's text. A line comment in a CRLF document runs up to the
+    /// `\n`, so its `\r` is cut off here: the formatter ends the line itself.
     text: String,
     /// The byte position where this comment starts
     start_byte: usize,
@@ -37,7 +39,7 @@ fn collect_inner_comments(node: &Node, content: &str) -> Vec<Comment> {
             let is_trailing = is_trailing_comment_in_context(content, start_byte, &children[..i]);
 
             result.push(Comment {
-                text: text.to_string(),
+                text: text.trim_end_matches('\r').to_string(),
                 start_byte: child.start_byte(),
                 end_byte: child.end_byte(),
                 is_trailing,
@@ -105,7 +107,7 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
             && let Some(text) = ts_utils::node_text(&child, content)
         {
             comments.push(Comment {
-                text: text.to_string(),
+                text: text.trim_end_matches('\r').to_string(),
                 start_byte: child.start_byte(),
                 end_byte: child.end_byte(),
                 is_trailing: false,
@@ -131,8 +133,18 @@ fn value_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
 /// that document's parse tree, and parsing a large file again costs more than
 /// laying it out does.
 pub fn format_ron(content: &str) -> String {
+    format_ron_with_line_ending(content, ts_utils::line_ending(content))
+}
+
+/// [`format_ron`] ending every line it lays out with `newline` rather than with
+/// whatever `content` itself uses.
+///
+/// For text cut out of a larger document — a range-formatting selection — whose
+/// own line endings, if it even has a line break, don't say what the document's
+/// are.
+pub fn format_ron_with_line_ending(content: &str, newline: &'static str) -> String {
     match ts_utils::parse(content) {
-        Some(tree) => format_tree(&tree, content),
+        Some(tree) => layout(&tree, content, newline),
         // If parsing fails, return original content
         None => content.to_string(),
     }
@@ -145,6 +157,13 @@ pub fn format_ron(content: &str) -> String {
 /// recorded, so a tree belonging to different text would reproduce that text's
 /// contents.
 pub fn format_tree(tree: &Tree, content: &str) -> String {
+    layout(tree, content, ts_utils::line_ending(content))
+}
+
+/// Lay out `content`, whose parse tree is `tree`, ending each line written with
+/// `newline`. Comments and other leaves are copied verbatim, line breaks inside
+/// them included.
+fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
     if ts_utils::exceeds_max_depth(&tree.root_node()) {
@@ -167,12 +186,13 @@ pub fn format_tree(tree: &Tree, content: &str) -> String {
 
     let mut formatter = Formatter {
         content,
+        newline,
         output: String::new(),
     };
 
     for comment in collect_top_level_comments(&tree.root_node(), content, &main_value) {
         formatter.output.push_str(&comment.text);
-        formatter.output.push('\n');
+        formatter.output.push_str(newline);
     }
     formatter.node(&main_value, 0);
 
@@ -187,6 +207,8 @@ pub fn format_tree(tree: &Tree, content: &str) -> String {
 /// deep it sits.
 struct Formatter<'a> {
     content: &'a str,
+    /// What every line written ends with: the document's own line terminator.
+    newline: &'static str,
     output: String,
 }
 
@@ -239,7 +261,7 @@ impl Formatter<'_> {
         if !items.is_empty() {
             let comments = collect_inner_comments(node, self.content);
 
-            self.output.push('\n');
+            self.output.push_str(self.newline);
             for (i, item) in items.iter().enumerate() {
                 self.leading_comments(&comments, items, i, level);
 
@@ -248,7 +270,7 @@ impl Formatter<'_> {
                 self.output.push(',');
 
                 self.trailing_comment(&comments, items, i);
-                self.output.push('\n');
+                self.output.push_str(self.newline);
             }
 
             self.remaining_comments(&comments, items, level);
@@ -355,7 +377,7 @@ impl Formatter<'_> {
             {
                 self.indent(level + 1);
                 self.output.push_str(&comment.text);
-                self.output.push('\n');
+                self.output.push_str(self.newline);
             }
         }
     }
@@ -385,7 +407,7 @@ impl Formatter<'_> {
             if !comment.is_trailing && comment.start_byte > last.end_byte() {
                 self.indent(level + 1);
                 self.output.push_str(&comment.text);
-                self.output.push('\n');
+                self.output.push_str(self.newline);
             }
         }
     }
@@ -751,5 +773,23 @@ Post(
         let depth = ts_utils::MAX_TREE_DEPTH * 20;
         let input = format!("{}1{}", "Outer(inner: ".repeat(depth), ")".repeat(depth));
         assert_eq!(format_ron(&input), input);
+    }
+
+    /// A CRLF document is laid out with CRLF lines. It used to come back with
+    /// every line ending in a bare `\n`, so formatting it rewrote every line of
+    /// the file, and an already formatted one could never be left alone.
+    #[test]
+    fn test_crlf_document_keeps_crlf() {
+        let input = "// top\r\nConfig(\r\n    // lead\r\n    port: 1, // trail\r\n    tags: [\"a\"],\r\n    inner: Inner(a: 1),\r\n    /* done */\r\n)\r\n";
+        let expected = "// top\r\nConfig(\r\n    // lead\r\n    port: 1, // trail\r\n    tags: [\r\n        \"a\",\r\n    ],\r\n    inner: Inner(\r\n        a: 1,\r\n    ),\r\n    /* done */\r\n)";
+        assert_eq!(format_ron(input), expected);
+        assert_eq!(format_ron(expected), expected, "formatting is idempotent");
+
+        // A selection without a line break of its own takes the document's.
+        assert_eq!(
+            format_ron_with_line_ending("Inner(a: 1)", "\r\n"),
+            "Inner(\r\n    a: 1,\r\n)"
+        );
+        assert_eq!(format_ron("Inner(a: 1)"), "Inner(\n    a: 1,\n)");
     }
 }
