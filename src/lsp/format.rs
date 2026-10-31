@@ -168,12 +168,16 @@ pub fn format_tree(tree: &Tree, content: &str) -> String {
     let mut formatter = Formatter {
         content,
         output: String::new(),
+        prev_end: None,
     };
 
     for comment in collect_top_level_comments(&tree.root_node(), content, &main_value) {
+        formatter.separate_from_previous(comment.start_byte);
         formatter.output.push_str(&comment.text);
         formatter.output.push('\n');
+        formatter.prev_end = Some(comment.end_byte);
     }
+    formatter.separate_from_previous(main_value.start_byte());
     formatter.node(&main_value, 0);
 
     formatter.output.trim_end().to_string()
@@ -188,9 +192,40 @@ pub fn format_tree(tree: &Tree, content: &str) -> String {
 struct Formatter<'a> {
     content: &'a str,
     output: String,
+    /// Where the last line-starting piece of the current container (an item,
+    /// or a comment on its own line) ends in `content`, or `None` before the
+    /// first one. A blank line in the source between it and the next piece is
+    /// kept, so the groups a document is written in survive formatting.
+    prev_end: Option<usize>,
+}
+
+/// True if `gap` holds a line with nothing but whitespace on it.
+///
+/// The first and last lines of `gap` are the tails of the lines the pieces on
+/// either side sit on, so only the lines strictly between them count. That
+/// keeps a block comment spanning several lines from reading as a blank line.
+fn has_blank_line(gap: &str) -> bool {
+    let lines: Vec<&str> = gap.split('\n').collect();
+    lines.len() > 2
+        && lines[1..lines.len() - 1]
+            .iter()
+            .any(|l| l.trim().is_empty())
 }
 
 impl Formatter<'_> {
+    /// Write an empty line before a piece starting at `start` if the source
+    /// had at least one between it and the piece before. Several blank lines
+    /// are written as one, and nothing is written before a container's first
+    /// piece.
+    fn separate_from_previous(&mut self, start: usize) {
+        if let Some(prev) = self.prev_end
+            && prev < start
+            && has_blank_line(&self.content[prev..start])
+        {
+            self.output.push('\n');
+        }
+    }
+
     /// Write `level` levels of indentation.
     fn indent(&mut self, level: usize) {
         for _ in 0..level {
@@ -240,11 +275,14 @@ impl Formatter<'_> {
             let comments = collect_inner_comments(node, self.content);
 
             self.output.push('\n');
+            self.prev_end = None;
             for (i, item) in items.iter().enumerate() {
                 self.leading_comments(&comments, items, i, level);
 
+                self.separate_from_previous(item.start_byte());
                 self.indent(level + 1);
                 self.node(item, level + 1);
+                self.prev_end = Some(item.end_byte());
                 self.output.push(',');
 
                 self.trailing_comment(&comments, items, i);
@@ -353,9 +391,11 @@ impl Formatter<'_> {
                 && comment.end_byte <= items[i].start_byte()
                 && (i == 0 || comment.start_byte > items[i - 1].end_byte())
             {
+                self.separate_from_previous(comment.start_byte);
                 self.indent(level + 1);
                 self.output.push_str(&comment.text);
                 self.output.push('\n');
+                self.prev_end = Some(comment.end_byte);
             }
         }
     }
@@ -383,9 +423,11 @@ impl Formatter<'_> {
         };
         for comment in comments {
             if !comment.is_trailing && comment.start_byte > last.end_byte() {
+                self.separate_from_previous(comment.start_byte);
                 self.indent(level + 1);
                 self.output.push_str(&comment.text);
                 self.output.push('\n');
+                self.prev_end = Some(comment.end_byte);
             }
         }
     }
@@ -645,6 +687,29 @@ User(
         let expected = "Point(\n    // first\n    1, // one\n    2,\n)";
         assert_eq!(format_ron("Point(// first\n1, // one\n2)"), expected);
         assert_eq!(format_ron(expected), expected);
+    }
+
+    /// Config files group their fields with blank lines, and the formatter
+    /// used to delete every one of them: with format-on-save, a file's
+    /// sections ran together on the first save. A blank line between two
+    /// items, or between an item and a comment above the next one, is kept;
+    /// a run of them is collapsed to one, and one just inside a delimiter is
+    /// dropped.
+    #[test]
+    fn test_blank_lines_between_items_are_kept() {
+        let input = "// header\n\n\nAppConfig(\n\n    debug: true, // why\n\n\n    // network\n    port: 8080,\n\n    server: ServerConfig(\n        host: \"localhost\",\n\n        mode: Production,\n\n    ),\n    features: [\n        \"a\",\n\n        \"b\",\n    ],\n)\n";
+        let expected = "// header\n\nAppConfig(\n    debug: true, // why\n\n    // network\n    port: 8080,\n\n    server: ServerConfig(\n        host: \"localhost\",\n\n        mode: Production,\n    ),\n    features: [\n        \"a\",\n\n        \"b\",\n    ],\n)";
+        assert_eq!(format_ron(input), expected);
+        assert_eq!(format_ron(expected), expected);
+    }
+
+    /// A block comment spanning several lines has no blank line in it, so it
+    /// doesn't add one; nor does a comment directly above its item.
+    #[test]
+    fn test_multiline_block_comment_is_not_a_blank_line() {
+        let input =
+            "Config(\n    a: 1, /* first\n    second */\n    b: 2,\n    // about c\n    c: 3,\n)";
+        assert_eq!(format_ron(input), input);
     }
 
     #[test]

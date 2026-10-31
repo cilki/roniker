@@ -317,7 +317,10 @@ trailing comma after each, `: ` after every field name, and `()`, `[]` and `{}`
 kept closed up when they're empty. A tuple struct holding a single value stays
 on one line (`max_connections: Some(16)`). Comments keep their place — above the
 field they describe, or on the same line as it, or at the top of the file — and
-laying out a document that is already in this shape changes nothing.
+so do the blank lines that group fields into sections: a blank line between two
+items (or between the header comment and the root value) stays, a run of them
+becomes one, and one just inside an opening or closing delimiter is dropped.
+Laying out a document that is already in this shape changes nothing.
 
 Two things are not laid out again but **deleted**, which is why the Helix
 snippet's `auto-format = true` is worth a second thought if your config files
