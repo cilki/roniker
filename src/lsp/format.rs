@@ -188,6 +188,7 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
         content,
         newline,
         output: String::new(),
+        malformed: false,
     };
 
     for comment in collect_top_level_comments(&tree.root_node(), content, &main_value) {
@@ -195,6 +196,13 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
         formatter.output.push_str(newline);
     }
     formatter.node(&main_value, 0);
+
+    // The grammar accepts a few things RON doesn't, without an ERROR node to
+    // show for it; the layout notices them on the way and they are left alone
+    // for the same reason a syntax error is.
+    if formatter.malformed {
+        return content.to_string();
+    }
 
     formatter.output.trim_end().to_string()
 }
@@ -210,6 +218,9 @@ struct Formatter<'a> {
     /// What every line written ends with: the document's own line terminator.
     newline: &'static str,
     output: String,
+    /// Set when the tree holds something RON can't parse that tree-sitter
+    /// accepted anyway, and that the layout would lose part of.
+    malformed: bool,
 }
 
 impl Formatter<'_> {
@@ -290,12 +301,22 @@ impl Formatter<'_> {
         // `Point(1, 2)`, `Some("value")`. Both are containers and lay out as
         // one, bar the single exception below.
         let fields = ts_utils::struct_fields(node);
+        let values = self.struct_values(node);
+
+        // The grammar lets the two styles mix — `Config(port: 1, debug)` parses
+        // as a struct with one field and one value, with no ERROR node — but
+        // RON doesn't, and laying out only the fields deleted the bare value.
+        // That is a field whose name has been typed and its colon not yet,
+        // exactly what format-on-save meets mid-edit.
+        if !fields.is_empty() && !values.is_empty() {
+            self.malformed = true;
+            return;
+        }
+
         if !fields.is_empty() {
             self.container(node, level, ('(', ')'), &fields);
             return;
         }
-
-        let values = self.struct_values(node);
 
         // A tuple-style struct holding one value keeps that value on the
         // struct's own line: `Some([` rather than `Some(\n    [`. The value
@@ -756,6 +777,23 @@ Post(
             "AppConfig(\n    server: ServerConfig(timeout: ),\n)\n",
             "AppConfig(\n    port: 1,\n    host: \n)\n",
             "Config(port: 8080\n",
+        ] {
+            assert_eq!(format_ron(input), input);
+        }
+    }
+
+    /// A field name typed without its colon yet — `debug` among `name: value`
+    /// fields — isn't RON, but the grammar takes it as a tuple-style value in
+    /// a field-style struct and reports no error. Laying out only the fields
+    /// deleted it, so format-on-save threw away what was being typed. It is
+    /// left alone like any other document that doesn't parse.
+    #[test]
+    fn test_struct_mixing_fields_and_values_is_left_alone() {
+        for input in [
+            "AppConfig(\n    port: 1,\n    debug\n)\n",
+            "AppConfig(\n    debug,\n    port: 1,\n)\n",
+            "AppConfig(\n    server: ServerConfig(host: \"h\", mode),\n)\n",
+            "(port: 1, true)\n",
         ] {
             assert_eq!(format_ron(input), input);
         }
