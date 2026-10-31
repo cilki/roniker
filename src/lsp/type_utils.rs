@@ -131,6 +131,26 @@ pub fn tuple_element_types(clean: &str) -> Option<Vec<&str>> {
     }
 }
 
+/// Standard-library maps, which RON writes as `{key: value, ...}`.
+pub const MAP_WRAPPERS: [&str; 2] = ["HashMap<", "BTreeMap<"];
+
+/// The declared key and value types of a map, when `clean` — an
+/// already-normalized type name — is one of the [`MAP_WRAPPERS`]: `("String",
+/// "Listener")` for `HashMap<String,Listener>`.
+///
+/// `None` for anything else, including a map whose arguments don't split into
+/// exactly a key and a value (a `HashMap<K, V, S>` with a custom hasher keeps
+/// its first two).
+pub fn map_entry_types(clean: &str) -> Option<(&str, &str)> {
+    let inner = MAP_WRAPPERS
+        .iter()
+        .find_map(|wrapper| extract_inner_type(clean, wrapper))?;
+    match split_top_level(inner).as_slice() {
+        [key, value, ..] if !key.is_empty() && !value.is_empty() => Some((key, value)),
+        _ => None,
+    }
+}
+
 /// Split a comma-separated list of type names, leaving alone the commas nested
 /// inside a generic argument list, a tuple or an array — `(Vec<(u8, u8)>, u16)`
 /// has two elements, not four.
@@ -509,6 +529,26 @@ mod tests {
         // Nor one too long to be worth enumerating.
         assert_eq!(tuple_element_types("[u8;257]"), None);
         assert_eq!(tuple_element_types("[u8;256]").map(|e| e.len()), Some(256));
+    }
+
+    #[test]
+    fn test_map_entry_types() {
+        assert_eq!(
+            map_entry_types("HashMap<String,Listener>"),
+            Some(("String", "Listener"))
+        );
+        assert_eq!(
+            map_entry_types("BTreeMap<u8,Vec<(u8,u8)>>"),
+            Some(("u8", "Vec<(u8,u8)>"))
+        );
+        // A custom hasher is not part of what the document writes.
+        assert_eq!(
+            map_entry_types("HashMap<String,u8,RandomState>"),
+            Some(("String", "u8"))
+        );
+        assert_eq!(map_entry_types("HashSet<String>"), None);
+        assert_eq!(map_entry_types("Vec<u8>"), None);
+        assert_eq!(map_entry_types("MyHashMap<String,u8>"), None);
     }
 
     #[test]

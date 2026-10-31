@@ -1,6 +1,7 @@
 use super::type_utils::{
     SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type, is_custom_type,
-    is_primitive_type, missing_required_fields, normalize_type, short_name, tuple_element_types,
+    is_primitive_type, map_entry_types, missing_required_fields, normalize_type, short_name,
+    tuple_element_types,
 };
 use crate::rust_analyzer::{
     FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -602,6 +603,21 @@ fn validate_nested_value<'a>(
         {
             settled = true;
             diagnostics.extend(found);
+        }
+    } else if let Some((key_type, entry_type)) = map_entry_types(&field_type_normalized) {
+        // A `HashMap`/`BTreeMap` written as a map: every key and every value is
+        // checked against the type the map declares for it, exactly the way a
+        // `Vec`'s elements are above, and reported where it is written. The
+        // surface check only ever asks whether the value is a map at all, so
+        // without this a `{"main": Listener(prt: 80)}` passed silently and
+        // then failed to load. Anything that isn't written as a map is left to
+        // that surface check, which says so.
+        if value_node.kind() == "map" {
+            for (key, value) in super::ts_utils::map_entries(value_node) {
+                diagnostics.extend(validate_typed_value(&key, content, key_type, analyzer));
+                diagnostics.extend(validate_typed_value(&value, content, entry_type, analyzer));
+            }
+            settled = true;
         }
     } else if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
         // A plain struct/enum the workspace defines — validate the node
@@ -3413,6 +3429,99 @@ mod tests {
                 content,
                 diagnostics
             );
+        }
+    }
+
+    /// The keys and values of a `HashMap`/`BTreeMap` field are checked against
+    /// the types the map declares, each where it is written. They used to be
+    /// waved through by the surface check, which only asks whether the value
+    /// is a map: a misspelled field inside a map value, or a string where the
+    /// map holds integers, raised nothing in the editor and then failed to load.
+    #[test]
+    fn test_map_entries_are_checked_against_the_declared_types() {
+        let listener = TypeInfo {
+            name: "Listener".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "listeners".to_string(),
+                    type_name: "std::collections::HashMap<String, Listener>".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "limits".to_string(),
+                    type_name: "BTreeMap<u8, u16>".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(listener);
+        let analyzer = Arc::new(analyzer);
+        let errors = |content: &str| -> Vec<(String, u32)> {
+            validate_ron_with_analyzer(content, None, &root, analyzer.clone())
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| (d.message, d.range.start.line))
+                .collect()
+        };
+
+        // A named and an unnamed struct value alike are validated as the
+        // map's value type: unknown fields, missing ones, and their values.
+        let found = errors(
+            "Config(\n    listeners: {\n        \"a\": Listener(prt: 1),\n        \"b\": (port: \"x\"),\n    },\n)",
+        );
+        assert!(
+            found.iter().any(|(m, line)| m.contains("Unknown field 'prt'") && *line == 2),
+            "Got: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(m, line)| m.contains("Required fields: port") && *line == 2),
+            "Got: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(m, line)| m.contains("expected u16, got string") && *line == 3),
+            "Got: {found:?}"
+        );
+
+        // Primitive keys and values are checked too.
+        let found = errors("Config(limits: {1: 2, \"x\": 3, 4: 70000})");
+        assert!(
+            found.iter().any(|(m, _)| m.contains("expected u8, got string")),
+            "Got: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(m, _)| m.contains("70000 is out of range for u16")),
+            "Got: {found:?}"
+        );
+
+        // A value that isn't a map at all is still the surface check's to
+        // report...
+        let found = errors("Config(limits: [1])");
+        assert!(
+            found.iter().any(|(m, _)| m.contains("expected BTreeMap<u8,u16>, got array")),
+            "Got: {found:?}"
+        );
+
+        // ...and well-typed maps, empty or not, raise nothing.
+        for content in [
+            "Config(listeners: {}, limits: {})",
+            "Config(listeners: {\"a\": Listener(port: 1), \"b\": (port: 2)}, limits: {1: 2})",
+        ] {
+            assert_eq!(errors(content), Vec::new(), "{content}");
         }
     }
 

@@ -754,6 +754,27 @@ pub fn array_elements<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
         .collect()
 }
 
+/// The `(key, value)` nodes of each entry of a `map` node, with punctuation and
+/// comments left out. An entry missing either half — an unfinished `{"a": }` —
+/// is left out too. Empty for any other node kind.
+pub fn map_entries<'a>(node: &Node<'a>) -> Vec<(Node<'a>, Node<'a>)> {
+    if node.kind() != "map" {
+        return Vec::new();
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "map_entry")
+        .filter_map(|entry| {
+            let mut cursor = entry.walk();
+            let mut halves = entry
+                .named_children(&mut cursor)
+                .filter(|child| !is_comment(child) && !child.is_missing());
+            Some((halves.next()?, halves.next()?))
+        })
+        .collect()
+}
+
 /// The element values of a `tuple` node — `("a", 2)`, which is how RON writes
 /// both a Rust tuple and a fixed-size array — with punctuation and comments
 /// left out. Empty for any other node kind.
