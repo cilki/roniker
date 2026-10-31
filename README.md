@@ -332,8 +332,9 @@ hold either:
 
 Both are [#103](https://git.cilki.net/cilki/roniker/issues/103).
 
-A document that doesn't parse — a half-typed `timeout: `, an unclosed
-parenthesis, or one that is still only a comment — is left exactly as it is, so
+A document that doesn't parse — a half-typed `timeout: `, a field name whose
+colon isn't typed yet, an unclosed parenthesis, or one that is still only a
+comment — is left exactly as it is, so
 formatting on save never rewrites a file you are in the middle of editing. Note
 that this includes an empty struct written with space inside it, `( )`: the
 grammar only knows `()`, so a document holding one is not formatted.
