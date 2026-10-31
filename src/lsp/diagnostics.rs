@@ -502,36 +502,28 @@ fn validate_nested_value<'a>(
         ..Default::default()
     };
 
+    // A wrapper around a custom type the analyzer never registered is reported
+    // once, at the value as a whole, rather than once per element it holds.
+    let unregistered =
+        |inner: &str| is_custom_type(inner) && analyzer.get_type_info(inner).is_none();
+
     if let Some(inner_type) = SEQUENCE_WRAPPERS
         .iter()
         .find_map(|wrapper| extract_inner_type(&field_type_normalized, wrapper))
     {
-        // Vec<CustomType> — every element is validated against the inner type
-        // exactly the way a field's value is validated against the field's
+        // A `Vec<T>` written as an array: every element is validated against
+        // `T` exactly the way a field's value is validated against the field's
         // type, so an element of the wrong shape is reported where it is
-        // written rather than at the array as a whole. Having been through the
-        // array, we also know it is one, which is all the surface check in
-        // [`validate_typed_value`] still wants from it.
+        // written rather than at the array as a whole — and an element that is
+        // itself a wrapper, a map or a struct is recursed into in turn. Having
+        // been through the array, we also know it is one, which is all the
+        // surface check in [`validate_typed_value`] still wants from it.
         //
-        // A `Vec` of primitives is left to that check instead: its elements
-        // carry no fields to recurse into, and deserializing them together
-        // costs less than visiting them one at a time.
-        if is_custom_type(inner_type) {
-            if analyzer.get_type_info(inner_type).is_none() {
-                diagnostics.push(unknown_type_diag(inner_type));
-            } else if value_node.kind() == "array" {
-                for element in super::ts_utils::array_elements(value_node) {
-                    diagnostics.extend(validate_typed_value(
-                        &element, content, inner_type, analyzer,
-                    ));
-                }
-                settled = true;
-            }
-        } else if tuple_element_types(inner_type).is_some() && value_node.kind() == "array" {
-            // A `Vec` of tuples or fixed-size arrays. Those carry no fields,
-            // but they do carry a fixed shape, and checking it needs the parse
-            // tree for the reason given at the tuple branch below — so the
-            // elements are visited one at a time here too.
+        // An array of plain literals that all fit never gets here: the tree
+        // check in [`validate_typed_value`] has already settled it.
+        if unregistered(inner_type) {
+            diagnostics.push(unknown_type_diag(inner_type));
+        } else if value_node.kind() == "array" {
             for element in super::ts_utils::array_elements(value_node) {
                 diagnostics.extend(validate_typed_value(
                     &element, content, inner_type, analyzer,
@@ -543,56 +535,34 @@ fn validate_nested_value<'a>(
         .chain(TRANSPARENT_WRAPPERS.iter())
         .find_map(|w| extract_inner_type(&field_type_normalized, w))
     {
-        // Single-element wrapper — check the inner type is known
-        if is_custom_type(inner_type) {
-            if analyzer.get_type_info(inner_type).is_some() {
-                // An `Option` field is usually written `Some(value)`. Validate
-                // the wrapped value rather than the `Some` wrapper, or the
-                // inner type's own fields go unchecked.
-                //
-                // What is inside an explicit `Some(..)` is checked against the
-                // inner type exactly the way a field's value is checked
-                // against the field's type — the same way a `Vec`'s elements
-                // are above — so a wrapped value of the wrong shape is
-                // reported where it is written and against the type that was
-                // actually expected there. Having been through it, the surface
-                // check in [`validate_typed_value`] has nothing left to add.
-                //
-                // A bare value written for the `Option`, which RON accepts
-                // under `implicit_some`, is the inner type's own value with no
-                // wrapper to see through, and is checked against the inner
-                // type the same way. Leaving it to the surface check instead
-                // read it against the wrapper, where `ron` parses a unit
-                // variant such as `Fast` into `()` and a correct value came
-                // back as `expected Mode, got ()`.
-                //
-                // An `Option`'s `None` is the one spelling with nothing wrapped
-                // to look at.
-                let is_none = field_type_normalized.starts_with("Option<")
-                    && super::ts_utils::node_text(value_node, content) == Some("None");
-                settled = true;
-                if !is_none {
-                    let inner =
-                        super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
-                    diagnostics.extend(validate_typed_value(&inner, content, inner_type, analyzer));
-                }
-            } else {
-                diagnostics.push(unknown_type_diag(inner_type));
+        // A single-element wrapper. An `Option` field is usually written
+        // `Some(value)`, and what is inside is checked against the inner type
+        // exactly the way a field's value is checked against the field's type
+        // — the same way a `Vec`'s elements are above — so a wrapped value of
+        // the wrong shape is reported where it is written and against the type
+        // that was actually expected there.
+        //
+        // A bare value written for the `Option`, which RON accepts under
+        // `implicit_some`, and the value written for a `Box`/`Rc`/... are the
+        // inner type's own value with no wrapper to see through, and are
+        // checked against the inner type the same way. Leaving one to the
+        // surface check instead read it against the wrapper, where `ron` parses
+        // a unit variant such as `Fast` into `()` and a correct value came back
+        // as `expected Mode, got ()`.
+        //
+        // An `Option`'s `None` is the one spelling with nothing wrapped to look
+        // at.
+        if unregistered(inner_type) {
+            diagnostics.push(unknown_type_diag(inner_type));
+        } else {
+            let is_none = field_type_normalized.starts_with("Option<")
+                && super::ts_utils::node_text(value_node, content) == Some("None");
+            if !is_none {
+                let inner =
+                    super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
+                diagnostics.extend(validate_typed_value(&inner, content, inner_type, analyzer));
             }
-        } else if tuple_element_types(inner_type).is_some() {
-            // A wrapper around a tuple or a fixed-size array. Those carry a
-            // fixed shape rather than fields, and checking it needs the parse
-            // tree for the reason given at [`validate_tuple_value`], so the
-            // wrapped value is visited here too. `None` is the one spelling
-            // with nothing wrapped to look at, and the surface check reads it
-            // against the wrapper as before.
-            let wrapped = super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
-            if wrapped.kind() != "identifier" {
-                settled = true;
-                diagnostics.extend(validate_typed_value(
-                    &wrapped, content, inner_type, analyzer,
-                ));
-            }
+            settled = true;
         }
     } else if let Some(element_types) = tuple_element_types(&field_type_normalized) {
         // A tuple or a fixed-size array, which RON writes the same way: a
@@ -637,13 +607,7 @@ fn validate_nested_value<'a>(
         // standard-library type is not one of these: it is absent from the
         // analyzer because it is not defined in the workspace the analyzer
         // read, which says nothing about the build script.
-        diagnostics.push(Diagnostic {
-            range: super::ts_utils::node_to_lsp_range(value_node, content),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("Unknown type '{}'", field_type_normalized),
-            code: code(codes::UNKNOWN_TYPE),
-            ..Default::default()
-        });
+        diagnostics.push(unknown_type_diag(&field_type_normalized));
     }
 
     Nested {
@@ -2345,8 +2309,8 @@ mod tests {
         for (type_name, literal, expected) in [
             // A wrapper the tree can see through still gets its contents
             // checked, element by element and layer by layer.
-            ("Vec<String>", r#"["a", 1]"#, "in Vec: expected String, got"),
-            ("Vec<u16>", r#"[1, "x"]"#, "in Vec: expected u16, got string"),
+            ("Vec<String>", r#"["a", 1]"#, "expected String, got"),
+            ("Vec<u16>", r#"[1, "x"]"#, "expected u16, got string"),
             ("Option<String>", "Some(1)", "expected String, got"),
             ("Option<bool>", "Some(\"x\")", "expected bool, got string"),
             ("Box<u8>", "\"x\"", "expected u8, got string"),
@@ -3181,7 +3145,7 @@ mod tests {
             vec![
                 (
                     code(codes::TYPE_MISMATCH),
-                    "Type mismatch: in Vec: expected String, got number".to_string()
+                    "Type mismatch: expected String, got number".to_string()
                 ),
                 (
                     code(codes::TYPE_MISMATCH),
@@ -3428,6 +3392,79 @@ mod tests {
                 "'{}' is valid and should raise nothing. Got: {:?}",
                 content,
                 diagnostics
+            );
+        }
+    }
+
+    /// A wrapper is seen through however deeply it nests: the struct at the
+    /// bottom of an `Option<Vec<T>>`, a `Vec<Option<T>>`, a `Vec<Vec<T>>`, a
+    /// `Vec<HashMap<K, T>>` or a `Box<Option<T>>` is checked field by field like
+    /// any other. Only a wrapper directly around a custom type used to be
+    /// recursed into, so every one of these misspelled fields passed silently
+    /// and then failed to load.
+    #[test]
+    fn test_nested_wrappers_are_seen_through_to_the_struct_inside() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Listener".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+        let errors = |type_name: &str, value: &str| -> Vec<String> {
+            let root = TypeInfo {
+                name: "Config".to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "x".to_string(),
+                    type_name: type_name.to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            validate_ron_with_analyzer(
+                &format!("Config(x: {value})"),
+                None,
+                &root,
+                analyzer.clone(),
+            )
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect()
+        };
+
+        for (type_name, bad, good) in [
+            (
+                "Option<Vec<Listener>>",
+                "Some([(prt: 1)])",
+                "Some([(port: 1)])",
+            ),
+            (
+                "Vec<Option<Listener>>",
+                "[Some((prt: 1))]",
+                "[Some((port: 1)), None]",
+            ),
+            ("Vec<Vec<Listener>>", "[[(prt: 1)]]", "[[(port: 1)], []]"),
+            (
+                "Vec<HashMap<String,Listener>>",
+                r#"[{"a": (prt: 1)}]"#,
+                r#"[{"a": (port: 1)}]"#,
+            ),
+            ("Box<Option<Listener>>", "Some((prt: 1))", "Some((port: 1))"),
+        ] {
+            let found = errors(type_name, bad);
+            assert!(
+                found.iter().any(|m| m.contains("Unknown field 'prt'")),
+                "{bad} for {type_name} should report the misspelled field, got {found:?}"
+            );
+            assert_eq!(
+                errors(type_name, good),
+                Vec::<String>::new(),
+                "{good} for {type_name}"
             );
         }
     }
