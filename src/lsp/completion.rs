@@ -1,7 +1,8 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
-    SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, normalize_type, short_name,
-    std_type, strip_outer_generic, tuple_element_types,
+    MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type,
+    is_number_type, is_wrapped_by, normalize_type, short_name, std_type, strip_outer_generic,
+    tuple_element_types,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
@@ -521,17 +522,15 @@ fn generate_value_completions_by_type(
             // whose length is a const generic. Still a tuple in RON.
             None => snippet_item("(...)", format!("{field_type} as a tuple"), "($0)"),
         }]
-    } else if SEQUENCE_WRAPPERS
-        .iter()
-        .chain(["HashSet<", "BTreeSet<"].iter())
-        .any(|prefix| clean_type.starts_with(prefix))
+    } else if is_wrapped_by(&clean_type, &SEQUENCE_WRAPPERS)
+        || is_wrapped_by(&clean_type, &SET_WRAPPERS)
     {
         // A set is written as a sequence too, so it takes the same values.
         vec![
             value_item("[]", "Empty vector/array", "[]"),
             snippet_item("[...]", "Vector/array with elements", "[$0]"),
         ]
-    } else if clean_type.starts_with("HashMap<") || clean_type.starts_with("BTreeMap<") {
+    } else if is_wrapped_by(&clean_type, &MAP_WRAPPERS) {
         vec![
             value_item("{}", "Empty map", "{}"),
             snippet_item("{...}", "Map with entries", "{$0}"),
@@ -574,11 +573,7 @@ fn generate_value_completions_by_type(
         // written as the string it borrows. Leaving it out sent those fields to
         // the "every type in the workspace" fallback.
         vec![snippet_item("\"\"", "String value", "\"$0\"")]
-    } else if clean_type.starts_with("i")
-        || clean_type.starts_with("u")
-        || clean_type.starts_with("f")
-    {
-        // Numeric types (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64)
+    } else if is_number_type(&clean_type) {
         vec![value_item("0", format!("{field_type} value"), "0")]
     } else {
         Vec::new()

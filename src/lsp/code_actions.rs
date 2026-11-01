@@ -793,43 +793,34 @@ fn generate_default_value(type_name: &str, analyzer: &RustAnalyzer) -> String {
 }
 
 fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth: usize) -> String {
+    use super::type_utils::{
+        MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, is_number_type, is_wrapped_by,
+    };
+
     let clean = super::type_utils::normalize_type(type_name);
 
-    if clean.starts_with("Option") {
-        return "None".to_string();
-    }
-    if clean == "bool" {
-        return "false".to_string();
-    }
-    // A set serializes as a sequence, the same as a `Vec`. A fixed-size array
-    // does not, despite the brackets in its name: see the tuple branch below.
-    if [
-        "Vec",
-        "VecDeque",
-        "LinkedList",
-        "BinaryHeap",
-        "HashSet",
-        "BTreeSet",
-    ]
-    .iter()
-    .any(|prefix| clean.starts_with(prefix))
-    {
-        return "[]".to_string();
-    }
-    if clean.starts_with("HashMap") || clean.starts_with("BTreeMap") {
-        return "{}".to_string();
-    }
-    if clean == "String" || clean == "&str" || clean == "str" {
-        return "\"\"".to_string();
-    }
-    if clean == "char" {
+    // Matched by the wrapper with its `<`, so a workspace type that merely
+    // starts the same way — an `Options` struct, a `Vector3` — keeps its own
+    // constructor instead of being handed `None` or `[]`.
+    let literal = match clean.as_ref() {
+        _ if clean.starts_with("Option<") => Some("None"),
+        // A set serializes as a sequence, the same as a `Vec`. A fixed-size
+        // array does not, despite the brackets in its name: see the tuple
+        // branch below.
+        _ if is_wrapped_by(&clean, &SEQUENCE_WRAPPERS) || is_wrapped_by(&clean, &SET_WRAPPERS) => {
+            Some("[]")
+        }
+        _ if is_wrapped_by(&clean, &MAP_WRAPPERS) => Some("{}"),
+        "bool" => Some("false"),
+        "String" | "&str" | "str" => Some("\"\""),
         // A `char` is a quoted character, and the one thing it is not is
         // `char()` — which is what the opaque fallback below used to insert.
-        return "'a'".to_string();
-    }
-    if is_numeric_type(&clean) {
-        // Numeric types default to zero
-        return "0".to_string();
+        "char" => Some("'a'"),
+        _ if is_number_type(&clean) => Some("0"),
+        _ => None,
+    };
+    if let Some(literal) = literal {
+        return literal.to_string();
     }
     // RON writes a tuple and a fixed-size array alike as a parenthesized list
     // of exactly as many values as the type declares, each filled in from the
@@ -924,26 +915,6 @@ fn positional_elements(
             .map(|field| generate_default_value_depth(&field.type_name, analyzer, depth - 1))
             .collect::<Vec<_>>()
             .join(", "),
-    )
-}
-
-/// Whether a cleaned type name is a Rust numeric primitive.
-fn is_numeric_type(clean: &str) -> bool {
-    matches!(
-        clean,
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "f32"
-            | "f64"
     )
 }
 
@@ -1343,6 +1314,27 @@ mod tests {
             generate_default_value("Duration", &RustAnalyzer::new()),
             "(secs: 0, nanos: 0)"
         );
+    }
+
+    /// A workspace type whose name only *begins* like a standard-library
+    /// generic is not that generic. Matching the bare prefix used to fill a
+    /// required `Options` field in as `None`, a `Vector3` as `[]` and a
+    /// `HashMapping` as `{}` — none of which `ron` reads as those structs.
+    #[test]
+    fn test_generate_default_value_for_lookalike_type_names() {
+        let mut analyzer = RustAnalyzer::new();
+        for name in ["Options", "Vector3", "HashMapping", "BTreeSetup"] {
+            analyzer.add_type(TypeInfo {
+                name: name.to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "x".to_string(),
+                    type_name: "u8".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            assert_eq!(generate_default_value(name, &analyzer), format!("{name}()"));
+        }
     }
 
     /// The one "make ... explicit" action, among those offered for `content`

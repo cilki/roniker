@@ -71,6 +71,38 @@ pub const TRANSPARENT_WRAPPERS: [&str; 8] = [
 /// a whole rather than element by element, so they are not in this list.
 pub const SEQUENCE_WRAPPERS: [&str; 4] = ["Vec<", "VecDeque<", "LinkedList<", "BinaryHeap<"];
 
+/// Standard-library sets, which RON writes as an array exactly like the
+/// [`SEQUENCE_WRAPPERS`].
+pub const SET_WRAPPERS: [&str; 2] = ["HashSet<", "BTreeSet<"];
+
+/// Whether an already-normalized type name starts with one of `wrappers` —
+/// i.e. is that standard-library generic, rather than a user-defined type
+/// whose name merely begins the same way (`Options`, `Vector3`).
+pub fn is_wrapped_by(clean: &str, wrappers: &[&str]) -> bool {
+    wrappers.iter().any(|wrapper| clean.starts_with(wrapper))
+}
+
+/// Whether an already-normalized type name is one of Rust's numeric
+/// primitives, which RON writes as a bare number literal.
+pub fn is_number_type(clean: &str) -> bool {
+    matches!(
+        clean,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
+}
+
 /// Check if a type is a user-defined struct or enum — i.e. something the
 /// analyzer should resolve and validate against. A thin wrapper over
 /// [`crate::rust_analyzer::is_custom_type`], which spells out what that
