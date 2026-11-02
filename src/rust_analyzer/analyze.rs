@@ -7,7 +7,7 @@ use super::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Component, Path};
-use syn::{Fields, Item, ItemEnum, ItemStruct, ItemType};
+use syn::{Attribute, Fields, Item};
 
 impl RustAnalyzer {
     /// Add a Rust source file to the analyzer.
@@ -53,12 +53,8 @@ impl RustAnalyzer {
         let syntax_tree = syn::parse_file(source).with_context(|| {
             format!("Failed to parse Rust source from: {}", file_path.display())
         })?;
-
-        let initial_count = self.type_cache.len();
-        self.extract_types_from_file(&syntax_tree, file_path);
-        let types_added = self.type_cache.len() - initial_count;
-
-        Ok(types_added)
+        let module_prefix = file_path_to_module_path(file_path);
+        Ok(self.add_items(&syntax_tree.items, &module_prefix, Some(file_path)))
     }
 
     /// Add Rust source code with a custom module prefix.
@@ -75,26 +71,20 @@ impl RustAnalyzer {
     /// * `Err` - If the source cannot be parsed
     pub fn add_source_with_prefix(&mut self, module_prefix: &str, source: &str) -> Result<usize> {
         let syntax_tree = syn::parse_file(source).context("Failed to parse Rust source")?;
-
-        let initial_count = self.type_cache.len();
-        self.extract_types_from_syntax_tree(&syntax_tree, module_prefix, None);
-        let types_added = self.type_cache.len() - initial_count;
-
-        Ok(types_added)
+        Ok(self.add_items(&syntax_tree.items, module_prefix, None))
     }
 
-    fn extract_types_from_file(&mut self, syntax_tree: &syn::File, file_path: &Path) {
-        let module_prefix = self.file_path_to_module_path(file_path);
-        self.extract_types_from_syntax_tree(syntax_tree, &module_prefix, Some(file_path));
-    }
-
-    fn extract_types_from_syntax_tree(
+    /// Register the types defined by `items`, returning how many the cache
+    /// grew by.
+    fn add_items(
         &mut self,
-        syntax_tree: &syn::File,
+        items: &[Item],
         module_prefix: &str,
         file_path: Option<&Path>,
-    ) {
-        self.extract_types_from_items(&syntax_tree.items, module_prefix, file_path);
+    ) -> usize {
+        let initial_count = self.type_cache.len();
+        self.extract_types_from_items(items, module_prefix, file_path);
+        self.type_cache.len() - initial_count
     }
 
     /// Extract type definitions from a list of items, recursing into inline
@@ -108,32 +98,30 @@ impl RustAnalyzer {
     ) {
         for item in items {
             match item {
-                Item::Struct(struct_item) => {
-                    if let Some(type_info) =
-                        self.extract_struct_info(struct_item, module_prefix, file_path)
-                    {
-                        self.add_type(type_info);
-                    }
+                Item::Struct(item) => self.add_type(type_info(
+                    &item.ident,
+                    &item.attrs,
+                    TypeKind::Struct(extract_fields(&item.fields)),
+                    module_prefix,
+                    file_path,
+                )),
+                Item::Enum(item) => self.add_type(type_info(
+                    &item.ident,
+                    &item.attrs,
+                    TypeKind::Enum(item.variants.iter().map(extract_variant).collect()),
+                    module_prefix,
+                    file_path,
+                )),
+                Item::Type(item) => {
+                    self.type_aliases.insert(
+                        qualified_name(module_prefix, &item.ident.to_string()),
+                        type_to_string(&item.ty),
+                    );
                 }
-                Item::Enum(enum_item) => {
-                    if let Some(type_info) =
-                        self.extract_enum_info(enum_item, module_prefix, file_path)
-                    {
-                        self.add_type(type_info);
-                    }
-                }
-                Item::Type(type_item) => {
-                    self.extract_type_alias(type_item, module_prefix);
-                }
-                Item::Mod(mod_item) => {
-                    // Recurse into inline modules, extending the module path.
-                    if let Some((_, items)) = &mod_item.content {
-                        let mod_name = mod_item.ident.to_string();
-                        let nested_prefix = if module_prefix.is_empty() {
-                            mod_name
-                        } else {
-                            format!("{}::{}", module_prefix, mod_name)
-                        };
+                // Recurse into inline modules, extending the module path.
+                Item::Mod(item) => {
+                    if let Some((_, items)) = &item.content {
+                        let nested_prefix = qualified_name(module_prefix, &item.ident.to_string());
                         self.extract_types_from_items(items, &nested_prefix, file_path);
                     }
                 }
@@ -141,147 +129,76 @@ impl RustAnalyzer {
             }
         }
     }
+}
 
-    /// Convert a file path to a module path
-    ///
-    /// Example: `"src/models/user.rs"` -> `"crate::models::user"`
-    fn file_path_to_module_path(&self, file_path: &Path) -> String {
-        let components: Vec<_> = file_path
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(os) => os.to_str(),
-                _ => None,
-            })
-            .collect();
+/// Convert a file path to a module path
+///
+/// Example: `"src/models/user.rs"` -> `"crate::models::user"`
+fn file_path_to_module_path(file_path: &Path) -> String {
+    let components: Vec<&str> = file_path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => os.to_str(),
+            _ => None,
+        })
+        .collect();
 
-        if let Some(src_index) = components.iter().position(|c| *c == "src") {
-            let relative = &components[src_index + 1..];
-            if relative.is_empty() {
-                return "crate".to_string();
-            }
+    let Some(src_index) = components.iter().position(|c| *c == "src") else {
+        return String::new();
+    };
 
-            let mut parts = relative.to_vec();
-            if let Some(last) = parts.last_mut() {
-                if last.ends_with(".rs") {
-                    let stem = last.trim_end_matches(".rs");
-                    *last = stem;
-                }
-                if *last == "lib" || *last == "main" {
-                    parts.pop();
-                    if parts.is_empty() {
-                        return "crate".to_string();
-                    }
-                } else if *last == "mod" {
-                    parts.pop();
-                }
-            }
-
-            if parts.is_empty() {
-                "crate".to_string()
-            } else {
-                format!("crate::{}", parts.join("::"))
-            }
-        } else {
-            String::new()
+    let mut parts = components[src_index + 1..].to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = last.strip_suffix(".rs").unwrap_or(last);
+        if matches!(*last, "lib" | "main" | "mod") {
+            parts.pop();
         }
     }
 
-    fn extract_struct_info(
-        &self,
-        struct_item: &ItemStruct,
-        module_prefix: &str,
-        file_path: Option<&Path>,
-    ) -> Option<TypeInfo> {
-        let struct_name = struct_item.ident.to_string();
-        let full_path = qualified_name(module_prefix, &struct_name);
+    std::iter::once("crate")
+        .chain(parts)
+        .collect::<Vec<_>>()
+        .join("::")
+}
 
-        let docs = extract_docs(&struct_item.attrs);
-        let fields = extract_fields(&struct_item.fields);
-
-        let start = struct_item.ident.span().start();
-        let line = Some(start.line);
-        let column = Some(start.column);
-        let serde_attrs = serde_attributes::extract_serde_attributes(&struct_item.attrs);
+/// The [`TypeInfo`] for a struct or enum named `ident`, declared with `attrs`.
+fn type_info(
+    ident: &syn::Ident,
+    attrs: &[Attribute],
+    kind: TypeKind,
+    module_prefix: &str,
+    file_path: Option<&Path>,
+) -> TypeInfo {
+    let start = ident.span().start();
+    let serde_attrs = serde_attributes::extract_serde_attributes(attrs);
+    TypeInfo {
+        name: qualified_name(module_prefix, &ident.to_string()),
+        kind,
+        docs: extract_docs(attrs),
+        source_file: file_path.map(Path::to_path_buf),
+        line: Some(start.line),
+        column: Some(start.column),
         // Only a container `#[serde(default)]` makes the fields optional. A bare
         // `#[derive(Default)]` says nothing about deserialization: serde still
         // demands every field that has no default of its own, so counting the
         // derive here would suppress the missing-field diagnostic on exactly the
         // structs that need it most (`#[derive(Default, Deserialize)]` being the
-        // usual shape of a config type).
-        let has_default = serde_attrs.has_default;
-        let rename_all = serde_attrs.rename_all;
-
-        Some(TypeInfo {
-            name: full_path,
-            kind: TypeKind::Struct(fields),
-            docs,
-            source_file: file_path.map(|p| p.to_path_buf()),
-            line,
-            column,
-            has_default,
-            rename_all,
-        })
+        // usual shape of a config type). Serde rejects the attribute on an enum,
+        // so for one this is always false.
+        has_default: serde_attrs.has_default,
+        rename_all: serde_attrs.rename_all,
     }
+}
 
-    fn extract_enum_info(
-        &self,
-        enum_item: &ItemEnum,
-        module_prefix: &str,
-        file_path: Option<&Path>,
-    ) -> Option<TypeInfo> {
-        let enum_name = enum_item.ident.to_string();
-        let full_path = qualified_name(module_prefix, &enum_name);
-
-        let docs = extract_docs(&enum_item.attrs);
-
-        let variants = enum_item
-            .variants
-            .iter()
-            .map(|variant| {
-                let variant_start = variant.ident.span().start();
-
-                EnumVariant {
-                    name: variant.ident.to_string(),
-                    fields: extract_fields(&variant.fields),
-                    docs: extract_docs(&variant.attrs),
-                    line: Some(variant_start.line),
-                    column: Some(variant_start.column),
-                    rename: serde_attributes::extract_serde_attributes(&variant.attrs).rename,
-                }
-            })
-            .collect();
-
-        let start = enum_item.ident.span().start();
-        let line = Some(start.line);
-        let column = Some(start.column);
-        let serde_attrs = serde_attributes::extract_serde_attributes(&enum_item.attrs);
-        // As for structs, only a container `#[serde(default)]` counts — and serde
-        // rejects that on an enum, so in practice this is always false. A
-        // `#[derive(Default)]` with a `#[default]` variant picks the variant when
-        // the field is absent entirely; it does not excuse the chosen variant's
-        // own fields from being spelled out.
-        let has_default = serde_attrs.has_default;
-        let rename_all = serde_attrs.rename_all;
-
-        Some(TypeInfo {
-            name: full_path,
-            kind: TypeKind::Enum(variants),
-            docs,
-            source_file: file_path.map(|p| p.to_path_buf()),
-            line,
-            column,
-            has_default,
-            rename_all,
-        })
-    }
-
-    fn extract_type_alias(&mut self, type_item: &ItemType, module_prefix: &str) {
-        let alias_name = type_item.ident.to_string();
-        let full_alias_path = qualified_name(module_prefix, &alias_name);
-
-        let target_type = type_to_string(&type_item.ty);
-
-        self.type_aliases.insert(full_alias_path, target_type);
+fn extract_variant(variant: &syn::Variant) -> EnumVariant {
+    let start = variant.ident.span().start();
+    EnumVariant {
+        name: variant.ident.to_string(),
+        fields: extract_fields(&variant.fields),
+        docs: extract_docs(&variant.attrs),
+        line: Some(start.line),
+        column: Some(start.column),
+        rename: serde_attributes::extract_serde_attributes(&variant.attrs).rename,
     }
 }
 
@@ -297,61 +214,32 @@ fn qualified_name(module_prefix: &str, name: &str) -> String {
 /// Extract FieldInfo entries from struct or enum-variant fields.
 /// Unnamed (tuple) fields are named by their index.
 fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
-    match fields {
-        Fields::Named(fields) => fields
-            .named
-            .iter()
-            .map(|field| {
-                let (line, column) = field
-                    .ident
-                    .as_ref()
-                    .map(|i| {
-                        let start = i.span().start();
-                        (start.line, start.column)
-                    })
-                    .unzip();
-
-                let serde_attrs = serde_attributes::extract_serde_attributes(&field.attrs);
-                FieldInfo {
-                    name: field
-                        .ident
-                        .as_ref()
-                        .expect("named field must have ident")
-                        .to_string(),
-                    type_name: type_to_string(&field.ty),
-                    docs: extract_docs(&field.attrs),
-                    line,
-                    column,
-                    has_default: serde_attrs.has_default,
-                    rename: serde_attrs.rename,
-                    aliases: serde_attrs.aliases,
-                    skip: serde_attrs.skip,
-                    flatten: serde_attrs.flatten,
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let serde_attrs = serde_attributes::extract_serde_attributes(&field.attrs);
+            let (name, line, column) = match &field.ident {
+                Some(ident) => {
+                    let start = ident.span().start();
+                    (ident.to_string(), Some(start.line), Some(start.column))
                 }
-            })
-            .collect(),
-        Fields::Unnamed(fields) => fields
-            .unnamed
-            .iter()
-            .enumerate()
-            .map(|(i, field)| {
-                let serde_attrs = serde_attributes::extract_serde_attributes(&field.attrs);
-                FieldInfo {
-                    name: i.to_string(),
-                    type_name: type_to_string(&field.ty),
-                    docs: None,
-                    line: None,
-                    column: None,
-                    has_default: serde_attrs.has_default,
-                    rename: serde_attrs.rename,
-                    aliases: serde_attrs.aliases,
-                    skip: serde_attrs.skip,
-                    flatten: serde_attrs.flatten,
-                }
-            })
-            .collect(),
-        Fields::Unit => vec![],
-    }
+                None => (index.to_string(), None, None),
+            };
+            FieldInfo {
+                name,
+                type_name: type_to_string(&field.ty),
+                docs: extract_docs(&field.attrs),
+                line,
+                column,
+                has_default: serde_attrs.has_default,
+                rename: serde_attrs.rename,
+                aliases: serde_attrs.aliases,
+                skip: serde_attrs.skip,
+                flatten: serde_attrs.flatten,
+            }
+        })
+        .collect()
 }
 
 fn extract_docs(attrs: &[syn::Attribute]) -> Option<String> {
@@ -442,6 +330,7 @@ fn normalize_type_tokens(s: &str) -> String {
 ///
 /// See <https://git.cilki.net/cilki/roniker/issues/72>.
 mod serde_attributes {
+    use syn::meta::ParseNestedMeta;
     use syn::{Attribute, LitStr, Token};
 
     #[derive(Default)]
@@ -467,35 +356,16 @@ mod serde_attributes {
                         let _: LitStr = meta.value()?.parse()?;
                     }
                 } else if meta.path.is_ident("rename") {
-                    if meta.input.peek(Token![=]) {
-                        let lit: LitStr = meta.value()?.parse()?;
-                        out.rename = Some(lit.value());
-                    } else {
-                        // rename(serialize = "...", deserialize = "...")
-                        meta.parse_nested_meta(|inner| {
-                            let lit: LitStr = inner.value()?.parse()?;
-                            if inner.path.is_ident("deserialize") {
-                                out.rename = Some(lit.value());
-                            }
-                            Ok(())
-                        })?;
+                    if let Some(name) = deserialize_name(&meta)? {
+                        out.rename = Some(name);
                     }
                 } else if meta.path.is_ident("alias") {
                     // #[serde(alias = "...")], repeatable
                     let lit: LitStr = meta.value()?.parse()?;
                     out.aliases.push(lit.value());
                 } else if meta.path.is_ident("rename_all") {
-                    if meta.input.peek(Token![=]) {
-                        let lit: LitStr = meta.value()?.parse()?;
-                        out.rename_all = Some(lit.value());
-                    } else {
-                        meta.parse_nested_meta(|inner| {
-                            let lit: LitStr = inner.value()?.parse()?;
-                            if inner.path.is_ident("deserialize") {
-                                out.rename_all = Some(lit.value());
-                            }
-                            Ok(())
-                        })?;
+                    if let Some(name) = deserialize_name(&meta)? {
+                        out.rename_all = Some(name);
                     }
                 } else if meta.path.is_ident("skip") || meta.path.is_ident("skip_deserializing") {
                     out.skip = true;
@@ -518,6 +388,25 @@ mod serde_attributes {
         }
 
         out
+    }
+
+    /// The name a `rename`/`rename_all` attribute gives for deserializing:
+    /// the value of `name = "..."`, or the `deserialize` half of
+    /// `name(serialize = "...", deserialize = "...")`.
+    fn deserialize_name(meta: &ParseNestedMeta) -> syn::Result<Option<String>> {
+        if meta.input.peek(Token![=]) {
+            let lit: LitStr = meta.value()?.parse()?;
+            return Ok(Some(lit.value()));
+        }
+        let mut name = None;
+        meta.parse_nested_meta(|inner| {
+            let lit: LitStr = inner.value()?.parse()?;
+            if inner.path.is_ident("deserialize") {
+                name = Some(lit.value());
+            }
+            Ok(())
+        })?;
+        Ok(name)
     }
 }
 
@@ -724,8 +613,6 @@ mod tests {
     /// an absolute path can just as well find above the crate itself.
     #[test]
     fn test_file_path_to_module_path() {
-        let analyzer = RustAnalyzer::new();
-
         for (path, expected) in [
             ("src/config.rs", "crate::config"),
             ("src/config/mod.rs", "crate::config"),
@@ -739,7 +626,7 @@ mod tests {
             ("examples/data/config_types.rs", ""),
         ] {
             assert_eq!(
-                analyzer.file_path_to_module_path(&PathBuf::from(path)),
+                file_path_to_module_path(&PathBuf::from(path)),
                 expected,
                 "module path for {path}"
             );
@@ -1346,8 +1233,14 @@ mod tests {
             );
         }
 
-        assert_eq!(rename_all_variant("FastMode", "SCREAMING_SNAKE_CASE"), "FAST_MODE");
+        assert_eq!(
+            rename_all_variant("FastMode", "SCREAMING_SNAKE_CASE"),
+            "FAST_MODE"
+        );
         assert_eq!(rename_all_field("max_size", "PascalCase"), "MaxSize");
-        assert_eq!(rename_all_field("max_size", "SCREAMING-KEBAB-CASE"), "MAX-SIZE");
+        assert_eq!(
+            rename_all_field("max_size", "SCREAMING-KEBAB-CASE"),
+            "MAX-SIZE"
+        );
     }
 }
