@@ -155,42 +155,39 @@ pub fn generate_completions_for_type(
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    let context = get_completion_context(tree, content, position);
+    // The declared type of the field whose value is being completed, found by
+    // serialized or Rust name.
+    let field_type = |field: Option<String>| {
+        let name =
+            field.or_else(|| tree_sitter_parser::get_field_at_position(tree, content, position))?;
+        type_info
+            .find_field_serialized(&name)
+            .map(|f| f.type_name.as_str())
+    };
 
-    match context {
+    match get_completion_context(tree, content, position) {
         CompletionContext::FieldName => {
             generate_field_completions(tree, content, position, type_info, &analyzer)
         }
         CompletionContext::FieldValue(field) => {
-            // Find the field we're completing the value for
-            if let Some(field_name) = field.or_else(|| find_current_field(tree, content, position))
-            {
-                let completions =
-                    generate_value_completions_for_field(field_name, type_info, analyzer.clone());
+            let completions = field_type(field)
+                .map(|t| generate_value_completions_by_type(t, analyzer.clone()))
+                .unwrap_or_default();
 
-                // Only fall back to offering every workspace type when the field
-                // type couldn't be resolved to concrete value completions.
-                // Otherwise the type-directed suggestions above are the right
-                // (and only) ones — appending all types just buries them under,
-                // e.g., unrelated struct constructors for a `bool` or enum field.
-                if completions.is_empty() {
-                    get_all_workspace_types(analyzer)
-                } else {
-                    completions
-                }
-            } else {
+            // Only fall back to offering every workspace type when the field
+            // type couldn't be resolved to concrete value completions.
+            // Otherwise the type-directed suggestions above are the right
+            // (and only) ones — appending all types just buries them under,
+            // e.g., unrelated struct constructors for a `bool` or enum field.
+            if completions.is_empty() {
                 get_all_workspace_types(analyzer)
-            }
-        }
-        CompletionContext::StructType(field) => {
-            // Find the field type and provide struct completions
-            if let Some(field_name) = field.or_else(|| find_current_field(tree, content, position))
-            {
-                generate_type_completions_for_field(field_name, type_info, analyzer)
             } else {
-                Vec::new()
+                completions
             }
         }
+        CompletionContext::StructType(field) => field_type(field)
+            .map(|t| generate_type_completions_by_type(t, &analyzer))
+            .unwrap_or_default(),
     }
 }
 
@@ -247,7 +244,7 @@ fn generate_field_completions(
             {
                 Some(variant) => Cow::Owned(variant.effective_fields()),
                 // Not inside a variant's fields: complete the variant names.
-                None => return enum_variant_name_completions(type_info, variants),
+                None => return variant_completions(type_info, variants),
             }
         }
     };
@@ -266,13 +263,11 @@ fn generate_field_completions(
         .collect()
 }
 
-/// Completion items offering an enum's variant names where a variant is being
-/// named, serialized (honoring rename/rename_all), with a snippet opening the
-/// parens of a variant that carries data.
-fn enum_variant_name_completions(
-    type_info: &TypeInfo,
-    variants: &[EnumVariant],
-) -> Vec<CompletionItem> {
+/// Completion items offering an enum's variants, serialized (honoring
+/// rename/rename_all), both where a variant is being named and as a field's
+/// value. A variant that carries data is inserted as a snippet with the caret in
+/// its parens.
+fn variant_completions(type_info: &TypeInfo, variants: &[EnumVariant]) -> Vec<CompletionItem> {
     let rename_all = type_info.rename_all.as_deref();
     variants
         .iter()
@@ -282,10 +277,10 @@ fn enum_variant_name_completions(
                 Some(docs) => format!("```rust\n{}\n```\n\n{}", name, docs),
                 None => format!("```rust\n{}\n```", name),
             };
-            let insert_text = if variant.fields.is_empty() {
-                name.to_string()
+            let (insert_text, insert_text_format) = if variant.fields.is_empty() {
+                (name.to_string(), None)
             } else {
-                format!("{}($0)", name)
+                (format!("{}($0)", name), Some(InsertTextFormat::SNIPPET))
             };
 
             CompletionItem {
@@ -294,79 +289,36 @@ fn enum_variant_name_completions(
                 detail: Some(format!("Variant of {}", type_info.name)),
                 documentation: Some(markdown_docs(value)),
                 insert_text: Some(insert_text),
+                insert_text_format,
                 ..Default::default()
             }
         })
         .collect()
 }
 
-/// Find the field name for the current cursor position using tree-sitter
-fn find_current_field(tree: &Tree, content: &str, position: Position) -> Option<String> {
-    tree_sitter_parser::get_field_at_position(tree, content, position)
-}
-
-/// Generate value completions for a specific field
-fn generate_value_completions_for_field(
-    field_name: String,
-    type_info: &TypeInfo,
-    analyzer: Arc<RustAnalyzer>,
-) -> Vec<CompletionItem> {
-    // Find the field in the type info (by serialized or Rust name)
-    if let Some(field) = type_info.find_field_serialized(&field_name) {
-        return generate_value_completions_by_type(&field.type_name, analyzer);
+/// The values a field declared as the workspace type `type_info` takes: an
+/// enum's variants, or a snippet of the whole struct.
+fn workspace_type_completions(type_info: &TypeInfo) -> Vec<CompletionItem> {
+    match &type_info.kind {
+        TypeKind::Enum(variants) => variant_completions(type_info, variants),
+        TypeKind::Struct(_) => vec![create_type_completion(type_info)],
     }
-
-    Vec::new()
 }
 
-/// Generate type completions for a field that expects a custom type
-fn generate_type_completions_for_field(
-    field_name: String,
-    type_info: &TypeInfo,
-    analyzer: Arc<RustAnalyzer>,
+/// Type completions for a field whose value is being written as a bare
+/// identifier, looking through one generic wrapper (`Vec<T>`, `Option<T>`).
+///
+/// An enum field's value is a variant name, which the syntactic context
+/// detection can't tell apart from a struct type name (both are bare
+/// identifiers), so an enum offers its variants rather than its own name.
+fn generate_type_completions_by_type(
+    field_type: &str,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
-    // Find the field in the type info (by serialized or Rust name)
-    if let Some(field) = type_info.find_field_serialized(&field_name) {
-        // Get the inner type if it's a generic
-        let inner_type = strip_outer_generic(&field.type_name);
-
-        // Try to get type info for this type
-        if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
-            // An enum field's value is a variant name, which the syntactic
-            // context detection can't tell apart from a struct type name (both
-            // are bare identifiers). Offer the variants rather than the enum
-            // type itself, matching the `FieldValue` path.
-            if let TypeKind::Enum(variants) = &nested_type.kind {
-                return enum_variant_value_completions(nested_type, variants);
-            }
-            return vec![create_type_completion(nested_type)];
-        }
-    }
-
-    Vec::new()
-}
-
-/// Completion items offering an enum's variants as RON values, using serialized
-/// names (honoring `#[serde(rename)]` / `rename_all`).
-fn enum_variant_value_completions(
-    type_info: &TypeInfo,
-    variants: &[EnumVariant],
-) -> Vec<CompletionItem> {
-    let rename_all = type_info.rename_all.as_deref();
-    variants
-        .iter()
-        .map(|variant| {
-            let name = variant.serialized_name(rename_all).into_owned();
-            CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(format!("Variant of {}", type_info.name)),
-                documentation: variant.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
-                insert_text: Some(name),
-                ..Default::default()
-            }
-        })
-        .collect()
+    analyzer
+        .get_type_info(&strip_outer_generic(field_type))
+        .map(workspace_type_completions)
+        .unwrap_or_default()
 }
 
 /// Create a completion item for a type (struct or enum)
@@ -455,10 +407,7 @@ fn generate_value_completions_by_type(
     // an enum's values are its variants (serialized names), a struct's is the
     // struct itself, as a snippet.
     if let Some(type_info) = analyzer.get_type_info(field_type) {
-        return match &type_info.kind {
-            TypeKind::Enum(variants) => enum_variant_value_completions(type_info, variants),
-            TypeKind::Struct(_) => vec![create_type_completion(type_info)],
-        };
+        return workspace_type_completions(type_info);
     }
 
     // A wrapper the document writes straight through — `Box<T>`, `Cow<T>`,
@@ -756,6 +705,16 @@ mod tests {
         let variant_labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
         assert!(variant_labels.contains(&"UnitVariant".to_string()));
         assert!(variant_labels.contains(&"TupleVariant".to_string()));
+
+        // A variant carrying data opens its parens with the caret inside, which
+        // only works when the client is told the `$0` is a tab stop.
+        let item = |label: &str| completions.iter().find(|c| c.label == label).unwrap();
+        let tuple = item("TupleVariant");
+        assert_eq!(tuple.insert_text.as_deref(), Some("TupleVariant($0)"));
+        assert_eq!(tuple.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        let unit = item("UnitVariant");
+        assert_eq!(unit.insert_text.as_deref(), Some("UnitVariant"));
+        assert_eq!(unit.insert_text_format, None);
     }
 
     #[test]
@@ -792,7 +751,10 @@ mod tests {
         analyzer.add_type(enum_type);
         let analyzer = std::sync::Arc::new(analyzer);
 
-        let completions = generate_type_completions_for_field("mode".to_string(), &parent, analyzer);
+        let content = "Config(mode: P)";
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, Position::new(0, 14), &parent, analyzer);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
         assert!(
