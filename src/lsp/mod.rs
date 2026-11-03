@@ -262,26 +262,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params
-            .text_document_position_params
-            .text_document
-            .uri
-            .to_string();
-        let position = params.text_document_position_params.position;
-
-        let documents = self.documents.read().await;
-        let Some(doc) = documents.get(&uri) else {
-            return Ok(None);
-        };
-        let (content, tree) = (&doc.content, doc.tree.as_ref());
-
-        // Get the word at cursor position - early return if none
-        let Some(word) = get_word_at_position(content, position) else {
-            return Ok(None);
-        };
-
-        let owner = self.resolve_owner_type_at(content, tree, position);
-        let Some(symbol) = self.resolve_symbol(owner, tree, content, position, &word) else {
+        let Some(symbol) = self.symbol_at(&params.text_document_position_params).await else {
             return Ok(None);
         };
 
@@ -296,26 +277,7 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params
-            .text_document_position_params
-            .text_document
-            .uri
-            .to_string();
-        let position = params.text_document_position_params.position;
-
-        let documents = self.documents.read().await;
-        let Some(doc) = documents.get(&uri) else {
-            return Ok(None);
-        };
-        let (content, tree) = (&doc.content, doc.tree.as_ref());
-
-        // Get the word at cursor position
-        let Some(word) = get_word_at_position(content, position) else {
-            return Ok(None);
-        };
-
-        let owner = self.resolve_owner_type_at(content, tree, position);
-        let Some(symbol) = self.resolve_symbol(owner, tree, content, position, &word) else {
+        let Some(symbol) = self.symbol_at(&params.text_document_position_params).await else {
             return Ok(None);
         };
 
@@ -327,7 +289,7 @@ impl LanguageServer for Backend {
                 field.docs.as_deref().unwrap_or("")
             ),
             Symbol::Variant { owner, variant } => format_variant_hover(&owner.name, variant),
-            Symbol::Type(info) => self.format_type_hover(info),
+            Symbol::Type(info) => format_type_hover(info),
         };
 
         Ok(Some(Hover {
@@ -716,19 +678,30 @@ impl Backend {
         })
     }
 
-    /// What the word at `position` refers to, resolved against `owner` — the
-    /// type that owns the value the cursor is in, as returned by
+    /// What the word under the cursor of an open document refers to — the
+    /// question hover and go-to-definition both ask. See
+    /// [`Backend::resolve_symbol`].
+    async fn symbol_at(&self, params: &TextDocumentPositionParams) -> Option<Symbol<'_>> {
+        let documents = self.documents.read().await;
+        let doc = documents.get(&params.text_document.uri.to_string())?;
+        self.resolve_symbol(doc.tree.as_ref(), &doc.content, params.position)
+    }
+
+    /// What the word at `position` refers to, resolved against the type that
+    /// owns the value the cursor is in, as returned by
     /// [`Backend::resolve_owner_type_at`].
     ///
-    /// `None` when the word names nothing the analyzer knows about.
-    fn resolve_symbol<'a>(
-        &'a self,
-        owner: Option<&'a rust_analyzer::TypeInfo>,
+    /// `None` when there is no identifier at `position`, or it names nothing
+    /// the analyzer knows about.
+    fn resolve_symbol(
+        &self,
         tree: Option<&tree_sitter::Tree>,
         content: &str,
         position: Position,
-        word: &str,
-    ) -> Option<Symbol<'a>> {
+    ) -> Option<Symbol<'_>> {
+        let word = get_word_at_position(content, position)?;
+        let word = word.as_str();
+        let owner = self.resolve_owner_type_at(content, tree, position);
         if let (Some(owner), Some(tree)) = (owner, tree) {
             let cursor_field = tree_sitter_parser::get_field_at_position(tree, content, position);
 
@@ -860,64 +833,6 @@ impl Backend {
         }
 
         found
-    }
-
-    fn format_type_hover(&self, type_info: &rust_analyzer::TypeInfo) -> String {
-        use crate::rust_analyzer::TypeKind;
-
-        let type_name = type_utils::short_name(&type_info.name);
-        let mut hover_text = String::new();
-
-        match &type_info.kind {
-            TypeKind::Struct(fields) => {
-                hover_text.push_str(&format!("```rust\nstruct {}\n```", type_name));
-
-                if let Some(ref docs) = type_info.docs {
-                    hover_text.push_str(&format!("\n\n{}", docs));
-                }
-
-                if !fields.is_empty() {
-                    hover_text.push_str("\n\n**Fields:**\n");
-                    for field in fields {
-                        hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
-                        if let Some(ref field_docs) = field.docs {
-                            hover_text.push_str(&format!(" - {}", field_docs));
-                        }
-                        hover_text.push('\n');
-                    }
-                }
-            }
-            TypeKind::Enum(variants) => {
-                hover_text.push_str(&format!("```rust\nenum {}\n```", type_name));
-
-                if let Some(ref docs) = type_info.docs {
-                    hover_text.push_str(&format!("\n\n{}", docs));
-                }
-
-                if !variants.is_empty() {
-                    hover_text.push_str("\n\n**Variants:**\n");
-                    for variant in variants {
-                        if variant.fields.is_empty() {
-                            hover_text.push_str(&format!("- `{}`", variant.name));
-                        } else {
-                            hover_text.push_str(&format!("- `{}` with fields:", variant.name));
-                            for field in &variant.fields {
-                                hover_text.push_str(&format!(
-                                    "\n  - `{}`: `{}`",
-                                    field.name, field.type_name
-                                ));
-                            }
-                        }
-                        if let Some(ref variant_docs) = variant.docs {
-                            hover_text.push_str(&format!(" - {}", variant_docs));
-                        }
-                        hover_text.push('\n');
-                    }
-                }
-            }
-        }
-
-        hover_text
     }
 
     async fn publish_diagnostics(&self, uri: &str, doc: &Document) {
@@ -1147,23 +1062,69 @@ fn format_variant_hover(enum_type_name: &str, variant: &rust_analyzer::EnumVaria
         type_utils::short_name(enum_type_name),
         variant.name
     );
+    push_docs(&mut hover_text, &variant.docs);
+    push_field_list(&mut hover_text, &variant.fields);
+    hover_text
+}
 
-    if let Some(ref docs) = variant.docs {
+/// Build the Markdown hover shown when the cursor is on a struct or enum name:
+/// its declaration, its docs, and its fields or variants.
+fn format_type_hover(type_info: &rust_analyzer::TypeInfo) -> String {
+    let keyword = match type_info.kind {
+        rust_analyzer::TypeKind::Struct(_) => "struct",
+        rust_analyzer::TypeKind::Enum(_) => "enum",
+    };
+    let mut hover_text = format!(
+        "```rust\n{keyword} {}\n```",
+        type_utils::short_name(&type_info.name)
+    );
+    push_docs(&mut hover_text, &type_info.docs);
+
+    match &type_info.kind {
+        rust_analyzer::TypeKind::Struct(fields) => push_field_list(&mut hover_text, fields),
+        rust_analyzer::TypeKind::Enum(variants) if !variants.is_empty() => {
+            hover_text.push_str("\n\n**Variants:**\n");
+            for variant in variants {
+                hover_text.push_str(&format!("- `{}`", variant.name));
+                if !variant.fields.is_empty() {
+                    hover_text.push_str(" with fields:");
+                    for field in &variant.fields {
+                        hover_text
+                            .push_str(&format!("\n  - `{}`: `{}`", field.name, field.type_name));
+                    }
+                }
+                if let Some(docs) = &variant.docs {
+                    hover_text.push_str(&format!(" - {}", docs));
+                }
+                hover_text.push('\n');
+            }
+        }
+        rust_analyzer::TypeKind::Enum(_) => {}
+    }
+    hover_text
+}
+
+/// Append a hover's doc paragraph, when there are docs to show.
+fn push_docs(hover_text: &mut String, docs: &Option<String>) {
+    if let Some(docs) = docs {
         hover_text.push_str(&format!("\n\n{}", docs));
     }
+}
 
-    if !variant.fields.is_empty() {
-        hover_text.push_str("\n\n**Fields:**\n");
-        for field in &variant.fields {
-            hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
-            if let Some(ref field_docs) = field.docs {
-                hover_text.push_str(&format!(" - {}", field_docs));
-            }
-            hover_text.push('\n');
-        }
+/// Append a hover's `**Fields:**` list, one line per field with its type and
+/// docs, when there are fields to list.
+fn push_field_list(hover_text: &mut String, fields: &[rust_analyzer::FieldInfo]) {
+    if fields.is_empty() {
+        return;
     }
-
-    hover_text
+    hover_text.push_str("\n\n**Fields:**\n");
+    for field in fields {
+        hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
+        if let Some(docs) = &field.docs {
+            hover_text.push_str(&format!(" - {}", docs));
+        }
+        hover_text.push('\n');
+    }
 }
 
 #[cfg(test)]
