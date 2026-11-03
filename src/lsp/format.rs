@@ -96,37 +96,6 @@ fn is_trailing_comment_in_context(
     false
 }
 
-/// Collect top-level comments (direct children of source_file that come before the main value)
-fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> Vec<Comment> {
-    let mut comments = Vec::new();
-    let mut cursor = root.walk();
-
-    for child in root.children(&mut cursor) {
-        if ts_utils::is_comment(&child)
-            && child.end_byte() <= main_value.start_byte()
-            && let Some(text) = ts_utils::node_text(&child, content)
-        {
-            comments.push(Comment {
-                text: text.trim_end_matches('\r').to_string(),
-                start_byte: child.start_byte(),
-                end_byte: child.end_byte(),
-                is_trailing: false,
-            });
-        }
-    }
-
-    comments.sort_by_key(|c| c.start_byte);
-    comments
-}
-
-/// The named children of a node that carry data, with comments filtered out.
-fn value_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
-    ts_utils::named_children(node)
-        .into_iter()
-        .filter(|n| !ts_utils::is_comment(n))
-        .collect()
-}
-
 /// Format RON content using tree-sitter AST, preserving comments.
 ///
 /// For a whole open document, prefer [`format_tree`]: the server already holds
@@ -192,11 +161,12 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
         prev_end: None,
     };
 
-    for comment in collect_top_level_comments(&tree.root_node(), content, &main_value) {
-        formatter.separate_from_previous(comment.start_byte);
-        formatter.output.push_str(&comment.text);
-        formatter.output.push_str(newline);
-        formatter.prev_end = Some(comment.end_byte);
+    // The comments above the root value, each on a line of its own: nothing
+    // else written before the root survives the layout for one to trail.
+    for comment in collect_inner_comments(&tree.root_node(), content) {
+        if comment.end_byte <= main_value.start_byte() {
+            formatter.own_line_comment(&comment, 0);
+        }
     }
     formatter.separate_from_previous(main_value.start_byte());
     formatter.node(&main_value, 0);
@@ -270,8 +240,8 @@ impl Formatter<'_> {
     fn node(&mut self, node: &Node, level: usize) {
         match node.kind() {
             "struct" => self.struct_value(node, level),
-            "array" => self.container(node, level, ('[', ']'), &value_children(node)),
-            "tuple" => self.container(node, level, ('(', ')'), &value_children(node)),
+            "array" => self.container(node, level, ('[', ']'), &ts_utils::array_elements(node)),
+            "tuple" => self.container(node, level, ('(', ')'), &ts_utils::tuple_elements(node)),
             "map" => {
                 let entries = ts_utils::children_by_kind(node, "map_entry");
                 self.container(node, level, ('{', '}'), &entries)
@@ -339,7 +309,7 @@ impl Formatter<'_> {
         // `Point(1, 2)`, `Some("value")`. Both are containers and lay out as
         // one, bar the single exception below.
         let fields = ts_utils::struct_fields(node);
-        let values = self.struct_values(node);
+        let values = ts_utils::struct_values(node, self.content);
 
         // The grammar lets the two styles mix — `Config(port: 1, debug)` parses
         // as a struct with one field and one value, with no ERROR node — but
@@ -375,19 +345,6 @@ impl Formatter<'_> {
         self.container(node, level, ('(', ')'), &values);
     }
 
-    /// The values of a tuple-style struct, with its name and its comments left
-    /// out.
-    ///
-    /// [`ts_utils::struct_values`] drops the name but counts a comment as a
-    /// value, and a comment laid out as one acquires a terminating comma:
-    /// `Some(/* why */ 1)` became `Some(/* why */, 1)`, which RON rejects.
-    fn struct_values<'t>(&self, node: &Node<'t>) -> Vec<Node<'t>> {
-        ts_utils::struct_values(node, self.content)
-            .into_iter()
-            .filter(|value| !ts_utils::is_comment(value))
-            .collect()
-    }
-
     /// Lay out a `name: value` field of a struct.
     fn field(&mut self, node: &Node, level: usize) {
         if let Some(name) = ts_utils::field_name(node, self.content) {
@@ -402,14 +359,13 @@ impl Formatter<'_> {
 
     /// Lay out a `key: value` entry of a map.
     fn map_entry(&mut self, node: &Node, level: usize) {
-        let children = value_children(node);
-        let [key, value, ..] = children.as_slice() else {
+        let Some((key, value)) = ts_utils::map_entry_halves(node) else {
             return;
         };
 
-        self.node(key, level);
+        self.node(&key, level);
         self.output.push_str(": ");
-        self.node(value, level);
+        self.node(&value, level);
     }
 
     /// Emit the leading (non-trailing) comments that fall before `items[i]` and
@@ -434,11 +390,7 @@ impl Formatter<'_> {
                 && comment.end_byte <= items[i].start_byte()
                 && (i == 0 || comment.start_byte > items[i - 1].end_byte())
             {
-                self.separate_from_previous(comment.start_byte);
-                self.indent(level + 1);
-                self.output.push_str(&comment.text);
-                self.output.push_str(self.newline);
-                self.prev_end = Some(comment.end_byte);
+                self.own_line_comment(comment, level + 1);
             }
         }
     }
@@ -466,13 +418,19 @@ impl Formatter<'_> {
         };
         for comment in comments {
             if !comment.is_trailing && comment.start_byte > last.end_byte() {
-                self.separate_from_previous(comment.start_byte);
-                self.indent(level + 1);
-                self.output.push_str(&comment.text);
-                self.output.push_str(self.newline);
-                self.prev_end = Some(comment.end_byte);
+                self.own_line_comment(comment, level + 1);
             }
         }
+    }
+
+    /// Write `comment` on a line of its own at `level` levels of indentation,
+    /// after a blank line if the source had one before it.
+    fn own_line_comment(&mut self, comment: &Comment, level: usize) {
+        self.separate_from_previous(comment.start_byte);
+        self.indent(level);
+        self.output.push_str(&comment.text);
+        self.output.push_str(self.newline);
+        self.prev_end = Some(comment.end_byte);
     }
 }
 
@@ -704,7 +662,7 @@ User(
         assert_eq!(format_ron(&formatted), formatted);
     }
 
-    /// `struct_values` counts a comment as a value, and a comment laid out as a
+    /// `struct_values` counted a comment as a value, and a comment laid out as a
     /// value got a terminating comma of its own: `Some(/* why */ 1)` came back
     /// as `Some(/* why */, 1)`, which RON rejects — formatting turned a
     /// deserializable document into an unparseable one. The comment is a
@@ -803,10 +761,11 @@ Post(
         );
     }
 
-    /// Only the comments *before* the root value are collected
-    /// ([`collect_top_level_comments`] filters on `end_byte <= start_byte`), and
-    /// a comment after it is a sibling of the root value rather than a child, so
-    /// [`collect_inner_comments`] doesn't see it either. It is dropped. Pinned
+    /// Only the comments *before* the root value are written (the document's
+    /// own comments are filtered on `end_byte <= start_byte`), and a comment
+    /// after it is a sibling of the root value rather than a child, so
+    /// collecting the root value's comments doesn't see it either. It is
+    /// dropped. Pinned
     /// alongside the case above; see
     /// https://git.cilki.net/cilki/roniker/issues/103.
     #[test]

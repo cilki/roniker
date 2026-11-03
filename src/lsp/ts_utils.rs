@@ -744,29 +744,24 @@ pub fn struct_fields<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     named_children_by_kind(node, "field")
 }
 
-/// Get all value children of a struct (for tuple-style structs), excluding the struct name identifier
+/// The values of a tuple-style struct — `Point(1, 2)`, `Some("value")` — with
+/// its name, its fields, punctuation and comments left out. Empty for any other
+/// node kind.
+///
+/// A comment is a named child like any value, and counting it as one made
+/// `Some(/* why */ 1)` a two-value struct rather than a `Some`, and
+/// `Unit(/* nothing */)` a unit variant carrying data.
 pub fn struct_values<'a>(node: &Node<'a>, content: &str) -> Vec<Node<'a>> {
     if node.kind() != "struct" {
         return Vec::new();
     }
 
-    let mut values = Vec::new();
     let mut cursor = node.walk();
-    let has_name = struct_name(node, content).is_some();
-    let mut skip_first_identifier = has_name;
-
-    for child in node.children(&mut cursor) {
-        // Skip the first identifier (struct name) and punctuation
-        if child.is_named() && child.kind() != "field" {
-            if skip_first_identifier && child.kind() == "identifier" {
-                skip_first_identifier = false;
-                continue;
-            }
-            values.push(child);
-        }
-    }
-
-    values
+    node.named_children(&mut cursor)
+        // The name, when there is one, is the struct's first child.
+        .skip(usize::from(struct_name(node, content).is_some()))
+        .filter(|child| child.kind() != "field" && !is_comment(child))
+        .collect()
 }
 
 /// The element values of an `array` node, with punctuation and comments left
@@ -793,14 +788,23 @@ pub fn map_entries<'a>(node: &Node<'a>) -> Vec<(Node<'a>, Node<'a>)> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "map_entry")
-        .filter_map(|entry| {
-            let mut cursor = entry.walk();
-            let mut halves = entry
-                .named_children(&mut cursor)
-                .filter(|child| !is_comment(child) && !child.is_missing());
-            Some((halves.next()?, halves.next()?))
-        })
+        .filter_map(|entry| map_entry_halves(&entry))
         .collect()
+}
+
+/// The key and value nodes of a `map_entry` node, with punctuation and comments
+/// left out. `None` for an entry missing either half, and for any other node
+/// kind.
+pub fn map_entry_halves<'a>(entry: &Node<'a>) -> Option<(Node<'a>, Node<'a>)> {
+    if entry.kind() != "map_entry" {
+        return None;
+    }
+
+    let mut cursor = entry.walk();
+    let mut halves = entry
+        .named_children(&mut cursor)
+        .filter(|child| !is_comment(child) && !child.is_missing());
+    Some((halves.next()?, halves.next()?))
 }
 
 /// The element values of a `tuple` node — `("a", 2)`, which is how RON writes
@@ -1271,6 +1275,25 @@ mod tests {
             assert_eq!(values.len(), 0);
             assert_eq!(fields.len(), 0);
         }
+    }
+
+    /// A comment inside a tuple-style struct is no value of it: `Some` with a
+    /// comment beside its value still wraps that one value, and a unit
+    /// variant holding only a comment still holds nothing.
+    #[test]
+    fn test_struct_values_leave_out_comments() {
+        let content = "Some(/* why */ 1)";
+        let tree = parse(content).unwrap();
+        let value = find_main_value(&tree).unwrap();
+        let values = struct_values(&value, content);
+        assert_eq!(values.len(), 1);
+        assert_eq!(node_text(&values[0], content), Some("1"));
+        assert!(unwrap_some(&value, content).is_some());
+
+        let content = "Active(// nothing\n)";
+        let tree = parse(content).unwrap();
+        let value = find_main_value(&tree).unwrap();
+        assert!(struct_values(&value, content).is_empty());
     }
 
     #[test]

@@ -2556,7 +2556,7 @@ mod tests {
 
         // Unit variant should not have data
         let content = "Active(123)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
         // Should get error for providing data to unit variant
         assert!(
             diagnostics
@@ -2565,6 +2565,14 @@ mod tests {
                     || d.message.contains("cannot have data")),
             "Should error on unit variant with data. Got: {:?}",
             diagnostics
+        );
+
+        // A comment is not data.
+        let content = "Active(/* paused until Monday */)";
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        assert!(
+            diagnostics.is_empty(),
+            "a comment is no data for a unit variant. Got: {diagnostics:?}"
         );
     }
 
