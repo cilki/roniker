@@ -1,8 +1,8 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
     MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type,
-    is_number_type, is_wrapped_by, normalize_type, short_name, std_type, strip_outer_generic,
-    tuple_element_types,
+    is_number_type, is_wrapped_by, map_entry_types, normalize_type, short_name, std_type,
+    strip_outer_generic, tuple_element_types,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
@@ -22,9 +22,161 @@ enum CompletionContext {
     /// Completing field names (e.g., after comma or opening paren)
     FieldName,
     /// Completing a value after a colon
-    FieldValue(Option<String>),
+    FieldValue(ValueSlot),
     /// Completing the struct type name of a nested value
-    StructType(Option<String>),
+    StructType(ValueSlot),
+}
+
+/// Where a value being completed sits: the field it is written for, and the
+/// containers between that field's colon and the cursor.
+#[derive(Debug, PartialEq, Default)]
+struct ValueSlot {
+    /// The field whose value it is, when the context could tell.
+    field: Option<String>,
+    /// The containers the cursor is inside of, outermost first.
+    steps: Vec<ValueStep>,
+}
+
+impl ValueSlot {
+    fn field(field: Option<String>) -> Self {
+        Self {
+            field,
+            steps: Vec::new(),
+        }
+    }
+}
+
+/// One step from the type a field is declared as down to the type of the value
+/// the cursor is in. Without them a cursor inside `shapes: [|]` was completed
+/// as though it were the whole `Vec<Shape>`, and offered another `[]` where a
+/// `Shape` belongs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ValueStep {
+    /// An element of a sequence or set, written `[...]`.
+    Element,
+    /// What an `Option`'s `Some(...)` wraps.
+    Some,
+    /// The key of a map entry, written `{key: value}`.
+    MapKey,
+    /// The value of a map entry.
+    MapValue,
+}
+
+impl ValueStep {
+    /// The type of the value one step inside a value declared as `declared`,
+    /// or `None` when `declared` is not the container the document wrote.
+    fn apply(self, declared: &str) -> Option<String> {
+        let clean = normalize_type(declared);
+        // A wrapper the document writes straight through holds the container.
+        if let Some(inner) = TRANSPARENT_WRAPPERS
+            .iter()
+            .find_map(|w| extract_inner_type(&clean, w))
+        {
+            return self.apply(inner);
+        }
+        match self {
+            ValueStep::Element => SEQUENCE_WRAPPERS
+                .iter()
+                .chain(SET_WRAPPERS.iter())
+                .find_map(|w| extract_inner_type(&clean, w)),
+            ValueStep::Some => extract_inner_type(&clean, "Option<"),
+            ValueStep::MapKey => map_entry_types(&clean).map(|(key, _)| key),
+            ValueStep::MapValue => map_entry_types(&clean).map(|(_, value)| value),
+        }
+        .map(str::to_string)
+    }
+}
+
+/// Descend from a field's `value` through the containers the cursor (a byte
+/// offset) is inside of: an array, a `Some(...)`, a map. Returns the steps
+/// taken, outermost first, and the value the cursor is on inside the innermost
+/// of them — `None` when it is in the space between values, where a new one is
+/// about to be written.
+fn value_steps<'a>(
+    value: tree_sitter::Node<'a>,
+    content: &str,
+    cursor: usize,
+) -> (Vec<ValueStep>, Option<tree_sitter::Node<'a>>) {
+    use super::ts_utils;
+
+    let contains =
+        |node: &tree_sitter::Node| node.start_byte() <= cursor && cursor <= node.end_byte();
+    let mut steps = Vec::new();
+    let mut current = value;
+    loop {
+        let (step, inner) = match current.kind() {
+            "array" => (
+                ValueStep::Element,
+                ts_utils::array_elements(&current)
+                    .into_iter()
+                    .find(contains),
+            ),
+            "struct" if ts_utils::is_some_wrapper(&current, content) => (
+                ValueStep::Some,
+                ts_utils::struct_values(&current, content)
+                    .into_iter()
+                    .find(contains),
+            ),
+            "map" => {
+                // The entry the cursor is in is the last one started before it
+                // with no comma since. Its span is no guide: an entry whose
+                // value is not typed yet (`"a": |`) ends at its colon.
+                let mut walk = current.walk();
+                let mut entry = None;
+                for child in current.children(&mut walk) {
+                    if child.start_byte() > cursor {
+                        break;
+                    }
+                    match child.kind() {
+                        "map_entry" => entry = Some(child),
+                        "," if child.end_byte() <= cursor => entry = None,
+                        _ => {}
+                    }
+                }
+                match entry {
+                    // Past the entry's colon is its value; before it, its key.
+                    Some(entry) => match ts_utils::child_by_kind(&entry, ":") {
+                        Some(colon) if cursor >= colon.end_byte() => (
+                            ValueStep::MapValue,
+                            colon.next_sibling().filter(|value| contains(value)),
+                        ),
+                        _ => (ValueStep::MapKey, entry.named_child(0)),
+                    },
+                    // Between entries a new key is about to be written.
+                    None => (ValueStep::MapKey, None),
+                }
+            }
+            _ => return (steps, Some(current)),
+        };
+        if !inside_delimiters(&current, cursor) {
+            return (steps, Some(current));
+        }
+        steps.push(step);
+        // A value tree-sitter had to make up (`{"a": }`) has nothing written.
+        match inner.filter(|node| !node.is_missing()) {
+            Some(inner) => current = inner,
+            None => return (steps, None),
+        }
+    }
+}
+
+/// Whether `cursor` is between a container's opening delimiter and its
+/// closing one (or its end, if it is not closed yet), rather than on the
+/// container as a whole — the `Some` of `Some(..)`, or past its closing `]`.
+fn inside_delimiters(node: &tree_sitter::Node, cursor: usize) -> bool {
+    let mut walk = node.walk();
+    let children: Vec<_> = node.children(&mut walk).collect();
+    let Some(open) = children
+        .iter()
+        .find(|c| matches!(c.kind(), "[" | "(" | "{"))
+    else {
+        return false;
+    };
+    let close = children
+        .iter()
+        .rev()
+        .find(|c| matches!(c.kind(), "]" | ")" | "}") && !c.is_missing());
+    cursor >= open.end_byte() && close.is_none_or(|close| cursor <= close.start_byte())
 }
 
 /// Determine what we're completing based on cursor position using tree-sitter
@@ -105,7 +257,7 @@ fn struct_body_context(
     // A value with no terminator yet (`mode: `) defeats tree-sitter's `field`
     // production entirely, so there is no field child to find above.
     match tree_sitter_parser::unterminated_value_field(tree, content, position) {
-        Some(field) => CompletionContext::FieldValue(Some(field)),
+        Some(field) => CompletionContext::FieldValue(ValueSlot::field(Some(field))),
         None => CompletionContext::FieldName,
     }
 }
@@ -129,18 +281,23 @@ fn field_completion_context(
         if position.line > name_end.line
             || (position.line == name_end.line && position.character > name_end.character)
         {
-            let field = ts_utils::field_name(field_node, content).map(str::to_string);
+            let cursor = ts_utils::position_to_byte_offset(content, position);
+            let (steps, innermost) = value_steps(value_node, content, cursor);
+            let slot = ValueSlot {
+                field: ts_utils::field_name(field_node, content).map(str::to_string),
+                steps,
+            };
 
             // Check if there's already some text (might be completing a type)
-            if let Some(val_text) = ts_utils::node_text(&value_node, content)
+            if let Some(val_text) = innermost.and_then(|value| ts_utils::node_text(&value, content))
                 && val_text
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
             {
-                return CompletionContext::StructType(field);
+                return CompletionContext::StructType(slot);
             }
 
-            return CompletionContext::FieldValue(field);
+            return CompletionContext::FieldValue(slot);
         }
     }
 
@@ -159,23 +316,26 @@ pub fn generate_completions_for_type(
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    // The declared type of the field whose value is being completed, found by
-    // serialized or Rust name.
-    let field_type = |field: Option<String>| {
-        let name =
-            field.or_else(|| tree_sitter_parser::get_field_at_position(tree, content, position))?;
-        type_info
-            .find_field_serialized(&name)
-            .map(|f| f.type_name.as_str())
+    // The type of the value being completed: the declared type of the field it
+    // is written for, found by serialized or Rust name, followed down through
+    // the containers the cursor is inside of.
+    let field_type = |slot: ValueSlot| {
+        let name = slot
+            .field
+            .or_else(|| tree_sitter_parser::get_field_at_position(tree, content, position))?;
+        let declared = type_info.find_field_serialized(&name)?.type_name.clone();
+        slot.steps
+            .iter()
+            .try_fold(declared, |declared, step| step.apply(&declared))
     };
 
     match get_completion_context(tree, content, position) {
         CompletionContext::FieldName => {
             generate_field_completions(tree, content, position, type_info, &analyzer)
         }
-        CompletionContext::FieldValue(field) => {
-            let completions = field_type(field)
-                .map(|t| generate_value_completions_by_type(t, analyzer.clone()))
+        CompletionContext::FieldValue(slot) => {
+            let completions = field_type(slot)
+                .map(|t| generate_value_completions_by_type(&t, analyzer.clone()))
                 .unwrap_or_default();
 
             // Only fall back to offering every workspace type when the field
@@ -189,8 +349,8 @@ pub fn generate_completions_for_type(
                 completions
             }
         }
-        CompletionContext::StructType(field) => field_type(field)
-            .map(|t| generate_type_completions_by_type(t, &analyzer))
+        CompletionContext::StructType(slot) => field_type(slot)
+            .map(|t| generate_type_completions_by_type(&t, &analyzer))
             .unwrap_or_default(),
     }
 }

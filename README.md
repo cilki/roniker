@@ -445,6 +445,10 @@ What gets offered depends on where in the value the cursor sits:
   types](#standard-library-types) are offered the value `ron` reads them from,
   with the caret where the value goes: `""` for a `PathBuf`, `"0.0.0.0:0"` for
   a `SocketAddr`, `(secs: 0, nanos: 0)` for a `Duration`.
+- Inside a container written as a field's value: what the container holds. An
+  element of a `Vec` or a set (`modes: [|]` offers `Mode`'s variants), what a
+  `Some(|)` wraps, and a map entry's key or value, nested as deep as the type
+  goes (`Option<Vec<Mode>>` is `Some([|])`).
 - Every registered type, as a fallback, when the field's declared type yields
   none of the above — anything the build script was not given the source for.
 

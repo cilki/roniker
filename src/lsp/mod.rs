@@ -2068,6 +2068,106 @@ Document::new(content.to_string()),
         }
     }
 
+    /// A value written inside a container — an element of a `Vec`, what a
+    /// `Some(..)` wraps, a map entry's key or value — takes the values of the
+    /// type the container holds, not of the field's whole declared type. The
+    /// container used to be ignored: inside `modes: [|]` the `Vec<Mode>` was
+    /// offered another `[]`/`[...]` where a `Mode` belongs, and inside an empty
+    /// `Some(|)` — which is what accepting the `Some` completion leaves behind —
+    /// nothing at all was offered.
+    #[tokio::test]
+    async fn test_value_completion_inside_containers() {
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(
+                [
+                    ("modes", "Vec<Mode>"),
+                    ("grid", "Vec<Vec<Mode>>"),
+                    ("fallback", "Option<Mode>"),
+                    ("maybe_modes", "Option<Vec<Mode>>"),
+                    ("by_name", "HashMap<String, Mode>"),
+                    ("ports", "Box<Vec<u16>>"),
+                ]
+                .into_iter()
+                .map(|(name, type_name)| FieldInfo {
+                    name: name.to_string(),
+                    type_name: type_name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(
+                ["Fast", "Slow"]
+                    .into_iter()
+                    .map(|name| EnumVariant {
+                        name: name.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+
+        let variants = vec!["Fast", "Slow"];
+        let sequence = vec!["[]", "[...]"];
+        // The document, with `|` marking the cursor, and what completing there
+        // offers.
+        for (marked, expected) in [
+            ("Config(modes: [|])", &variants),
+            ("Config(modes: [Fast, |])", &variants),
+            ("Config(modes: [\n    Fast,\n    |\n])", &variants),
+            ("Config(modes: [Fa|])", &variants),
+            ("Config(grid: [[|]])", &variants),
+            ("Config(fallback: Some(|))", &variants),
+            ("Config(maybe_modes: Some([|]))", &variants),
+            ("Config(by_name: {\"a\": |})", &variants),
+            ("Config(by_name: {\"a\": Fast, \"b\": Sl|})", &variants),
+            ("Config(by_name: {|})", &vec!["\"\""]),
+            ("Config(ports: [|])", &vec!["0"]),
+            // One container out, the containers' own spellings are still what
+            // the cursor's value takes.
+            ("Config(grid: [|])", &sequence),
+            ("Config(maybe_modes: Some(|))", &sequence),
+            ("Config(modes: |[])", &sequence),
+            ("Config(modes: []|)", &sequence),
+        ] {
+            let offset = marked.find('|').unwrap();
+            let content = marked.replacen('|', "", 1);
+            let line = content[..offset].matches('\n').count() as u32;
+            let character = (offset - content[..offset].rfind('\n').map_or(0, |i| i + 1)) as u32;
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(line, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(&labels, expected, "completion in {marked:?}");
+        }
+    }
+
     /// Whole-document formatting lays out the tree the document already
     /// carries instead of parsing its text again, so what the editor is handed
     /// has to be exactly what parsing from scratch would have produced — over

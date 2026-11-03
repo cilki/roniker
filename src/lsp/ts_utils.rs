@@ -865,8 +865,15 @@ pub fn unwrap_some<'a>(node: &Node<'a>, content: &str) -> Option<Node<'a>> {
 /// as a `struct` named `Some`, but it is no struct value of the document's
 /// types: walks that resolve the type of each struct value see straight
 /// through it to the value it wraps, the way diagnostics do.
+///
+/// An empty `Some()` counts too. It is what a document holds the moment the
+/// `Some` completion is accepted, with the caret between the parentheses, and
+/// read as a struct named `Some` it resolved to no type at all, so completion
+/// had nothing to offer for the value it is waiting for.
 pub fn is_some_wrapper(node: &Node, content: &str) -> bool {
-    unwrap_some(node, content).is_some()
+    struct_name(node, content) == Some("Some")
+        && struct_fields(node).is_empty()
+        && struct_values(node, content).len() <= 1
 }
 
 /// The enum variant a value names, and where that name is written.
