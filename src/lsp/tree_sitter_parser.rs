@@ -1,6 +1,6 @@
 use super::ts_utils::{
-    ancestor_chain, ancestors, child_by_kind, field_name, node_at_position, node_text,
-    owning_field_for_children, position_to_byte_offset, struct_name,
+    ancestor_chain, ancestors, child_by_kind, field_name, is_some_wrapper, node_at_position,
+    node_text, owning_field_for_children, position_to_byte_offset, struct_name,
 };
 use tower_lsp_server::ls_types::Position;
 use tree_sitter::{Node, Tree};
@@ -43,7 +43,9 @@ pub fn find_type_context_at_position(
     let mut contexts = Vec::new();
     let mut owning_field = None;
     for node in ancestor_chain(tree, current) {
-        if node.kind() == "struct" {
+        // A `Some(..)` is no step of the path: the value inside it is the
+        // value of the field the `Some` is written for.
+        if node.kind() == "struct" && !is_some_wrapper(&node, content) {
             contexts.push(struct_type_context(&node, content, owning_field));
         }
         owning_field = owning_field_for_children(&node, content, owning_field);

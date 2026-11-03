@@ -46,8 +46,12 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
         match ancestor.kind() {
             // Inside this struct's parentheses. A cursor still on the struct's
             // own name is not in the body yet, so it falls through to the
-            // enclosing field instead.
-            "struct" if inside_struct_body(&ancestor, content, position) => {
+            // enclosing field instead. A `Some(..)` has no fields to name
+            // either: what it wraps is the enclosing field's value.
+            "struct"
+                if !ts_utils::is_some_wrapper(&ancestor, content)
+                    && inside_struct_body(&ancestor, content, position) =>
+            {
                 return struct_body_context(&ancestor, tree, content, position);
             }
             "field" => return field_completion_context(&ancestor, content, position),

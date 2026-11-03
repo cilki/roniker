@@ -822,7 +822,10 @@ impl Backend {
         let mut stack = vec![(tree.root_node(), None, None)];
 
         while let Some((node, enclosing, owning_field)) = stack.pop() {
-            let enclosing = if node.kind() == "struct" {
+            // A `Some(..)` resolves to no type of its own: what it wraps sits
+            // in the value the `Some` sits in.
+            let enclosing = if node.kind() == "struct" && !ts_utils::is_some_wrapper(&node, content)
+            {
                 let owner = match enclosing.map(|id| owners[&id]) {
                     // One step down from the value this one sits in.
                     Some(Some(outer)) => navigation::step_type_context(
@@ -1936,6 +1939,131 @@ Document::new(content.to_string()),
             assert!(
                 !labels.contains(&"server"),
                 "completion should not offer Config's fields ({label}). Got: {labels:?}"
+            );
+        }
+    }
+
+    /// An `Option<Server>` field is written `Some(Server(..))` or `Some((..))`,
+    /// and the value inside the `Some` is a `Server` just as it would be
+    /// written bare. The `Some` parses as a struct of its own, though, which
+    /// resolved to no type: hover found nothing, completion offered nothing,
+    /// and rename fell back to matching by name, renaming the root's own
+    /// `port` along with the server's.
+    #[tokio::test]
+    async fn test_nested_resolution_sees_through_some() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
+        analyzer.add_type(TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "server".to_string(),
+                    type_name: "Option<crate::Server>".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "u16".to_string(),
+                    docs: Some("Port to bind".to_string()),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "host".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+        let at = |position| TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        };
+
+        for nested in ["Server", ""] {
+            let content = format!(
+                "(\n    server: Some({nested}(\n        port: 80,\n    )),\n    port: 1,\n)"
+            );
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let hover = backend
+                .hover(HoverParams {
+                    text_document_position_params: at(Position::new(2, 9)),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            let Some(Hover {
+                contents: HoverContents::Markup(markup),
+                ..
+            }) = hover
+            else {
+                panic!("hover on 'port' inside Some({nested}(..)) returned nothing");
+            };
+            assert!(
+                markup.value.contains("Port to bind"),
+                "hover inside Some({nested}(..)) should document Server::port. Got: {}",
+                markup.value
+            );
+
+            let edit = backend
+                .rename(RenameParams {
+                    text_document_position: at(Position::new(2, 9)),
+                    new_name: "listen".to_string(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap()
+                .expect("rename inside Some(..) should produce an edit");
+            let edits = &edit.changes.unwrap()[&uri];
+            let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+            assert_eq!(
+                lines,
+                vec![2],
+                "rename inside Some({nested}(..)) should leave Config::port alone"
+            );
+
+            let with_blank_line = format!(
+                "(\n    server: Some({nested}(\n        port: 80,\n        \n    )),\n    port: 1,\n)"
+            );
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(with_blank_line));
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: at(Position::new(3, 8)),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion inside Some({nested}(..)) returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["host"],
+                "completion inside Some({nested}(..)) should offer Server's unwritten fields"
             );
         }
     }

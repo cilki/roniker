@@ -609,7 +609,9 @@ pub fn find_ancestor_by_kind<'a>(tree: &'a Tree, node: Node<'a>, kind: &str) -> 
 /// inside another struct value — the `Inner(..)` of `Some(Inner(..))` — is that
 /// struct's payload rather than the value of any field. Wrappers that aren't
 /// structs are threaded through, so an array element still finds the field the
-/// array belongs to.
+/// array belongs to, and so is an `Option`'s `Some(..)` (see
+/// [`is_some_wrapper`]): the `(port: 1)` of `server: Some((port: 1))` is the
+/// value of `server` as much as it would be written bare.
 ///
 /// Threading the answer down a walk costs nothing. Asking for it per value
 /// means walking back up per value, which is what makes a walk over a nested
@@ -619,7 +621,9 @@ pub fn owning_field_for_children<'a>(
     content: &'a str,
     owning_field: Option<&'a str>,
 ) -> Option<&'a str> {
-    if node.kind() == "struct" {
+    if is_some_wrapper(node, content) {
+        owning_field
+    } else if node.kind() == "struct" {
         None
     } else {
         field_name(node, content).or(owning_field)
@@ -853,6 +857,14 @@ pub fn unwrap_some<'a>(node: &Node<'a>, content: &str) -> Option<Node<'a>> {
     }
 }
 
+/// Whether `node` is an `Option`'s `Some(..)` around a single value. It parses
+/// as a `struct` named `Some`, but it is no struct value of the document's
+/// types: walks that resolve the type of each struct value see straight
+/// through it to the value it wraps, the way diagnostics do.
+pub fn is_some_wrapper(node: &Node, content: &str) -> bool {
+    unwrap_some(node, content).is_some()
+}
+
 /// The enum variant a value names, and where that name is written.
 #[derive(Debug, Clone)]
 pub struct ParsedEnumVariant {
@@ -1000,6 +1012,19 @@ mod tests {
         // Anything else passes on what it was handed, so an array element
         // still finds the field the array belongs to.
         assert_eq!(field_of("array", Some("server")), Some("server"));
+
+        // So does a `Some(..)`, though it parses as a struct: what it wraps is
+        // the value of the field the `Some` is written for.
+        let content = "Config(server: Some((port: 1)))";
+        let tree = parse(content).unwrap();
+        let some = descendants_by_kind(&tree, "struct")
+            .into_iter()
+            .find(|node| struct_name(node, content) == Some("Some"))
+            .expect("fixture must contain the Some");
+        assert_eq!(
+            owning_field_for_children(&some, content, Some("server")),
+            Some("server")
+        );
     }
 
     #[test]
