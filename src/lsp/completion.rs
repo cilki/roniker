@@ -491,18 +491,24 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
 
     match &type_info.kind {
         TypeKind::Struct(fields) => {
-            // Generate a snippet for the struct with all fields (serialized names)
-            let rename_all = type_info.rename_all.as_deref();
-            let field_snippets: Vec<String> = fields
-                .iter()
-                .filter(|f| !f.skip)
-                .enumerate()
-                .map(|(i, f)| format!("    {}: ${{{}}}", f.serialized_name(rename_all), i + 1))
-                .collect();
+            let fields: Vec<_> = fields.iter().filter(|f| !f.skip).collect();
 
-            let snippet = if field_snippets.is_empty() {
+            let snippet = if fields.is_empty() {
                 format!("{}()", type_name)
+            } else if fields.iter().all(|f| f.is_positional()) {
+                // A tuple or newtype struct is written as its values in order,
+                // `Point(1, 2)`: its fields' names are their indices, and
+                // `Point(0: 1, 1: 2)` isn't RON.
+                let stops: Vec<String> = (1..=fields.len()).map(|i| format!("${{{i}}}")).collect();
+                format!("{}({})", type_name, stops.join(", "))
             } else {
+                // One field per line, under the names serde reads.
+                let rename_all = type_info.rename_all.as_deref();
+                let field_snippets: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| format!("    {}: ${{{}}}", f.serialized_name(rename_all), i + 1))
+                    .collect();
                 format!("{}(\n{},\n)", type_name, field_snippets.join(",\n"))
             };
 
@@ -1311,6 +1317,42 @@ mod tests {
                 labels
             );
         }
+    }
+
+    /// A tuple struct's fields are named by their index, so spelling them out
+    /// the way a named struct's are offered `Point(\n    0: ${1},\n ...)`,
+    /// which `ron` can't parse. Its values are written in order instead.
+    #[test]
+    fn test_tuple_struct_completed_as_its_values_in_order() {
+        let positional = |index: usize, type_name: &str| FieldInfo {
+            name: index.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let snippet = |fields: Vec<FieldInfo>| {
+            create_type_completion(&TypeInfo {
+                name: "crate::Point".to_string(),
+                kind: TypeKind::Struct(fields),
+                ..Default::default()
+            })
+            .insert_text
+            .unwrap()
+        };
+
+        assert_eq!(
+            snippet(vec![positional(0, "i32"), positional(1, "i32")]),
+            "Point(${1}, ${2})"
+        );
+        assert_eq!(snippet(vec![positional(0, "u16")]), "Point(${1})");
+        assert_eq!(
+            snippet(vec![FieldInfo {
+                name: "x".to_string(),
+                type_name: "i32".to_string(),
+                ..Default::default()
+            }]),
+            "Point(\n    x: ${1},\n)",
+            "a named struct keeps one field per line"
+        );
     }
 
     /// The "already written" filter has to be read off the same value the
