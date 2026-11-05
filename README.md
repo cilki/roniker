@@ -449,6 +449,10 @@ What gets offered depends on where in the value the cursor sits:
   element of a `Vec` or a set (`modes: [|]` offers `Mode`'s variants), what a
   `Some(|)` wraps, and a map entry's key or value, nested as deep as the type
   goes (`Option<Vec<Mode>>` is `Some([|])`).
+- On the name of a value whose parentheses are already written
+  (`server: Serv|erConfig(..)`, `mode: Cu|stom(level: 1)`): the names that fit
+  there — the struct the field is declared as, or the enum's variants — and
+  only the name is inserted, so the parentheses and what is in them are kept.
 - Every registered type, as a fallback, when the field's declared type yields
   none of the above — anything the build script was not given the source for.
 

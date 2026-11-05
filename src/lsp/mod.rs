@@ -313,7 +313,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let Some(type_info) = self.resolve_owner_type_at(&doc.content, Some(tree), position) else {
+        let Some(type_info) = self.resolve_completion_owner_at(&doc.content, tree, position) else {
             return Ok(None);
         };
         let completions = completion::generate_completions_for_type(
@@ -773,6 +773,28 @@ impl Backend {
         let contexts = tree
             .map(|t| tree_sitter_parser::find_type_context_at_position(t, content, position))
             .unwrap_or_default();
+        navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
+    }
+
+    /// The type a completion at `position` is answered from: the one owning
+    /// the fields there, as [`Backend::resolve_owner_type_at`] resolves it —
+    /// except on the name of a struct value, `Serv|erConfig(..)`. What is
+    /// completed there is the value's name, which the type the value sits in
+    /// decides; the value's own type only has field names to offer, and none
+    /// of them is the field being completed, so every type in the workspace
+    /// used to be offered instead, an enum field's variants among them never.
+    fn resolve_completion_owner_at(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        position: Position,
+    ) -> Option<&rust_analyzer::TypeInfo> {
+        let root = self.resolve_root_type_info(content, Some(tree))?;
+        let mut contexts =
+            tree_sitter_parser::find_type_context_at_position(tree, content, position);
+        if tree_sitter_parser::on_struct_value_name(tree, content, position) {
+            contexts.pop();
+        }
         navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
     }
 
@@ -2139,6 +2161,128 @@ Document::new(content.to_string()),
             let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
             assert_eq!(&labels, expected, "completion in {marked:?}");
         }
+    }
+
+    /// On the name of a value that already has its parentheses — a struct or
+    /// a variant carrying data — completion offers what the field it is
+    /// written for takes, and inserts only the name. It used to resolve the
+    /// value's own type, find no field of that type to complete for, and offer
+    /// every type in the workspace as a full snippet: an enum field never got
+    /// its variants, and accepting anything added a second pair of parentheses.
+    #[tokio::test]
+    async fn test_completion_on_the_name_of_a_value_with_parentheses() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("mode", "Mode"),
+                field("server", "Server"),
+                field("servers", "Vec<Server>"),
+                field("backup", "Option<Server>"),
+                field("by_name", "HashMap<String, Server>"),
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![field("port", "u16")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Fast".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Custom".to_string(),
+                    fields: vec![field("level", "u8")],
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+
+        let variants = vec!["Fast", "Custom"];
+        let server = vec!["Server"];
+        // The document, with `|` marking the cursor, and what completing there
+        // offers.
+        for (marked, expected) in [
+            ("Config(mode: Cu|stom(level: 1))", &variants),
+            ("Config(mode: |Custom(level: 1))", &variants),
+            ("Config(mode: Custom|(level: 1))", &variants),
+            ("Config(server: Ser|ver(port: 1))", &server),
+            ("Config(server: Server|())", &server),
+            ("Config(servers: [Ser|ver(port: 1)])", &server),
+            ("Config(backup: Some(Ser|ver(port: 1)))", &server),
+            ("Config(by_name: {\"a\": Ser|ver(port: 1)})", &server),
+        ] {
+            let offset = marked.find('|').unwrap();
+            let content = marked.replacen('|', "", 1);
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(0, offset as u32),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(&labels, expected, "completion in {marked:?}");
+            for item in &items {
+                assert_eq!(
+                    item.insert_text.as_deref(),
+                    Some(item.label.as_str()),
+                    "completion in {marked:?} inserts more than the name"
+                );
+                assert_eq!(item.insert_text_format, None, "completion in {marked:?}");
+            }
+        }
+
+        // Inside the parentheses the value's own fields are still what is
+        // offered.
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document::new("Config(server: Server())".to_string()),
+        );
+        let completion = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(0, 22),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+        let Some(CompletionResponse::Array(items)) = completion else {
+            panic!("completion inside Server() returned nothing");
+        };
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["port"]);
     }
 
     /// Whole-document formatting lays out the tree the document already

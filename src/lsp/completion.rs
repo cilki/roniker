@@ -25,6 +25,10 @@ enum CompletionContext {
     FieldValue(ValueSlot),
     /// Completing the struct type name of a nested value
     StructType(ValueSlot),
+    /// Completing the name of a value whose parentheses are already written —
+    /// `Serv|erConfig(host: "x")`, `cus|tom(verbosity: 3)` — so only the name
+    /// is inserted, not another pair of them.
+    ValueName(ValueSlot),
 }
 
 /// Where a value being completed sits: the field it is written for, and the
@@ -288,6 +292,15 @@ fn field_completion_context(
                 steps,
             };
 
+            // On the name of a struct value or variant that already has its
+            // parentheses.
+            if innermost.is_some_and(|value| {
+                !ts_utils::is_some_wrapper(&value, content)
+                    && tree_sitter_parser::cursor_on_struct_name(&value, cursor)
+            }) {
+                return CompletionContext::ValueName(slot);
+            }
+
             // Check if there's already some text (might be completing a type)
             if let Some(val_text) = innermost.and_then(|value| ts_utils::node_text(&value, content))
                 && val_text
@@ -352,6 +365,16 @@ pub fn generate_completions_for_type(
         CompletionContext::StructType(slot) => field_type(slot)
             .map(|t| generate_type_completions_by_type(&t, &analyzer))
             .unwrap_or_default(),
+        CompletionContext::ValueName(slot) => field_type(slot)
+            .map(|t| generate_type_completions_by_type(&t, &analyzer))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| CompletionItem {
+                insert_text: Some(item.label.clone()),
+                insert_text_format: None,
+                ..item
+            })
+            .collect(),
     }
 }
 

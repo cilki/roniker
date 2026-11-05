@@ -136,6 +136,29 @@ fn unterminated_field_pair<'a>(
         .map(|pair| (pair[0], pair[1]))
 }
 
+/// Whether byte offset `cursor` is on the name `struct_node` is written with —
+/// the `ServerConfig` of `ServerConfig(..)`, from its first character to just
+/// past its last — rather than inside its parentheses. Always `false` for a
+/// value written without a name, `(..)`.
+pub fn cursor_on_struct_name(struct_node: &Node, cursor: usize) -> bool {
+    struct_node.kind() == "struct"
+        && struct_node.child(0).is_some_and(|name| {
+            name.kind() == "identifier" && name.start_byte() <= cursor && cursor <= name.end_byte()
+        })
+}
+
+/// Whether `position` is on the name of the innermost struct value around it,
+/// as [`cursor_on_struct_name`] decides. A `Some(..)` is no value of its own
+/// (see [`is_some_wrapper`]), so the cursor on a `Some` is not counted.
+pub fn on_struct_value_name(tree: &Tree, content: &str, position: Position) -> bool {
+    let cursor = position_to_byte_offset(content, position);
+    node_at_position(tree, content, position)
+        .and_then(|current| ancestors(tree, current).find(|node| node.kind() == "struct"))
+        .is_some_and(|node| {
+            !is_some_wrapper(&node, content) && cursor_on_struct_name(&node, cursor)
+        })
+}
+
 /// Find the current variant context (enum variant name) at a position
 pub fn find_current_variant_context(
     tree: &Tree,
