@@ -399,7 +399,9 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         // A selection reaching past the last line names text that isn't there.
-        if range.end.line as usize >= doc.content.lines().count() {
+        // The empty line after a trailing newline is still part of the
+        // document: it is where an editor puts the end of a select-all.
+        if range.end.line as usize > doc.content.matches('\n').count() {
             return Ok(None);
         }
 
@@ -409,11 +411,21 @@ impl LanguageServer for Backend {
         let end = ts_utils::position_to_byte_offset(&doc.content, range.end);
         let selected_text = &doc.content[start..end];
 
+        // Only the value is laid out; the whitespace around it is kept as it
+        // is. The layout writes the value and nothing after it, so a selection
+        // of whole lines — a select-all included — would otherwise lose the
+        // line break it ends with and join the line after it, and one starting
+        // at column 0 of an indented line would lose that indentation.
+        let trimmed_start = selected_text.trim_start();
+        let leading = &selected_text[..selected_text.len() - trimmed_start.len()];
+        let value = trimmed_start.trim_end();
+        let trailing = &trimmed_start[value.len()..];
+
         // Lines end the way the document's do: a selection on one line has no
         // line break of its own to go by.
-        let formatted = format::format_ron_with_line_ending(
-            selected_text,
-            ts_utils::line_ending(&doc.content),
+        let formatted = format!(
+            "{leading}{}{trailing}",
+            format::format_ron_with_line_ending(value, ts_utils::line_ending(&doc.content))
         );
         if formatted == selected_text {
             return Ok(None);
@@ -2750,6 +2762,82 @@ PostReference(
             }]
         );
         assert_eq!(edits[0].new_text, "User(\n    id: 1,\n    name: \"Bob\",\n)");
+    }
+
+    /// A selection of whole lines ends at column 0 of the line after it, and a
+    /// select-all in a file with a trailing newline ends on the empty line
+    /// after that newline. Both are formatted, and the whitespace around the
+    /// selected value is kept: the line break it ends with, so the next line
+    /// isn't pulled up onto the value's last one, and the indentation of the
+    /// line it starts on.
+    #[tokio::test]
+    async fn test_range_formatting_whole_lines_keeps_surrounding_whitespace() {
+        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "User(\nid:1,\nname:\"Bob\",\n)\n";
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: url.clone(),
+                    language_id: "ron".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+
+        let format = async |range| {
+            backend
+                .range_formatting(DocumentRangeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: url.clone() },
+                    range,
+                    options: Default::default(),
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .unwrap()
+        };
+
+        // Select-all: from the start to the empty line after the final newline.
+        let all = Range::new(Position::new(0, 0), Position::new(4, 0));
+        assert_eq!(
+            format(all).await,
+            Some(vec![TextEdit {
+                range: all,
+                new_text: "User(\n    id: 1,\n    name: \"Bob\",\n)\n".to_string(),
+            }])
+        );
+
+        // Nothing exists past that line.
+        assert_eq!(
+            format(Range::new(Position::new(0, 0), Position::new(5, 0))).await,
+            None
+        );
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: url.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "Post(\n    tags:\n    [\"a\",\n\"b\"]\n)\n".to_string(),
+                }],
+            })
+            .await;
+
+        // Lines 2 and 3 whole: the indented list, up to column 0 of line 4.
+        let lines = Range::new(Position::new(2, 0), Position::new(4, 0));
+        assert_eq!(
+            format(lines).await,
+            Some(vec![TextEdit {
+                range: lines,
+                new_text: "    [\n    \"a\",\n    \"b\",\n]\n".to_string(),
+            }])
+        );
     }
 
     #[test]
