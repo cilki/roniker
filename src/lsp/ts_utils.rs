@@ -6,43 +6,6 @@ use std::cell::RefCell;
 use tower_lsp_server::ls_types::{Position, Range};
 use tree_sitter::{Node, Parser, Point, Tree};
 
-/// Wrapper around tree-sitter parser for RON files
-pub struct RonParser {
-    parser: Parser,
-}
-
-impl RonParser {
-    pub fn new() -> Self {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&ron_lsp_tree_sitter::language())
-            .expect("Error loading RON language");
-        Self { parser }
-    }
-
-    /// Parse RON content and return the tree
-    pub fn parse(&mut self, content: &str) -> Option<Tree> {
-        self.parse_with(content, None).0
-    }
-
-    /// Re-parse content reusing a previous (edited) tree for incremental
-    /// parsing.
-    ///
-    /// Alongside the tree comes whether it may be handed back here as
-    /// `old_tree` after the next edit. It may not when `content` holds a raw
-    /// string: tree-sitter was then shown [masked](mask_raw_strings) text, and
-    /// an edit can change the masking of bytes well outside the edited range
-    /// (opening a `"` earlier on turns a later raw string into string
-    /// contents), which an incremental re-parse would never look at again.
-    /// For the same reason `old_tree` is ignored when `content` holds one.
-    pub fn parse_with(&mut self, content: &str, old_tree: Option<&Tree>) -> (Option<Tree>, bool) {
-        match mask_raw_strings(content) {
-            Cow::Borrowed(text) => (self.parser.parse(text, old_tree), true),
-            Cow::Owned(text) => (self.parser.parse(&text, None), false),
-        }
-    }
-}
-
 /// `content` with every raw string (`r"..."`, `r#"..."#`, ...) rewritten as an
 /// ordinary quoted string of exactly the same length, for tree-sitter to parse
 /// in its place.
@@ -165,29 +128,42 @@ fn memchr(needle: u8, bytes: &[u8], from: usize) -> Option<usize> {
         .map(|at| from + at)
 }
 
-impl Default for RonParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 thread_local! {
     // Building a `Parser` allocates and loads the RON grammar via `set_language`,
     // which is wasteful to repeat on every parse (e.g. once per keystroke through
     // `Document::apply_change`). Keep one parser per thread and reuse it.
-    static PARSER: RefCell<RonParser> = RefCell::new(RonParser::new());
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut parser = Parser::new();
+        parser
+            .set_language(&ron_lsp_tree_sitter::language())
+            .expect("Error loading RON language");
+        parser
+    });
 }
 
 /// Parse RON content using the thread-local reusable parser.
 pub fn parse(content: &str) -> Option<Tree> {
-    PARSER.with(|parser| parser.borrow_mut().parse(content))
+    parse_with(content, None).0
 }
 
 /// Re-parse content reusing a previous (edited) tree for incremental parsing,
-/// backed by the thread-local reusable parser. See [`RonParser::parse_with`]
-/// for what the `bool` says.
+/// backed by the thread-local reusable parser.
+///
+/// Alongside the tree comes whether it may be handed back here as `old_tree`
+/// after the next edit. It may not when `content` holds a raw string:
+/// tree-sitter was then shown [masked](mask_raw_strings) text, and an edit can
+/// change the masking of bytes well outside the edited range (opening a `"`
+/// earlier on turns a later raw string into string contents), which an
+/// incremental re-parse would never look at again. For the same reason
+/// `old_tree` is ignored when `content` holds one.
 pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> (Option<Tree>, bool) {
-    PARSER.with(|parser| parser.borrow_mut().parse_with(content, old_tree))
+    PARSER.with(|parser| {
+        let mut parser = parser.borrow_mut();
+        match mask_raw_strings(content) {
+            Cow::Borrowed(text) => (parser.parse(text, old_tree), true),
+            Cow::Owned(text) => (parser.parse(&text, None), false),
+        }
+    })
 }
 
 /// The text of row `row`, counting rows the way tree-sitter does: one per `\n`,
@@ -1174,15 +1150,13 @@ mod tests {
 
     #[test]
     fn test_parse_simple_struct() {
-        let mut parser = RonParser::new();
-        let tree = parser.parse("User(id: 1, name: \"test\")");
+        let tree = parse("User(id: 1, name: \"test\")");
         assert!(tree.is_some());
     }
 
     #[test]
     fn test_struct_name() {
-        let mut parser = RonParser::new();
-        let tree = parser.parse("User(id: 1)").unwrap();
+        let tree = parse("User(id: 1)").unwrap();
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1195,8 +1169,7 @@ mod tests {
 
     #[test]
     fn test_struct_fields() {
-        let mut parser = RonParser::new();
-        let tree = parser.parse("User(id: 1, name: \"test\")").unwrap();
+        let tree = parse("User(id: 1, name: \"test\")").unwrap();
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1240,8 +1213,7 @@ mod tests {
     #[test]
     fn test_field_name() {
         let content = "User(id: 1)";
-        let mut parser = RonParser::new();
-        let tree = parser.parse(content).unwrap();
+        let tree = parse(content).unwrap();
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1256,8 +1228,7 @@ mod tests {
     #[test]
     fn test_struct_name_extraction() {
         let content = "User(id: 1)";
-        let mut parser = RonParser::new();
-        let tree = parser.parse(content).unwrap();
+        let tree = parse(content).unwrap();
 
         if let Some(main_value) = find_main_value(&tree) {
             assert_eq!(main_value.kind(), "struct");
@@ -1271,9 +1242,8 @@ mod tests {
 
     #[test]
     fn test_empty_structure() {
-        let mut parser = RonParser::new();
         let content = "Unit()";
-        let tree = parser.parse(content).unwrap();
+        let tree = parse(content).unwrap();
 
         if let Some(value) = find_main_value(&tree) {
             assert_eq!(value.kind(), "struct");
@@ -1586,8 +1556,7 @@ mod tests {
     #[test]
     fn test_field_value_extraction_nested() {
         let content = "Post(author: User(id: 1, name: \"Alice\"))";
-        let mut parser = RonParser::new();
-        let tree = parser.parse(content).unwrap();
+        let tree = parse(content).unwrap();
 
         if let Some(main) = find_main_value(&tree) {
             let fields = struct_fields(&main);
@@ -1606,8 +1575,7 @@ mod tests {
     #[test]
     fn test_parse_double_colon_syntax() {
         let content = "MyEnum::StructVariant(\n    field_a: \"test\"\n)";
-        let mut parser = RonParser::new();
-        let tree = parser.parse(content);
+        let tree = parse(content);
 
         if let Some(tree) = tree {
             println!("Parsed successfully");

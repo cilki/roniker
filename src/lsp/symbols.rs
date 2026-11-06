@@ -107,7 +107,7 @@ mod tests {
     use super::*;
 
     fn parse(content: &str) -> Tree {
-        ts_utils::RonParser::new().parse(content).unwrap()
+        ts_utils::parse(content).unwrap()
     }
 
     #[test]

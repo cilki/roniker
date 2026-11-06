@@ -218,11 +218,10 @@ fn collect_direct_field_names(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ts_utils::RonParser;
     use super::*;
 
     fn parse(content: &str) -> Tree {
-        RonParser::new().parse(content).unwrap()
+        super::super::ts_utils::parse(content).unwrap()
     }
 
     #[test]
@@ -231,8 +230,7 @@ mod tests {
     name: "test",
     age: 30,
 )"#;
-        let mut parser = RonParser::new();
-        let tree = parser.parse(content);
+        let tree = super::super::ts_utils::parse(content);
         assert!(tree.is_some());
     }
 

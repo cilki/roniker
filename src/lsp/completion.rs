@@ -774,7 +774,7 @@ mod tests {
         let position = Position::new(1, 4); // Inside the parens
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
@@ -889,7 +889,7 @@ mod tests {
         let position = Position::new(0, 0);
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
@@ -945,7 +945,7 @@ mod tests {
         let analyzer = std::sync::Arc::new(analyzer);
 
         let content = "Config(mode: P)";
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, Position::new(0, 14), &parent, analyzer);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -1008,7 +1008,7 @@ mod tests {
         // context, since the value text isn't a bare identifier.
         let content = "Config(\n    mode: \"\"\n)";
         let position = Position::new(1, 11); // inside the quotes, after `mode: `
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, position, &parent, analyzer);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -1150,7 +1150,7 @@ mod tests {
         let content = "(\n    \n)";
         let position = Position::new(1, 4);
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
@@ -1191,7 +1191,7 @@ mod tests {
         let content = "";
         let position = Position::new(0, 0);
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
             generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
@@ -1264,7 +1264,7 @@ mod tests {
         type_info: &TypeInfo,
         analyzer: Arc<RustAnalyzer>,
     ) -> Vec<String> {
-        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = crate::lsp::ts_utils::parse(content).unwrap();
         generate_completions_for_type(&tree, content, position, type_info, analyzer)
             .into_iter()
             .map(|item| item.label)

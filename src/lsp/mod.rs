@@ -37,7 +37,7 @@ pub struct Document {
     // Cloning a Tree is cheap (tree-sitter trees are copy-on-write).
     tree: Option<tree_sitter::Tree>,
     // Whether `tree` can seed an incremental re-parse after an edit; see
-    // `ts_utils::RonParser::parse_with`.
+    // `ts_utils::parse_with`.
     tree_reusable: bool,
 }
 
@@ -2514,7 +2514,7 @@ User(
         )"#;
         let position = Position::new(1, 12); // On "length" line
 
-        let tree = ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = ts_utils::parse(content).unwrap();
         let variant = tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert_eq!(
             variant,
@@ -2531,7 +2531,7 @@ User(
         )"#;
         let position = Position::new(1, 20); // On "length" line, after colon
 
-        let tree = ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = ts_utils::parse(content).unwrap();
         let variant_name =
             tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert!(
@@ -2634,7 +2634,7 @@ PostReference(
             "Should detect 'length' word"
         );
 
-        let tree = ts_utils::RonParser::new().parse(content).unwrap();
+        let tree = ts_utils::parse(content).unwrap();
         let variant = tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert_eq!(
             variant,
