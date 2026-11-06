@@ -67,11 +67,7 @@ pub fn generate_remove_field_actions(
         let Some(node) = tree.root_node().descendant_for_byte_range(offset, offset) else {
             continue;
         };
-        let Some(field_node) = (if node.kind() == "field" {
-            Some(node)
-        } else {
-            ts_utils::find_ancestor_by_kind(tree, node, "field")
-        }) else {
+        let Some(field_node) = ts_utils::innermost_of_kind(tree, node, "field") else {
             continue;
         };
         let Some(name) = ts_utils::field_name(&field_node, content) else {

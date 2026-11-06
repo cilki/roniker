@@ -574,11 +574,7 @@ fn field_name_node_at<'a>(
     position: Position,
 ) -> Option<tree_sitter::Node<'a>> {
     let node = ts_utils::node_at_position(tree, content, position)?;
-    let field_node = if node.kind() == "field" {
-        node
-    } else {
-        ts_utils::find_ancestor_by_kind(tree, node, "field")?
-    };
+    let field_node = ts_utils::innermost_of_kind(tree, node, "field")?;
     let name_node = field_node.child(0)?;
 
     // The cursor must be on the name itself, not the value

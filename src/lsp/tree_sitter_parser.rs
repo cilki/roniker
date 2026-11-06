@@ -1,6 +1,6 @@
 use super::ts_utils::{
-    ancestor_chain, ancestors, child_by_kind, field_name, is_some_wrapper, node_at_position,
-    node_text, owning_field_for_children, position_to_byte_offset, struct_name,
+    ancestor_chain, ancestors, child_by_kind, field_name, innermost_of_kind, is_some_wrapper,
+    node_at_position, node_text, owning_field_for_children, position_to_byte_offset, struct_name,
 };
 use tower_lsp_server::ls_types::Position;
 use tree_sitter::{Node, Tree};
@@ -124,7 +124,7 @@ fn unterminated_field_pair<'a>(
     position: Position,
 ) -> Option<(Node<'a>, Node<'a>)> {
     let cursor_byte = position_to_byte_offset(content, position);
-    let struct_node = ancestors(tree, node).find(|n| n.kind() == "struct")?;
+    let struct_node = innermost_of_kind(tree, node, "struct")?;
 
     let mut walk = struct_node.walk();
     let children: Vec<Node> = struct_node.children(&mut walk).collect();
@@ -153,7 +153,7 @@ pub fn cursor_on_struct_name(struct_node: &Node, cursor: usize) -> bool {
 pub fn on_struct_value_name(tree: &Tree, content: &str, position: Position) -> bool {
     let cursor = position_to_byte_offset(content, position);
     node_at_position(tree, content, position)
-        .and_then(|current| ancestors(tree, current).find(|node| node.kind() == "struct"))
+        .and_then(|current| innermost_of_kind(tree, current, "struct"))
         .is_some_and(|node| {
             !is_some_wrapper(&node, content) && cursor_on_struct_name(&node, cursor)
         })
@@ -192,7 +192,7 @@ pub fn extract_fields_from_ron(tree: &Tree, content: &str, position: Position) -
     let mut fields = std::collections::HashSet::new();
 
     let enclosing = node_at_position(tree, content, position)
-        .and_then(|node| ancestors(tree, node).find(|n| n.kind() == "struct"))
+        .and_then(|node| innermost_of_kind(tree, node, "struct"))
         .or_else(|| child_by_kind(&tree.root_node(), "struct"));
     if let Some(struct_node) = enclosing {
         // Collect only direct child fields of this struct

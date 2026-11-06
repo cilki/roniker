@@ -571,9 +571,11 @@ pub fn ancestors<'a>(tree: &'a Tree, node: Node<'a>) -> impl Iterator<Item = Nod
     ancestor_chain(tree, node).into_iter().rev()
 }
 
-/// Find the first ancestor of a node with a given kind
-pub fn find_ancestor_by_kind<'a>(tree: &'a Tree, node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    ancestors(tree, node).skip(1).find(|n| n.kind() == kind)
+/// The innermost node of `kind` that `node` is inside of, `node` itself
+/// included: the `field` a cursor is in whether it landed on the field node or
+/// on something within it.
+pub fn innermost_of_kind<'a>(tree: &'a Tree, node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    ancestors(tree, node).find(|n| n.kind() == kind)
 }
 
 /// The owning field name to hand a node's children, given the one that reached
