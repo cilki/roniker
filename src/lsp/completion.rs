@@ -361,8 +361,18 @@ pub fn generate_completions_for_type(
                 completions
             }
         }
+        // A bare word is the start of a type or variant name — or of any other
+        // value spelled as a word: `t` on the way to `true`, `So` to `Some(..)`.
+        // A field whose type names no workspace type gets its plain values, or
+        // a half-typed `debug: t` was offered nothing at all.
         CompletionContext::StructType(slot) => field_type(slot)
-            .map(|t| generate_type_completions_by_type(&t, analyzer))
+            .map(|t| {
+                let types = generate_type_completions_by_type(&t, analyzer);
+                match types.is_empty() {
+                    true => generate_value_completions_by_type(&t, analyzer),
+                    false => types,
+                }
+            })
             .unwrap_or_default(),
         CompletionContext::ValueName(slot) => field_type(slot)
             .map(|t| generate_type_completions_by_type(&t, analyzer))
@@ -1328,6 +1338,44 @@ mod tests {
                 "the field's declared type should be offered for {:?}: {:?}",
                 content,
                 labels
+            );
+        }
+    }
+
+    #[test]
+    fn test_half_typed_word_value_completed_from_the_fields_type() {
+        // A half-typed `true` or `Some` is a bare word, the same shape as a
+        // half-typed type name, and used to be completed only from workspace
+        // types: a `bool` or `Option<u64>` field was offered nothing.
+        let root = TypeInfo {
+            name: "AppConfig".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "debug".to_string(),
+                    type_name: "bool".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "timeout".to_string(),
+                    type_name: "Option<u64>".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(root.clone());
+
+        for (content, position, expected) in [
+            ("AppConfig(debug: t)", Position::new(0, 18), "true"),
+            ("AppConfig(debug: fal,)", Position::new(0, 20), "false"),
+            ("AppConfig(timeout: So)", Position::new(0, 21), "Some()"),
+            ("AppConfig(timeout: N,)", Position::new(0, 20), "None"),
+        ] {
+            let labels = labels_at(content, position, &root, &analyzer);
+            assert!(
+                labels.contains(&expected.to_string()),
+                "{expected} should be offered for {content:?}: {labels:?}"
             );
         }
     }
