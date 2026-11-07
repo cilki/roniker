@@ -348,10 +348,7 @@ impl<'a> NestedWalk<'a> {
             false => super::type_utils::missing_required_fields(&target.fields, present),
         };
         let all = match offer_all {
-            true => target
-                .fields
-                .iter()
-                .filter(|(name, field)| !present(name) && !present(&field.name))
+            true => super::type_utils::missing_fields(&target.fields, present)
                 .cloned()
                 .collect(),
             false => Vec::new(),
@@ -2536,6 +2533,51 @@ mod tests {
         for edits in edit_sets {
             assert_eq!(apply(content, edits), "Cfg(\n    a: 1,\n    b: \"\",\n)");
         }
+    }
+
+    /// A field written under its `#[serde(alias)]` is present, as the validator
+    /// and the required-field action already agreed. "Add all missing fields"
+    /// only looked at the serialized and Rust names, so it offered to insert
+    /// the aliased field a second time — a document `ron` then refuses.
+    #[test]
+    fn test_add_all_missing_fields_skips_a_field_written_under_an_alias() {
+        let type_info = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "debug_mode".to_string(),
+                    type_name: "Option<bool>".to_string(),
+                    aliases: vec!["verbose".to_string()],
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "port".to_string(),
+                    type_name: "Option<u16>".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "Cfg(\n    verbose: Some(true),\n)";
+
+        let actions = generate_code_actions(
+            &parse(content),
+            content,
+            &type_info,
+            &url,
+            &RustAnalyzer::new(),
+            WHOLE_DOCUMENT,
+            &[],
+        );
+        let titles: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => Some(a.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["Add all 1 missing field"]);
     }
 
     /// The validator reports `missing-required-field` on a nested `()`, so the

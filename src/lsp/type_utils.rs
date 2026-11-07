@@ -254,25 +254,33 @@ pub fn closest_name<'a>(
     best.map(|(name, _)| name)
 }
 
-/// Fields that must be present in the RON: not `Option<T>`, no default.
-/// Takes `(serialized_name, field)` pairs (see `TypeInfo::effective_fields` /
-/// `EnumVariant::effective_fields`); a field counts as present under any name
-/// serde would accept for it — its serialized name, its Rust name, or any
-/// `#[serde(alias = "...")]`. Missing the aliases here would report a field as
-/// absent even though the unknown-field check just accepted the alias that
-/// supplies it.
+/// The fields the RON doesn't supply. Takes `(serialized_name, field)` pairs
+/// (see `TypeInfo::effective_fields` / `EnumVariant::effective_fields`); a
+/// field counts as present under any name serde would accept for it — its
+/// serialized name, its Rust name, or any `#[serde(alias = "...")]`. Missing
+/// the aliases here would report a field as absent even though the
+/// unknown-field check just accepted the alias that supplies it.
+///
+/// This is the one rule the diagnostics, the field-name completion and the
+/// missing-field quick-fixes all decide presence by, so none of them can
+/// re-offer or re-demand a field another one considers written.
+pub fn missing_fields(
+    fields: &[(String, FieldInfo)],
+    is_present: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = &(String, FieldInfo)> {
+    fields.iter().filter(move |(name, f)| {
+        !is_present(name) && !is_present(&f.name) && !f.aliases.iter().any(|a| is_present(a))
+    })
+}
+
+/// The [`missing_fields`] that must be present in the RON: not `Option<T>`, no
+/// default.
 pub fn missing_required_fields(
     fields: &[(String, FieldInfo)],
     is_present: impl Fn(&str) -> bool,
 ) -> Vec<(String, FieldInfo)> {
-    fields
-        .iter()
-        .filter(|(name, f)| {
-            !is_present(name)
-                && !is_present(&f.name)
-                && !f.aliases.iter().any(|a| is_present(a))
-                && !f.is_optional()
-        })
+    missing_fields(fields, is_present)
+        .filter(|(_, f)| !f.is_optional())
         .cloned()
         .collect()
 }

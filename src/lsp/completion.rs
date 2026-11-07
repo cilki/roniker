@@ -1,8 +1,8 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
     MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type,
-    is_number_type, is_wrapped_by, map_entry_types, normalize_type, short_name, std_type,
-    strip_outer_generic, tuple_element_types,
+    is_number_type, is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name,
+    std_type, strip_outer_generic, tuple_element_types,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
@@ -438,13 +438,7 @@ fn generate_field_completions(
     // Offer only the fields not already written, under any name serde
     // accepts for them.
     let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
-    fields
-        .iter()
-        .filter(|(name, field)| {
-            !used_fields.contains(name)
-                && !used_fields.contains(&field.name)
-                && !field.aliases.iter().any(|a| used_fields.contains(a))
-        })
+    missing_fields(&fields, |name| used_fields.contains(name))
         .map(|(name, field)| field_completion(name, field))
         .collect()
 }

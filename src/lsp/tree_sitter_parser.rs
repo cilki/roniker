@@ -1,7 +1,9 @@
 use super::ts_utils::{
     ancestor_chain, ancestors, child_by_kind, field_name, innermost_of_kind, is_some_wrapper,
-    node_at_position, node_text, owning_field_for_children, position_to_byte_offset, struct_name,
+    node_at_position, node_text, owning_field_for_children, position_to_byte_offset, struct_fields,
+    struct_name,
 };
+use std::collections::HashSet;
 use tower_lsp_server::ls_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -188,32 +190,21 @@ pub fn find_current_variant_context(
 ///
 /// A cursor inside no struct at all (in whitespace around the root value) falls
 /// back to the root value's fields.
-pub fn extract_fields_from_ron(tree: &Tree, content: &str, position: Position) -> Vec<String> {
-    let mut fields = std::collections::HashSet::new();
-
-    let enclosing = node_at_position(tree, content, position)
+pub fn extract_fields_from_ron<'a>(
+    tree: &Tree,
+    content: &'a str,
+    position: Position,
+) -> HashSet<&'a str> {
+    node_at_position(tree, content, position)
         .and_then(|node| innermost_of_kind(tree, node, "struct"))
-        .or_else(|| child_by_kind(&tree.root_node(), "struct"));
-    if let Some(struct_node) = enclosing {
-        // Collect only direct child fields of this struct
-        collect_direct_field_names(&struct_node, content, &mut fields);
-    }
-
-    fields.into_iter().collect()
-}
-
-/// Collect only direct child field names from a struct node (not recursively)
-fn collect_direct_field_names(
-    node: &Node,
-    content: &str,
-    fields: &mut std::collections::HashSet<String>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(name) = field_name(&child, content) {
-            fields.insert(name.to_string());
-        }
-    }
+        .or_else(|| child_by_kind(&tree.root_node(), "struct"))
+        .map(|struct_node| {
+            struct_fields(&struct_node)
+                .iter()
+                .filter_map(|field| field_name(field, content))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -388,9 +379,7 @@ mod tests {
     items: [],
 )"#;
         let fields = extract_fields_from_ron(&parse(content), content, Position::new(1, 4));
-        assert!(fields.contains(&"name".to_string()));
-        assert!(fields.contains(&"age".to_string()));
-        assert!(fields.contains(&"items".to_string()));
+        assert_eq!(fields, HashSet::from(["name", "age", "items"]));
     }
 
     #[test]

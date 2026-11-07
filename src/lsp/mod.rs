@@ -2662,8 +2662,8 @@ PostReference(
         );
         assert_eq!(field, Some("name".to_string()));
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
-        assert!(fields.contains(&"id".to_string()));
-        assert!(fields.contains(&"name".to_string()));
+        assert!(fields.contains("id"));
+        assert!(fields.contains("name"));
     }
 
     /// Incoming change ranges are columns in UTF-16 code units. Treating them
@@ -2691,8 +2691,8 @@ PostReference(
         // The reused tree must still agree with the content.
         let tree = doc.tree.as_ref().unwrap();
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
-        assert!(fields.contains(&"name".to_string()), "got {fields:?}");
-        assert!(fields.contains(&"id".to_string()), "got {fields:?}");
+        assert!(fields.contains("name"), "got {fields:?}");
+        assert!(fields.contains("id"), "got {fields:?}");
         assert_eq!(
             tree_sitter_parser::get_field_at_position(tree, &doc.content, Position::new(0, column)),
             Some("id".to_string())
@@ -2726,7 +2726,7 @@ PostReference(
         assert_eq!(doc.content, "User(id: 1, name: \"X\")");
         let tree = doc.tree.as_ref().unwrap();
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
-        assert!(fields.contains(&"name".to_string()));
+        assert!(fields.contains("name"));
 
         // A change without a range replaces the whole document
         doc.apply_change(TextDocumentContentChangeEvent {
@@ -2737,7 +2737,7 @@ PostReference(
         assert_eq!(doc.content, "Post(title: \"hi\")");
         let tree = doc.tree.as_ref().unwrap();
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
-        assert_eq!(fields, vec!["title".to_string()]);
+        assert_eq!(fields, std::collections::HashSet::from(["title"]));
     }
 
     /// A change range whose end precedes its start is malformed, but the server
