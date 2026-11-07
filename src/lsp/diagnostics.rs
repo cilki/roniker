@@ -8,7 +8,6 @@ use crate::rust_analyzer::{
 };
 use ron::Value;
 use std::borrow::Cow;
-use std::sync::Arc;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Tree;
 
@@ -92,7 +91,7 @@ pub fn validate_ron_with_analyzer(
     content: &str,
     tree: Option<&Tree>,
     type_info: &TypeInfo,
-    analyzer: Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -136,7 +135,7 @@ pub fn validate_ron_with_analyzer(
             &main_value,
             content,
             type_info,
-            &analyzer,
+            analyzer,
             true,
         ));
     }
@@ -155,7 +154,7 @@ fn validate_struct_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
     expected: &ExpectedStruct<'_>,
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
     let mut diagnostics = Vec::new();
@@ -287,7 +286,7 @@ fn validate_typed_value(
     value_node: &tree_sitter::Node<'_>,
     content: &str,
     declared_type: &str,
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<Diagnostic> {
     // A literal written straight into a primitive field — most of what a
     // configuration file is made of — needs none of the work below: the parse
@@ -487,7 +486,7 @@ fn validate_nested_value<'a>(
     value_node: &tree_sitter::Node<'a>,
     content: &str,
     field_type: &str,
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Nested {
     let mut diagnostics = Vec::new();
     let mut settled = false;
@@ -636,7 +635,7 @@ fn validate_tuple_value(
     content: &str,
     field_type: &str,
     element_types: &[&str],
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Option<Vec<Diagnostic>> {
     let mismatch = |tail: String| {
         vec![Diagnostic {
@@ -721,7 +720,7 @@ fn validate_node_with_type_info<'a>(
     node: &tree_sitter::Node<'a>,
     content: &str,
     type_info: &TypeInfo,
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
     at_root: bool,
 ) -> Vec<Diagnostic> {
     match &type_info.kind {
@@ -751,7 +750,7 @@ fn validate_enum_node(
     node: &tree_sitter::Node<'_>,
     content: &str,
     type_info: &TypeInfo,
-    analyzer: &Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<Diagnostic> {
     use super::ts_utils;
 
@@ -1132,9 +1131,8 @@ mod tests {
     }
 
     fn syntax_error(content: &str) -> Diagnostic {
-        let analyzer = Arc::new(RustAnalyzer::new());
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &two_field_config(), analyzer);
+        let analyzer = RustAnalyzer::new();
+        let diagnostics = validate_ron_with_analyzer(content, None, &two_field_config(), &analyzer);
         assert_eq!(
             diagnostics.len(),
             1,
@@ -1288,7 +1286,6 @@ mod tests {
             has_default: true,
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
         let config = analyzer.get_type_info("Config").unwrap().clone();
 
         for (root, nested) in [
@@ -1310,8 +1307,7 @@ mod tests {
             );
 
             for (shape, content) in [("multi-line", multiline), ("single-line", single_line)] {
-                let diagnostics =
-                    validate_ron_with_analyzer(&content, None, &config, analyzer.clone());
+                let diagnostics = validate_ron_with_analyzer(&content, None, &config, &analyzer);
                 assert!(
                     diagnostics.iter().any(|d| {
                         d.severity == Some(DiagnosticSeverity::ERROR)
@@ -1326,8 +1322,7 @@ mod tests {
             let good = format!(
                 "{root}(\n    server: {nested}(\n        post_type: Detailed(\n            length: 1,\n        ),\n    ),\n)"
             );
-            let diagnostics =
-                validate_ron_with_analyzer(&good, None, &config, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(&good, None, &config, &analyzer);
             assert!(
                 !diagnostics
                     .iter()
@@ -1339,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_enum_variant_validation() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "PostType".to_string(),
             kind: TypeKind::Enum(vec![
@@ -1370,7 +1365,7 @@ mod tests {
 
         // Valid enum variant
         let content = "Long";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1380,7 +1375,7 @@ mod tests {
 
         // Another valid variant
         let content = "Short";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1390,7 +1385,7 @@ mod tests {
 
         // Invalid enum variant
         let content = "Medium";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(diagnostics.len(), 1, "Medium should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Medium'"),
@@ -1400,7 +1395,7 @@ mod tests {
 
         // Invalid enum variant (typo)
         let content = "Longs";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(diagnostics.len(), 1, "Longs should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Longs'"),
@@ -1411,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_struct_with_enum_field() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1457,7 +1452,7 @@ mod tests {
             title: "Test",
             post_type: Long,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -1501,7 +1496,6 @@ mod tests {
             has_default: true,
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
 
         let config = TypeInfo {
             name: "Config".to_string(),
@@ -1516,7 +1510,7 @@ mod tests {
 
         // A nested variant typo must be flagged with a "did you mean" suggestion.
         let bad = "Config(\n    server: Server(\n        mode: Productio,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, &analyzer);
         let variant_err = diagnostics.iter().find(|d| {
             d.severity == Some(DiagnosticSeverity::ERROR)
                 && d.message.contains("Unknown variant 'Productio'")
@@ -1537,7 +1531,7 @@ mod tests {
 
         // A completely different word must still error, just without a suggestion.
         let bad = "Config(\n    server: Server(\n        mode: Prod,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(bad, None, &config, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(bad, None, &config, &analyzer);
         assert!(
             diagnostics.iter().any(|d| {
                 d.severity == Some(DiagnosticSeverity::ERROR)
@@ -1549,7 +1543,7 @@ mod tests {
 
         // Valid nested variant must not produce any error.
         let good = "Config(\n    server: Server(\n        mode: Production,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(good, None, &config, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(good, None, &config, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -1561,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_struct_field_expects_struct_not_primitive() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1597,7 +1591,7 @@ mod tests {
             id: 101,
             author: 1,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics.is_empty(),
             "Should error on primitive when expecting struct"
@@ -1615,7 +1609,7 @@ mod tests {
             id: 101,
             author: User(id: 1, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics.iter().any(
                 |d| d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("User")
@@ -1625,8 +1619,8 @@ mod tests {
         );
 
         // When User IS registered, the same content should produce no errors
-        let mut raw_analyzer = RustAnalyzer::new();
-        raw_analyzer.add_type(TypeInfo {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
             name: "User".to_string(),
             kind: TypeKind::Struct(vec![
                 FieldInfo {
@@ -1655,8 +1649,7 @@ mod tests {
             has_default: false,
             ..Default::default()
         });
-        let analyzer = Arc::new(raw_analyzer);
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1671,7 +1664,7 @@ mod tests {
 
     #[test]
     fn test_serde_alias_field_accepted() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -1686,7 +1679,7 @@ mod tests {
 
         // The alias is accepted — no "Unknown field" diagnostic
         let content = r#"(old_port: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -1697,7 +1690,7 @@ mod tests {
 
         // The canonical name still works
         let content = r#"(port: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -1708,7 +1701,7 @@ mod tests {
 
         // A genuinely unknown field is still reported
         let content = r#"(bogus: 8080)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -1720,7 +1713,7 @@ mod tests {
 
     #[test]
     fn test_type_mismatch_primitives() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1756,7 +1749,7 @@ mod tests {
             id: "not a number",
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(!diagnostics.is_empty(), "Should error on type mismatch");
         assert!(
             diagnostics
@@ -1784,11 +1777,10 @@ mod tests {
     /// The error messages validation produces for `Cfg(n: <literal>)` where `n`
     /// is declared as `type_name`.
     fn numeric_errors(type_name: &str, literal: &str) -> Vec<String> {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = single_field_type(type_name);
         let content = format!("Cfg(n: {literal})");
-        validate_ron_with_analyzer(&content, None, &type_info, analyzer)
-            
+        validate_ron_with_analyzer(&content, None, &type_info, &analyzer)
             .into_iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| d.message)
@@ -2002,12 +1994,11 @@ mod tests {
             }]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
         let type_info = single_field_type("Duration");
 
         let errors = |literal: &str| -> Vec<String> {
             let content = format!("Cfg(n: {literal})");
-            validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone())
+            validate_ron_with_analyzer(&content, None, &type_info, &analyzer)
                 .into_iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .map(|d| d.message)
@@ -2061,20 +2052,14 @@ mod tests {
             ]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
         let type_info = single_field_type("(String, Endpoint)");
 
         let errors = |literal: &str| -> Vec<String> {
-            validate_ron_with_analyzer(
-                &format!("Cfg(n: {literal})"),
-                None,
-                &type_info,
-                analyzer.clone(),
-            )
-            .into_iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-            .map(|d| d.message)
-            .collect()
+            validate_ron_with_analyzer(&format!("Cfg(n: {literal})"), None, &type_info, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
         };
 
         assert!(
@@ -2259,16 +2244,11 @@ mod tests {
                 ..Default::default()
             });
             let config = single_field_type(type_name);
-            validate_ron_with_analyzer(
-                &format!("Cfg(n: {literal})"),
-                None,
-                &config,
-                Arc::new(analyzer),
-            )
-            .into_iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-            .map(|d| d.message)
-            .collect()
+            validate_ron_with_analyzer(&format!("Cfg(n: {literal})"), None, &config, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
         };
 
         for (type_name, literal) in [
@@ -2368,13 +2348,12 @@ mod tests {
             }]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
         let config = single_field_type("Option<Retry>");
 
         // A literal where the wrapped struct belongs is a mismatch against
         // that struct, pointed at the literal itself.
         let content = "Cfg(n: Some(42))";
-        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &config, analyzer.clone())
+        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &config, &analyzer)
             .into_iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .collect();
@@ -2394,19 +2373,18 @@ mod tests {
         // And the well-formed spellings stay clean.
         for literal in ["None", "Some(Retry())", "Some(Retry(attempts: 3))"] {
             let content = format!("Cfg(n: {literal})");
-            let errors: Vec<_> =
-                validate_ron_with_analyzer(&content, None, &config, analyzer.clone())
-                    .into_iter()
-                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-                    .map(|d| d.message)
-                    .collect();
+            let errors: Vec<_> = validate_ron_with_analyzer(&content, None, &config, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect();
             assert!(errors.is_empty(), "{literal} is valid, got {errors:?}");
         }
     }
 
     #[test]
     fn test_unnamed_struct_syntax() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -2442,7 +2420,7 @@ mod tests {
             id: 1,
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -2457,7 +2435,7 @@ mod tests {
 
     #[test]
     fn test_enum_with_tuple_variant() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Value".to_string(),
             kind: TypeKind::Enum(vec![
@@ -2504,7 +2482,7 @@ mod tests {
 
         // Valid tuple variant
         let content = "Int(42)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(
             diagnostics.len(),
             0,
@@ -2514,7 +2492,7 @@ mod tests {
 
         // Another valid variant
         let content = r#"Str("hello")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert_eq!(
             diagnostics.len(),
             0,
@@ -2525,7 +2503,7 @@ mod tests {
 
     #[test]
     fn test_unit_variant_with_data_error() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Status".to_string(),
             kind: TypeKind::Enum(vec![
@@ -2556,7 +2534,7 @@ mod tests {
 
         // Unit variant should not have data
         let content = "Active(123)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         // Should get error for providing data to unit variant
         assert!(
             diagnostics
@@ -2569,7 +2547,7 @@ mod tests {
 
         // A comment is not data.
         let content = "Active(/* paused until Monday */)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics.is_empty(),
             "a comment is no data for a unit variant. Got: {diagnostics:?}"
@@ -2648,7 +2626,6 @@ mod tests {
         // Register User type with the analyzer
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(user_type);
-        let analyzer = Arc::new(analyzer);
 
         // Create Message enum with UserTag variant
         let type_info = TypeInfo {
@@ -2679,7 +2656,7 @@ mod tests {
 
         // Test with missing required fields in User structs
         let content = r#"UserTag([User(age: 22), User(email: "hello")])"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
 
         // We expect errors about missing fields
         // First User(age: 22) is missing: id, name, email, is_active, roles
@@ -2732,7 +2709,7 @@ mod tests {
     #[test]
     fn test_unknown_type_in_ron_file() {
         // Create a struct with a custom type field
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -2768,7 +2745,7 @@ mod tests {
             id: 1,
             author: UnknownType(name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
 
         assert!(
             diagnostics
@@ -2815,7 +2792,6 @@ mod tests {
 
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(user_type);
-        let analyzer = Arc::new(analyzer);
 
         let type_info = TypeInfo {
             name: "Post".to_string(),
@@ -2852,7 +2828,7 @@ mod tests {
             id: 1,
             author: User(id: 42, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
 
         assert!(
             !diagnostics
@@ -2865,7 +2841,7 @@ mod tests {
 
     #[test]
     fn test_serde_rename_all_fields() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![
@@ -2887,7 +2863,7 @@ mod tests {
 
         // The serialized (camelCase) name is what serde expects
         let content = "(maxConnections: 5)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -2898,7 +2874,7 @@ mod tests {
 
         // The Rust name is tolerated as a lenient fallback
         let content = "(max_connections: 5)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -2909,7 +2885,7 @@ mod tests {
 
         // A missing required field is reported under its serialized name
         let content = "(debugMode: true)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -2921,7 +2897,7 @@ mod tests {
 
     #[test]
     fn test_serde_field_rename() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -2934,7 +2910,7 @@ mod tests {
         };
 
         let content = r#"(kind: "full")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -2944,7 +2920,7 @@ mod tests {
         );
 
         let content = r#"(totally_unknown: "full")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -2966,7 +2942,6 @@ mod tests {
             }]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
 
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -2995,7 +2970,7 @@ mod tests {
         // Flattened fields are accepted at the top level; skipped fields are
         // not required and not accepted
         let content = r#"(name: "app", verbose: true)"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -3006,7 +2981,7 @@ mod tests {
 
         // Missing the flattened required field is an error
         let content = r#"(name: "app")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics.iter().any(|d| d.message.contains("verbose")),
             "Missing flattened field should error. Got: {:?}",
@@ -3015,7 +2990,7 @@ mod tests {
 
         // A skipped field in the file is unknown to serde
         let content = r#"(name: "app", verbose: true, runtime_state: "x")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -3027,7 +3002,7 @@ mod tests {
 
     #[test]
     fn test_serde_unresolved_flatten_allows_unknown_fields() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -3041,7 +3016,7 @@ mod tests {
 
         // Flattening into a map means serde accepts arbitrary keys
         let content = r#"(anything: "goes", here: "too")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -3083,7 +3058,6 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let analyzer = Arc::new(analyzer);
 
         let content = concat!(
             "Root(\n",
@@ -3095,11 +3069,10 @@ mod tests {
             "    name: \"n\",\n",
             ")",
         );
-        let errors: Vec<_> =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
-                .into_iter()
-                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-                .collect();
+        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
         assert!(errors.is_empty(), "Got: {errors:?}");
 
         // The `Option` field is optional, so leaving it out is not an error
@@ -3113,11 +3086,10 @@ mod tests {
             "    name: \"n\",\n",
             ")",
         );
-        let errors: Vec<_> =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
-                .into_iter()
-                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-                .collect();
+        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
         assert!(errors.is_empty(), "Got: {errors:?}");
     }
 
@@ -3139,10 +3111,10 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
 
         let content = "Root(\n    hosts: [1],\n    name: 7,\n)";
-        let messages: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, analyzer)
+        let messages: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
             .into_iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| (d.code, d.message))
@@ -3165,7 +3137,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_field_diagnostic() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
@@ -3177,7 +3149,7 @@ mod tests {
         };
 
         let content = "(\n    name: \"a\",\n    name: \"b\",\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         let duplicate: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("Duplicate field 'name'"))
@@ -3205,7 +3177,6 @@ mod tests {
             }]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
 
         let type_info = TypeInfo {
             name: "Config".to_string(),
@@ -3218,7 +3189,7 @@ mod tests {
         };
 
         let content = "(\n    inner: (\n        value: 1,\n        value: 2,\n    ),\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -3261,7 +3232,6 @@ mod tests {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(inner.clone());
         analyzer.add_type(outer.clone());
-        let analyzer = Arc::new(analyzer);
 
         // An unknown field, a field whose value has the wrong primitive type, a
         // duplicated field, and a missing required field ('other')
@@ -3283,12 +3253,10 @@ mod tests {
             codes
         };
 
-        let root_codes = error_codes(
-            validate_ron_with_analyzer(as_root, None, &inner, analyzer.clone()),
-        );
-        let nested_codes = error_codes(
-            validate_ron_with_analyzer(as_nested, None, &outer, analyzer.clone()),
-        );
+        let root_codes = error_codes(validate_ron_with_analyzer(as_root, None, &inner, &analyzer));
+        let nested_codes = error_codes(validate_ron_with_analyzer(
+            as_nested, None, &outer, &analyzer,
+        ));
 
         assert_eq!(
             root_codes,
@@ -3360,7 +3328,6 @@ mod tests {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(leaf);
         analyzer.add_type(middle);
-        let analyzer = Arc::new(analyzer);
 
         // `port` is a u16, so a string is wrong at every one of these depths
         let bad = [
@@ -3369,8 +3336,7 @@ mod tests {
             "(middle: (maybe_leaf: Some((port: \"80\"))))",
         ];
         for content in bad {
-            let diagnostics =
-                validate_ron_with_analyzer(content, None, &root, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
             assert!(
                 diagnostics.iter().any(|d| {
                     d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
@@ -3391,8 +3357,7 @@ mod tests {
             "(middle: Middle(leaf: Leaf(port: 80), leaves: [], maybe_leaf: None))",
         ];
         for content in good {
-            let diagnostics =
-                validate_ron_with_analyzer(content, None, &root, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
             assert!(
                 !diagnostics
                     .iter()
@@ -3422,7 +3387,6 @@ mod tests {
             }]),
             ..Default::default()
         });
-        let analyzer = Arc::new(analyzer);
         let errors = |type_name: &str, value: &str| -> Vec<String> {
             let root = TypeInfo {
                 name: "Config".to_string(),
@@ -3433,16 +3397,11 @@ mod tests {
                 }]),
                 ..Default::default()
             };
-            validate_ron_with_analyzer(
-                &format!("Config(x: {value})"),
-                None,
-                &root,
-                analyzer.clone(),
-            )
-            .into_iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-            .map(|d| d.message)
-            .collect()
+            validate_ron_with_analyzer(&format!("Config(x: {value})"), None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
         };
 
         for (type_name, bad, good) in [
@@ -3513,9 +3472,8 @@ mod tests {
         };
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(listener);
-        let analyzer = Arc::new(analyzer);
         let errors = |content: &str| -> Vec<(String, u32)> {
-            validate_ron_with_analyzer(content, None, &root, analyzer.clone())
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
                 .into_iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .map(|d| (d.message, d.range.start.line))
@@ -3600,11 +3558,10 @@ mod tests {
         };
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(leaf);
-        let analyzer = Arc::new(analyzer);
 
         // Line 3 holds the one element that is not a struct at all.
         let content = "(\n    leaves: [\n        (port: 80),\n        42,\n    ],\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &root, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
         let mismatches: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string())))
@@ -3627,8 +3584,7 @@ mod tests {
         );
 
         // The array itself still has to be an array.
-        let diagnostics =
-            validate_ron_with_analyzer("(leaves: 42)", None, &root, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer("(leaves: 42)", None, &root, &analyzer);
         assert!(
             diagnostics.iter().any(|d| {
                 d.code == Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
@@ -3643,9 +3599,8 @@ mod tests {
             "(leaves: [(port: 80), Leaf(port: 81)])",
             None,
             &root,
-            analyzer,
-        )
-        ;
+            &analyzer,
+        );
         assert!(
             !diagnostics
                 .iter()
@@ -3657,7 +3612,7 @@ mod tests {
 
     #[test]
     fn test_serde_renamed_enum_variant() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Mode".to_string(),
             kind: TypeKind::Enum(vec![
@@ -3677,8 +3632,7 @@ mod tests {
 
         // rename_all applies to the first variant, explicit rename to the second
         for content in ["fast_mode", "legacy", "FastMode"] {
-            let diagnostics =
-                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
             assert!(
                 !diagnostics
                     .iter()
@@ -3689,8 +3643,7 @@ mod tests {
             );
         }
 
-        let diagnostics =
-            validate_ron_with_analyzer("bogus_mode", None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer("bogus_mode", None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -3706,7 +3659,7 @@ mod tests {
     /// spanning lines didn't lex at all.
     #[test]
     fn test_raw_string_values_are_strings() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Db".to_string(),
             kind: TypeKind::Struct(vec![
@@ -3736,11 +3689,10 @@ mod tests {
             "Db(\n    host: r#\"line one\nline \"two\"\"#,\n    user: \"u\", port: 1,\n)",
         ] {
             ron::from_str::<ron::Value>(content).expect("valid RON");
-            let errors: Vec<_> =
-                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone())
-                    .into_iter()
-                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-                    .collect();
+            let errors: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
             assert!(
                 errors.is_empty(),
                 "{content}: expected no errors, got {errors:?}"
@@ -3749,7 +3701,7 @@ mod tests {
 
         // ...and the fields after one are still checked.
         let content = r#"Db(host: r"h", user: "u", port: "x")"#;
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -3760,7 +3712,7 @@ mod tests {
 
     #[test]
     fn test_unknown_field_suggests_closest() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![
@@ -3780,7 +3732,7 @@ mod tests {
 
         // A typo in a known field should be reported with a suggestion.
         let content = "(\n    ephemerl: true,\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics.iter().any(|d| d
                 .message
@@ -3791,7 +3743,7 @@ mod tests {
 
         // A field bearing no resemblance to any known field gets no suggestion.
         let content = "(\n    hostname: true,\n)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -3847,7 +3799,6 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let analyzer = Arc::new(analyzer);
 
         // The same variant as the document root, and as a nested field value.
         let as_root = (
@@ -3862,8 +3813,7 @@ mod tests {
         );
 
         for (content, root_type, retries_line) in [as_root, as_nested] {
-            let diagnostics =
-                validate_ron_with_analyzer(content, None, root_type, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(content, None, root_type, &analyzer);
 
             let retries = diagnostics
                 .iter()
@@ -3890,9 +3840,8 @@ mod tests {
             "Config(\n    mode: Tuned(retries: 1),\n)",
             None,
             &config,
-            analyzer.clone(),
-        )
-        ;
+            &analyzer,
+        );
         let missing_code = code(codes::MISSING_REQUIRED_FIELD);
         let missing = diagnostics
             .iter()
@@ -3906,8 +3855,7 @@ mod tests {
             "Config(\n    mode: Tuned(retries: 1, inner: (port: 80)),\n)",
             "Config(\n    mode: Tuned(retries: 1, inner: Leaf(port: 80)),\n)",
         ] {
-            let diagnostics =
-                validate_ron_with_analyzer(content, None, &config, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, &analyzer);
             assert!(
                 !diagnostics
                     .iter()
@@ -3960,12 +3908,11 @@ mod tests {
             .get_type_info("crate::AppConfig")
             .expect("AppConfig")
             .clone();
-        let analyzer = Arc::new(analyzer);
 
         // `port` is absent at the root and `host` is absent in the nested
         // struct. Both are required, at both depths.
         let missing = |content: &'static str| {
-            validate_ron_with_analyzer(content, None, &root, analyzer.clone())
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
                 .into_iter()
                 .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
                 .map(|d| d.message)
@@ -3993,8 +3940,7 @@ mod tests {
         // A container `#[serde(default)]` does still excuse everything.
         let tunables = analyzer.get_type_info("crate::Tunables").expect("Tunables");
         assert!(
-            validate_ron_with_analyzer("Tunables()", None, tunables, analyzer.clone())
-                
+            validate_ron_with_analyzer("Tunables()", None, tunables, &analyzer)
                 .iter()
                 .all(|d| d.code != code(codes::MISSING_REQUIRED_FIELD)),
             "container #[serde(default)] still makes every field optional"
@@ -4005,7 +3951,7 @@ mod tests {
     /// and checked against their declared types, like any other value.
     #[test]
     fn test_tuple_variant_payload_type_checked() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Value".to_string(),
             kind: TypeKind::Enum(vec![EnumVariant {
@@ -4028,7 +3974,7 @@ mod tests {
         };
 
         let diagnostics =
-            validate_ron_with_analyzer(r#"Pair(1, "a")"#, None, &type_info, analyzer.clone());
+            validate_ron_with_analyzer(r#"Pair(1, "a")"#, None, &type_info, &analyzer);
         assert!(
             !diagnostics
                 .iter()
@@ -4038,8 +3984,7 @@ mod tests {
 
         // The second element is declared String, so a number is wrong — and the
         // error belongs at that element, not at the start of the variant.
-        let diagnostics =
-            validate_ron_with_analyzer("Pair(1, 2)", None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer("Pair(1, 2)", None, &type_info, &analyzer);
         let mismatch = diagnostics
             .iter()
             .find(|d| d.message.contains("expected String, got number"))
@@ -4051,7 +3996,7 @@ mod tests {
 
     #[test]
     fn test_unknown_variant_suggests_closest() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Mode".to_string(),
             kind: TypeKind::Enum(vec![
@@ -4067,8 +4012,7 @@ mod tests {
             ..Default::default()
         };
 
-        let diagnostics =
-            validate_ron_with_analyzer("Ephemerl", None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer("Ephemerl", None, &type_info, &analyzer);
         assert!(
             diagnostics
                 .iter()
@@ -4085,7 +4029,7 @@ mod tests {
     /// the wrong text.
     #[test]
     fn test_diagnostic_columns_are_utf16() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![
@@ -4109,8 +4053,7 @@ mod tests {
         // `ü` is two bytes; `🚀` is four bytes and two UTF-16 code units.
         for host in ["x", "münchen", "🚀"] {
             let content = format!("Config(host: \"{host}\", bogus: 1, port: 80)");
-            let diagnostics =
-                validate_ron_with_analyzer(&content, None, &type_info, analyzer.clone());
+            let diagnostics = validate_ron_with_analyzer(&content, None, &type_info, &analyzer);
 
             let unknown = diagnostics
                 .iter()
@@ -4130,7 +4073,7 @@ mod tests {
     /// first line.
     #[test]
     fn test_type_mismatch_columns_are_utf16() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
         let type_info = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![
@@ -4152,8 +4095,7 @@ mod tests {
         };
 
         let content = "Config(host: \"🚀\", port: \"nope\")";
-        let diagnostics =
-            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone());
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
         let mismatch = diagnostics
             .iter()
             .find(|d| d.code == code(codes::TYPE_MISMATCH))
@@ -4171,7 +4113,7 @@ mod tests {
     /// happens to have the same field as `Server` — so that a value naming the
     /// wrong type still passes the field checks and gets as far as the
     /// surface-level type check.
-    fn named_value_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+    fn named_value_fixture() -> (TypeInfo, RustAnalyzer) {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
             name: "Mode".to_string(),
@@ -4214,14 +4156,13 @@ mod tests {
             ]),
             ..Default::default()
         };
-        (config, Arc::new(analyzer))
+        (config, analyzer)
     }
 
     /// The type-mismatch messages for a document, in order.
     fn type_mismatches(content: &str) -> Vec<String> {
         let (config, analyzer) = named_value_fixture();
-        validate_ron_with_analyzer(content, None, &config, analyzer)
-            
+        validate_ron_with_analyzer(content, None, &config, &analyzer)
             .into_iter()
             .filter(|d| d.code == code(codes::TYPE_MISMATCH))
             .map(|d| d.message)
@@ -4302,7 +4243,7 @@ mod tests {
             r#"Config(mode: Ephemeral, mode: Ephemeral, server: ())"#,
         ] {
             let (config, analyzer) = named_value_fixture();
-            let diagnostics = validate_ron_with_analyzer(content, None, &config, analyzer);
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, &analyzer);
             assert!(!diagnostics.is_empty(), "nothing reported for {content}");
 
             for diagnostic in &diagnostics {
@@ -4331,9 +4272,8 @@ mod tests {
             r#"Config(mode: Ephemeral, server: (host: "x"))"#,
             None,
             &config,
-            analyzer,
-        )
-        ;
+            &analyzer,
+        );
 
         let hints: Vec<&Diagnostic> = diagnostics
             .iter()
@@ -4377,7 +4317,7 @@ mod tests {
     fn test_empty_unnamed_struct_still_requires_fields() {
         let missing = |content: &'static str| {
             let (config, analyzer) = named_value_fixture();
-            validate_ron_with_analyzer(content, None, &config, analyzer)
+            validate_ron_with_analyzer(content, None, &config, &analyzer)
                 .into_iter()
                 .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
                 .map(|d| (d.message, d.range.start))
@@ -4420,9 +4360,7 @@ mod tests {
             .expect("Tunables")
             .clone();
         assert!(
-            validate_ron_with_analyzer("()", None, &tunables, Arc::new(analyzer))
-                
-                .is_empty(),
+            validate_ron_with_analyzer("()", None, &tunables, &analyzer).is_empty(),
             "`()` is a complete value for a struct that needs nothing"
         );
     }
@@ -4453,13 +4391,11 @@ mod tests {
         };
 
         let content = r#"Config(servers: [(host: "x"), ()])"#;
-        let missing: Vec<_> =
-            validate_ron_with_analyzer(content, None, &config, Arc::new(analyzer))
-                
-                .into_iter()
-                .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
-                .map(|d| (d.message, d.range.start))
-                .collect();
+        let missing: Vec<_> = validate_ron_with_analyzer(content, None, &config, &analyzer)
+            .into_iter()
+            .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+            .map(|d| (d.message, d.range.start))
+            .collect();
 
         assert_eq!(
             missing,

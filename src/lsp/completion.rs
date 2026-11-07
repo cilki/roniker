@@ -6,7 +6,6 @@ use super::type_utils::{
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
-use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
     Position,
@@ -327,7 +326,7 @@ pub fn generate_completions_for_type(
     content: &str,
     position: Position,
     type_info: &TypeInfo,
-    analyzer: Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
     // The type of the value being completed: the declared type of the field it
     // is written for, found by serialized or Rust name, followed down through
@@ -344,11 +343,11 @@ pub fn generate_completions_for_type(
 
     match get_completion_context(tree, content, position) {
         CompletionContext::FieldName => {
-            generate_field_completions(tree, content, position, type_info, &analyzer)
+            generate_field_completions(tree, content, position, type_info, analyzer)
         }
         CompletionContext::FieldValue(slot) => {
             let completions = field_type(slot)
-                .map(|t| generate_value_completions_by_type(&t, analyzer.clone()))
+                .map(|t| generate_value_completions_by_type(&t, analyzer))
                 .unwrap_or_default();
 
             // Only fall back to offering every workspace type when the field
@@ -363,10 +362,10 @@ pub fn generate_completions_for_type(
             }
         }
         CompletionContext::StructType(slot) => field_type(slot)
-            .map(|t| generate_type_completions_by_type(&t, &analyzer))
+            .map(|t| generate_type_completions_by_type(&t, analyzer))
             .unwrap_or_default(),
         CompletionContext::ValueName(slot) => field_type(slot)
-            .map(|t| generate_type_completions_by_type(&t, &analyzer))
+            .map(|t| generate_type_completions_by_type(&t, analyzer))
             .unwrap_or_default()
             .into_iter()
             .map(|item| CompletionItem {
@@ -379,7 +378,7 @@ pub fn generate_completions_for_type(
 }
 
 /// Get all types from the workspace as completion items
-fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
+fn get_all_workspace_types(analyzer: &RustAnalyzer) -> Vec<CompletionItem> {
     analyzer
         .get_all_types()
         .into_iter()
@@ -591,7 +590,7 @@ fn snippet_item(
 /// Generate value completions based on field type
 fn generate_value_completions_by_type(
     field_type: &str,
-    analyzer: Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
     // Clean up the type string (remove spaces)
     let clean_type = normalize_type(field_type);
@@ -773,10 +772,10 @@ mod tests {
         let content = "MyEnum::StructVariant(\n    \n)";
         let position = Position::new(1, 4); // Inside the parens
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+            generate_completions_for_type(&tree, content, position, &type_info, &analyzer);
 
         // Should complete with variant fields
         assert!(!completions.is_empty());
@@ -799,9 +798,9 @@ mod tests {
     /// definition is not, and that is what gets offered.
     #[test]
     fn test_std_type_value_completions() {
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let labels = |type_name: &str| -> Vec<String> {
-            generate_value_completions_by_type(type_name, analyzer.clone())
+            generate_value_completions_by_type(type_name, &analyzer)
                 .into_iter()
                 .map(|c| c.label)
                 .collect()
@@ -835,7 +834,7 @@ mod tests {
         // The snippet puts the caret where the value goes: inside the quotes
         // for a path, over the seed value for an address.
         let inserted = |type_name: &str| -> Option<String> {
-            generate_value_completions_by_type(type_name, analyzer.clone())
+            generate_value_completions_by_type(type_name, &analyzer)
                 .first()?
                 .insert_text
                 .clone()
@@ -888,10 +887,10 @@ mod tests {
         let content = "";
         let position = Position::new(0, 0);
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+            generate_completions_for_type(&tree, content, position, &type_info, &analyzer);
 
         // Should complete with variant names
         assert!(!completions.is_empty());
@@ -942,12 +941,11 @@ mod tests {
         let mut analyzer = crate::rust_analyzer::RustAnalyzer::new();
         analyzer.add_type(parent.clone());
         analyzer.add_type(enum_type);
-        let analyzer = std::sync::Arc::new(analyzer);
 
         let content = "Config(mode: P)";
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, Position::new(0, 14), &parent, analyzer);
+            generate_completions_for_type(&tree, content, Position::new(0, 14), &parent, &analyzer);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
         assert!(
@@ -1002,7 +1000,6 @@ mod tests {
         analyzer.add_type(parent.clone());
         analyzer.add_type(enum_type);
         analyzer.add_type(unrelated);
-        let analyzer = std::sync::Arc::new(analyzer);
 
         // A quoted value puts the cursor in `FieldValue` (not `StructType`)
         // context, since the value text isn't a bare identifier.
@@ -1010,7 +1007,7 @@ mod tests {
         let position = Position::new(1, 11); // inside the quotes, after `mode: `
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, position, &parent, analyzer);
+            generate_completions_for_type(&tree, content, position, &parent, &analyzer);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
         assert!(
@@ -1031,9 +1028,9 @@ mod tests {
     /// they take; they fell through to the "every registered type" fallback.
     #[test]
     fn test_value_completion_for_qualified_std_field_types() {
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let labels = |type_name: &str| -> Vec<String> {
-            generate_value_completions_by_type(type_name, analyzer.clone())
+            generate_value_completions_by_type(type_name, &analyzer)
                 .iter()
                 .map(|c| c.label.clone())
                 .collect()
@@ -1072,10 +1069,9 @@ mod tests {
             kind: TypeKind::Struct(Vec::new()),
             ..Default::default()
         });
-        let analyzer = std::sync::Arc::new(analyzer);
 
         let completions = |type_name: &str| -> Vec<(String, String)> {
-            generate_value_completions_by_type(type_name, analyzer.clone())
+            generate_value_completions_by_type(type_name, &analyzer)
                 .iter()
                 .map(|c| {
                     (
@@ -1149,10 +1145,10 @@ mod tests {
 
         let content = "(\n    \n)";
         let position = Position::new(1, 4);
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+            generate_completions_for_type(&tree, content, position, &type_info, &analyzer);
 
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"maxConnections"), "got: {:?}", labels);
@@ -1190,10 +1186,10 @@ mod tests {
 
         let content = "";
         let position = Position::new(0, 0);
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = crate::rust_analyzer::RustAnalyzer::new();
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         let completions =
-            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+            generate_completions_for_type(&tree, content, position, &type_info, &analyzer);
 
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"fast-mode"), "got: {:?}", labels);
@@ -1203,7 +1199,7 @@ mod tests {
     /// `AppConfig { server: ServerConfig { host, mode: ServerMode } }`, which is
     /// enough nesting to exercise a cursor inside a struct that is itself a
     /// field value.
-    fn nested_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+    fn nested_fixture() -> (TypeInfo, RustAnalyzer) {
         let server = TypeInfo {
             name: "ServerConfig".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1255,14 +1251,14 @@ mod tests {
         analyzer.add_type(root);
         analyzer.add_type(server.clone());
         analyzer.add_type(mode);
-        (server, Arc::new(analyzer))
+        (server, analyzer)
     }
 
     fn labels_at(
         content: &str,
         position: Position,
         type_info: &TypeInfo,
-        analyzer: Arc<RustAnalyzer>,
+        analyzer: &RustAnalyzer,
     ) -> Vec<String> {
         let tree = crate::lsp::ts_utils::parse(content).unwrap();
         generate_completions_for_type(&tree, content, position, type_info, analyzer)
@@ -1282,7 +1278,7 @@ mod tests {
         let content =
             "AppConfig(\n    server: ServerConfig(\n        host: \"x\",\n        \n    ),\n)\n";
 
-        let labels = labels_at(content, Position::new(3, 8), &server, analyzer);
+        let labels = labels_at(content, Position::new(3, 8), &server, &analyzer);
 
         assert!(
             labels.contains(&"mode".to_string()),
@@ -1305,7 +1301,7 @@ mod tests {
         let (server, analyzer) = nested_fixture();
         let content = "AppConfig(\n    server: ServerConfig(\n        host: \"x\",\n        mode: \n    ),\n)\n";
 
-        let labels = labels_at(content, Position::new(3, 14), &server, analyzer);
+        let labels = labels_at(content, Position::new(3, 14), &server, &analyzer);
 
         assert!(
             labels.contains(&"Production".to_string()),
@@ -1332,7 +1328,7 @@ mod tests {
             "AppConfig(\n    debug: true,\n    server: Serv\n)\n",
             "AppConfig(\n    debug: true,\n    server: Serv,\n)\n",
         ] {
-            let labels = labels_at(content, Position::new(2, 16), &root, analyzer.clone());
+            let labels = labels_at(content, Position::new(2, 16), &root, &analyzer);
             assert!(
                 labels.contains(&"ServerConfig".to_string()),
                 "the field's declared type should be offered for {:?}: {:?}",
@@ -1427,11 +1423,10 @@ mod tests {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(root);
         analyzer.add_type(database.clone());
-        let analyzer = Arc::new(analyzer);
 
         let content = "Config(\n    port: 8080,\n    database: DatabaseConfig(\n        host: \"localhost\",\n        \n    ),\n)\n";
         // The blank line inside DatabaseConfig's parentheses.
-        let labels = labels_at(content, Position::new(4, 8), &database, analyzer);
+        let labels = labels_at(content, Position::new(4, 8), &database, &analyzer);
 
         assert!(
             labels.contains(&"username".to_string()),
@@ -1495,11 +1490,9 @@ mod tests {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(root);
         analyzer.add_type(kind.clone());
-        let analyzer = Arc::new(analyzer);
 
-        let content =
-            "Post(\n    name: \"x\",\n    kind: Detailed(\n        length: 1,\n        \n    ),\n)\n";
-        let labels = labels_at(content, Position::new(4, 8), &kind, analyzer);
+        let content = "Post(\n    name: \"x\",\n    kind: Detailed(\n        length: 1,\n        \n    ),\n)\n";
+        let labels = labels_at(content, Position::new(4, 8), &kind, &analyzer);
 
         assert_eq!(labels, vec!["name".to_string()]);
     }
@@ -1510,7 +1503,7 @@ mod tests {
         let root = analyzer.get_type_info("AppConfig").unwrap().clone();
         let content = "AppConfig(\n    debug: true,\n    \n)\n";
 
-        let labels = labels_at(content, Position::new(2, 4), &root, analyzer);
+        let labels = labels_at(content, Position::new(2, 4), &root, &analyzer);
 
         assert!(
             labels.contains(&"server".to_string()),

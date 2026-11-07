@@ -1,6 +1,5 @@
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::borrow::Cow;
-use std::sync::Arc;
 use tower_lsp_server::ls_types::*;
 use tree_sitter::Tree;
 
@@ -11,7 +10,7 @@ pub fn generate_code_actions(
     content: &str,
     type_info: &TypeInfo,
     url: &Uri,
-    analyzer: Arc<RustAnalyzer>,
+    analyzer: &RustAnalyzer,
     range: Range,
     context_diagnostics: &[Diagnostic],
 ) -> Vec<CodeActionOrCommand> {
@@ -33,7 +32,7 @@ pub fn generate_code_actions(
     // Add actions for missing fields, at the root and at every depth below it
     // that `range` reaches
     actions.extend(generate_missing_field_actions(
-        tree, content, type_info, url, &analyzer, range,
+        tree, content, type_info, url, analyzer, range,
     ));
 
     actions
@@ -1222,7 +1221,7 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = missing_field_actions("Cfg()", &type_info, Arc::new(RustAnalyzer::new()));
+        let actions = missing_field_actions("Cfg()", &type_info, &RustAnalyzer::new());
         assert!(!actions.is_empty(), "the fields should be offered");
         for (title, document) in actions {
             ron::from_str::<Cfg>(&document).unwrap_or_else(|e| {
@@ -1276,7 +1275,7 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = missing_field_actions("Cfg()", &type_info, Arc::new(RustAnalyzer::new()));
+        let actions = missing_field_actions("Cfg()", &type_info, &RustAnalyzer::new());
         assert!(!actions.is_empty(), "the fields should be offered");
         for (title, document) in actions {
             ron::from_str::<Cfg>(&document).unwrap_or_else(|e| {
@@ -1701,16 +1700,15 @@ mod tests {
 
         // Create mock analyzer and client for the test
         use crate::rust_analyzer::RustAnalyzer;
-        use std::sync::Arc;
 
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
 
         let actions = generate_code_actions(
             &parse(content),
             content,
             &type_info,
             &url,
-            analyzer,
+            &analyzer,
             WHOLE_DOCUMENT,
             &[],
         );
@@ -1775,7 +1773,7 @@ mod tests {
 
         let content = "Prod(\n    a: 1,\n)";
         let url = "file:///test.ron".parse::<Uri>().unwrap();
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
 
         let edit_sets = |type_info: &TypeInfo| -> Vec<Vec<TextEdit>> {
             generate_code_actions(
@@ -1783,7 +1781,7 @@ mod tests {
                 content,
                 type_info,
                 &url,
-                analyzer.clone(),
+                &analyzer,
                 WHOLE_DOCUMENT,
                 &[],
             )
@@ -1841,14 +1839,14 @@ mod tests {
 
         let content = "Port(80)";
         let url = "file:///test.ron".parse::<Uri>().unwrap();
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
 
         let actions = generate_code_actions(
             &parse(content),
             content,
             &type_info,
             &url,
-            analyzer,
+            &analyzer,
             WHOLE_DOCUMENT,
             &[],
         );
@@ -1904,10 +1902,9 @@ mod tests {
             ..Default::default()
         };
         analyzer.add_type(root.clone());
-        let analyzer = Arc::new(analyzer);
 
         let content = "Cfg(\n)";
-        let actions = missing_field_actions(content, &root, analyzer.clone());
+        let actions = missing_field_actions(content, &root, &analyzer);
         assert_eq!(
             actions,
             vec![
@@ -1924,10 +1921,7 @@ mod tests {
 
         for (title, fixed) in actions {
             let errors: Vec<_> = super::super::diagnostics::validate_ron_with_analyzer(
-                &fixed,
-                None,
-                &root,
-                analyzer.clone(),
+                &fixed, None, &root, &analyzer,
             )
             .into_iter()
             .filter(|d| d.severity != Some(DiagnosticSeverity::INFORMATION))
@@ -1946,7 +1940,7 @@ mod tests {
 
     /// A root type carrying one enum-typed field `mode: Mode`, where `Mode`'s
     /// `Prod` variant requires both `a` and `b`.
-    fn nested_variant_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+    fn nested_variant_fixture() -> (TypeInfo, RustAnalyzer) {
         use crate::rust_analyzer::EnumVariant;
 
         let mut analyzer = RustAnalyzer::new();
@@ -1980,7 +1974,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        (root, Arc::new(analyzer))
+        (root, analyzer)
     }
 
     /// The titles and resulting documents of every missing-field action offered
@@ -1988,7 +1982,7 @@ mod tests {
     fn missing_field_actions(
         content: &str,
         type_info: &TypeInfo,
-        analyzer: Arc<RustAnalyzer>,
+        analyzer: &RustAnalyzer,
     ) -> Vec<(String, String)> {
         missing_field_actions_in(content, type_info, analyzer, WHOLE_DOCUMENT)
     }
@@ -1997,7 +1991,7 @@ mod tests {
     fn missing_field_actions_in(
         content: &str,
         type_info: &TypeInfo,
-        analyzer: Arc<RustAnalyzer>,
+        analyzer: &RustAnalyzer,
         range: Range,
     ) -> Vec<(String, String)> {
         let url = "file:///test.ron".parse::<Uri>().unwrap();
@@ -2054,7 +2048,6 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let analyzer = Arc::new(analyzer);
         let content = "Cfg(\n    items: [\n        Item(a: 1),\n        Item(b: \"x\"),\n    ],\n)";
         let at = |line, character| {
             Range::new(
@@ -2063,7 +2056,7 @@ mod tests {
             )
         };
         let titles = |range| -> Vec<String> {
-            missing_field_actions_in(content, &root, analyzer.clone(), range)
+            missing_field_actions_in(content, &root, &analyzer, range)
                 .into_iter()
                 .map(|(title, _)| title)
                 .collect()
@@ -2094,7 +2087,7 @@ mod tests {
         let content = "Cfg(\n    mode: Prod(\n        a: 1,\n    ),\n)";
 
         assert_eq!(
-            missing_field_actions(content, &root, analyzer),
+            missing_field_actions(content, &root, &analyzer),
             vec![(
                 "Add 1 required field to mode::Prod".to_string(),
                 "Cfg(\n    mode: Prod(\n        a: 1,\n        b: \"\",\n    ),\n)".to_string(),
@@ -2111,7 +2104,7 @@ mod tests {
         // `b` here belongs to `Inner`, not to `Prod`.
         let content = "Cfg(\n    mode: Prod(\n        a: 1,\n        junk: Inner(b: 2),\n    ),\n)";
 
-        let actions = missing_field_actions(content, &root, analyzer);
+        let actions = missing_field_actions(content, &root, &analyzer);
         assert_eq!(
             actions.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
             ["Add 1 required field to mode::Prod"],
@@ -2127,7 +2120,7 @@ mod tests {
     ///
     /// Every test below spells out all three root fields, so the only actions
     /// left are the nested ones under test.
-    fn nested_struct_fixture() -> (TypeInfo, Arc<RustAnalyzer>) {
+    fn nested_struct_fixture() -> (TypeInfo, RustAnalyzer) {
         let field = |name: &str, type_name: &str| FieldInfo {
             name: name.to_string(),
             type_name: type_name.to_string(),
@@ -2168,7 +2161,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        (root, Arc::new(analyzer))
+        (root, analyzer)
     }
 
     /// The fields a nested *struct* value is missing used to get no quick-fix at
@@ -2181,7 +2174,7 @@ mod tests {
         let content = "Cfg(\n    server: Server(\n        port: 1,\n    ),\n    certs: [],\n    extra: None,\n)";
 
         assert_eq!(
-            missing_field_actions(content, &root, analyzer),
+            missing_field_actions(content, &root, &analyzer),
             vec![(
                 "Add 1 required field to server".to_string(),
                 "Cfg(\n    server: Server(\n        port: 1,\n        host: \"\",\n    ),\n    certs: [],\n    extra: None,\n)".to_string(),
@@ -2199,7 +2192,7 @@ mod tests {
         let content = "Cfg(\n    server: Server(host: \"h\", port: 1, tls: Some(Tls())),\n    certs: [],\n    extra: None,\n)";
 
         assert_eq!(
-            missing_field_actions(content, &root, analyzer),
+            missing_field_actions(content, &root, &analyzer),
             vec![(
                 "Add 1 required field to server.tls".to_string(),
                 "Cfg(\n    server: Server(host: \"h\", port: 1, tls: Some(Tls(cert: \"\"))),\n    certs: [],\n    extra: None,\n)".to_string(),
@@ -2215,7 +2208,7 @@ mod tests {
         let content = "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls()],\n    extra: None,\n)";
 
         assert_eq!(
-            missing_field_actions(content, &root, analyzer),
+            missing_field_actions(content, &root, &analyzer),
             vec![(
                 "Add 1 required field to certs[1]".to_string(),
                 "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls(cert: \"\")],\n    extra: None,\n)".to_string(),
@@ -2231,7 +2224,7 @@ mod tests {
         let (root, analyzer) = nested_struct_fixture();
         let content = "Cfg(\n    server: Server(host: \"h\", port: 1, tls: None),\n    certs: [],\n    extra: None,\n)";
 
-        assert_eq!(missing_field_actions(content, &root, analyzer), vec![]);
+        assert_eq!(missing_field_actions(content, &root, &analyzer), vec![]);
     }
 
     /// A container-level `#[serde(default)]` fills in whatever is absent, so
@@ -2241,7 +2234,7 @@ mod tests {
         let (root, analyzer) = nested_struct_fixture();
         let content = "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [],\n    extra: Defaults(),\n)";
 
-        assert_eq!(missing_field_actions(content, &root, analyzer), vec![]);
+        assert_eq!(missing_field_actions(content, &root, &analyzer), vec![]);
     }
 
     #[test]
@@ -2519,14 +2512,14 @@ mod tests {
             ..Default::default()
         };
         let url = "file:///test.ron".parse::<Uri>().unwrap();
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = RustAnalyzer::new();
 
         let actions = generate_code_actions(
             &parse(content),
             content,
             &type_info,
             &url,
-            analyzer,
+            &analyzer,
             WHOLE_DOCUMENT,
             &[],
         );
@@ -2577,7 +2570,7 @@ mod tests {
             content,
             &config,
             &url,
-            Arc::new(analyzer),
+            &analyzer,
             WHOLE_DOCUMENT,
             &[],
         );

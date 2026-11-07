@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
@@ -127,8 +126,8 @@ fn byte_point(content: &str, byte_offset: usize, line: usize) -> tree_sitter::Po
 
 pub struct Backend {
     pub client: Client,
-    pub documents: Arc<RwLock<HashMap<String, Document>>>,
-    pub rust_analyzer: Arc<rust_analyzer::RustAnalyzer>,
+    pub documents: RwLock<HashMap<String, Document>>,
+    pub rust_analyzer: RustAnalyzer,
     pub info_diagnostics: bool,
 }
 
@@ -136,8 +135,8 @@ impl Backend {
     pub fn new(client: Client, analyzer: RustAnalyzer, info_diagnostics: bool) -> Self {
         Self {
             client,
-            documents: Arc::new(RwLock::new(HashMap::new())),
-            rust_analyzer: Arc::new(analyzer),
+            documents: RwLock::new(HashMap::new()),
+            rust_analyzer: analyzer,
             info_diagnostics,
         }
     }
@@ -321,7 +320,7 @@ impl LanguageServer for Backend {
             &doc.content,
             position,
             type_info,
-            self.rust_analyzer.clone(),
+            &self.rust_analyzer,
         );
         Ok(Some(CompletionResponse::Array(completions)))
     }
@@ -346,7 +345,7 @@ impl LanguageServer for Backend {
             &doc.content,
             type_info,
             &url,
-            self.rust_analyzer.clone(),
+            &self.rust_analyzer,
             params.range,
             &params.context.diagnostics,
         );
@@ -885,7 +884,7 @@ impl Backend {
                 content,
                 doc.tree.as_ref(),
                 type_info,
-                self.rust_analyzer.clone(),
+                &self.rust_analyzer,
             ),
             None => vec![],
         };
@@ -1162,21 +1161,11 @@ mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo, TypeInfo, TypeKind};
 
-    /// Helper to create a test Backend with a pre-configured analyzer
-    async fn create_test_backend_with_analyzer(analyzer: RustAnalyzer) -> Backend {
+    /// Helper to create a test service around a Backend with a pre-configured
+    /// analyzer; the Backend is borrowed from it with `inner()`.
+    async fn create_test_backend_with_analyzer(analyzer: RustAnalyzer) -> LspService<Backend> {
         let (service, _) = LspService::new(|client| Backend::new(client, analyzer, true));
-        service.inner().clone()
-    }
-
-    impl Clone for Backend {
-        fn clone(&self) -> Self {
-            Backend {
-                client: self.client.clone(),
-                documents: self.documents.clone(),
-                rust_analyzer: self.rust_analyzer.clone(),
-                info_diagnostics: self.info_diagnostics,
-            }
-        }
+        service
     }
 
     /// The `exit` notification means "stop the process", so a server that goes
@@ -1310,7 +1299,8 @@ mod tests {
             ..Default::default()
         });
 
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         // Simulate opening a document
         let uri: Uri = "file:///test/user.ron".parse().unwrap();
@@ -1433,7 +1423,8 @@ Document::new(content.to_string()),
             ..Default::default()
         });
 
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         // Simulate opening a document with an enum variant
         let uri: Uri = "file:///test/status.ron".parse().unwrap();
@@ -1503,7 +1494,8 @@ Document::new(content.to_string()),
             ..Default::default()
         });
 
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         // `on_vacation` is OnVacation under rename_all = "snake_case";
         // `legacy` comes from the explicit rename on Retired.
@@ -1569,7 +1561,8 @@ Document::new(content.to_string()),
 
         let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
         analyzer.add_type(config_type);
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let uri: Uri = "file:///test/config.ron".parse().unwrap();
         let content = r#"Config(
@@ -1634,7 +1627,8 @@ Document::new(content.to_string()),
 
         let mut analyzer = RustAnalyzer::with_root_type("crate::Simple");
         analyzer.add_type(simple_type);
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let uri: Uri = "file:///test/simple.ron".parse().unwrap();
         let content = r#"Simple(
@@ -1697,7 +1691,8 @@ Document::new(content.to_string()),
 
         let mut analyzer = RustAnalyzer::with_root_type("crate::User");
         analyzer.add_type(user_type);
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let uri: Uri = "file:///test/user.ron".parse().unwrap();
         // Content with cursor position where we want completions
@@ -1762,7 +1757,8 @@ Document::new(content.to_string()),
             ..Default::default()
         });
 
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/user.ron".parse().unwrap();
         let content = "User(\n    id: 42,\n)";
         backend
@@ -1830,7 +1826,8 @@ Document::new(content.to_string()),
             source_file: Some(std::path::PathBuf::from("/test/src/config.rs")),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         for (root, nested) in [
             ("Config", "Server"),
@@ -1976,7 +1973,8 @@ Document::new(content.to_string()),
             ]),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/config.ron".parse().unwrap();
         let at = |position| TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
@@ -2103,7 +2101,8 @@ Document::new(content.to_string()),
             ),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/config.ron".parse().unwrap();
 
         let variants = vec!["Fast", "Slow"];
@@ -2204,7 +2203,8 @@ Document::new(content.to_string()),
             ]),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/config.ron".parse().unwrap();
 
         let variants = vec!["Fast", "Custom"];
@@ -2288,7 +2288,8 @@ Document::new(content.to_string()),
     /// header that only the tree knows the position of.
     #[tokio::test]
     async fn formatting_a_document_matches_formatting_its_text() {
-        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
 
         let uri: Uri = "file:///test/format.ron".parse().unwrap();
         let content = "#![enable(implicit_some)]\n// leading\nConfig(port:8080,hosts:[\"a\",\"b\"],\nnested:Inner(x:1),)\n";
@@ -2824,7 +2825,8 @@ PostReference(
     /// one.
     #[tokio::test]
     async fn test_range_formatting_with_reversed_range() {
-        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
         let url = "file:///test.ron".parse::<Uri>().unwrap();
         let content = "User(\n   id:1,\n   name:\"Bob\",\n)";
 
@@ -2866,7 +2868,8 @@ PostReference(
     /// UTF-16 columns the editor sent and the edit covers only that span.
     #[tokio::test]
     async fn test_range_formatting_formats_only_the_selection() {
-        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
         let url = "file:///test.ron".parse::<Uri>().unwrap();
         let content = "Post(\n    title: \"é\", author: User(id:1,\nname:\"Bob\"), likes: 2,\n)";
 
@@ -2912,7 +2915,8 @@ PostReference(
     /// line it starts on.
     #[tokio::test]
     async fn test_range_formatting_whole_lines_keeps_surrounding_whitespace() {
-        let backend = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
         let url = "file:///test.ron".parse::<Uri>().unwrap();
         let content = "User(\nid:1,\nname:\"Bob\",\n)\n";
 
@@ -3034,7 +3038,8 @@ PostReference(
             }]),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let content = "Post(\n    name: \"post\",\n    author: User(\n        name: \"bob\",\n    ),\n)";
         let uri = "file:///test.ron";
@@ -3109,7 +3114,8 @@ PostReference(
     /// depth in the unoptimized build the tests run in.
     #[tokio::test]
     async fn test_rename_cost_does_not_grow_with_the_square_of_the_document() {
-        let backend = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+        let service = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+        let backend = service.inner();
 
         let depth = 400;
         let content = format!(
@@ -3175,7 +3181,8 @@ PostReference(
     /// request at this depth in the unoptimized build the tests run in.
     #[tokio::test]
     async fn test_position_resolution_does_not_grow_with_the_square_of_the_document() {
-        let backend = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+        let service = create_test_backend_with_analyzer(self_nesting_analyzer()).await;
+        let backend = service.inner();
 
         let depth = 4000;
         let level = "Server(host: \"x\", inner: ";
@@ -3273,7 +3280,8 @@ PostReference(
             }]),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let content = "Config(\n    servers: [\n        Server(host: \"a\"),\n        Server(host: \"b\"),\n        Server(host: \"c\"),\n    ],\n)";
         let uri = "file:///list.ron";
@@ -3338,7 +3346,8 @@ PostReference(
             }]),
             ..Default::default()
         });
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let entries = 4000;
         let content = format!(
@@ -3464,7 +3473,8 @@ PostReference(
     /// named nowhere in particular.
     #[tokio::test]
     async fn test_hover_and_definition_resolve_the_same_words() {
-        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let service = create_test_backend_with_analyzer(post_analyzer()).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "Post(\n    id: 42,\n    post_type: Detailed(\n        length: 1,\n    ),\n)";
         backend
@@ -3538,7 +3548,8 @@ PostReference(
     /// variant of the type the cursor is already in.
     #[tokio::test]
     async fn test_hover_and_definition_on_a_bare_variant_value() {
-        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let service = create_test_backend_with_analyzer(post_analyzer()).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "Post(\n    id: 42,\n    post_type: Short,\n)";
         backend
@@ -3596,7 +3607,8 @@ PostReference(
     /// type — here one mentioned in a comment — still resolves to that type.
     #[tokio::test]
     async fn test_hover_and_definition_fall_back_to_a_named_type() {
-        let backend = create_test_backend_with_analyzer(post_analyzer()).await;
+        let service = create_test_backend_with_analyzer(post_analyzer()).await;
+        let backend = service.inner();
         let uri: Uri = "file:///test/post.ron".parse().unwrap();
         let content = "// see Tag\nPost(\n    id: 42,\n)";
         backend
@@ -3651,7 +3663,8 @@ PostReference(
     #[tokio::test]
     async fn test_rename_rejects_invalid_identifier() {
         let analyzer = RustAnalyzer::with_root_type("crate::Post");
-        let backend = create_test_backend_with_analyzer(analyzer).await;
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
 
         let result = backend
             .rename(RenameParams {
