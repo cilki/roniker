@@ -203,8 +203,10 @@ Opening a RON file matched by the pattern above gets you:
     nothing in the workspace defines (`unknown type 'Bogus'`), a literal where
     a struct belongs (`expected ServerConfig, got integer`), a value that names
     no variant at all in an enum field (`unknown variant '42' for enum
-    ServerMode`), or data given to a unit variant. Those last two matter if you
-    filter by code: a message reading *unknown type* or *unknown variant* is
+    ServerMode`), data given to a unit variant, or a variant that declares
+    fields written as a bare name (`storage: S3` for an `S3(String)` variant,
+    which `ron` refuses for want of the parentheses). Mind the code if you
+    filter by it: a message reading *unknown type* or *unknown variant* is
     still tagged `type-mismatch`, not `unknown-type` or `unknown-variant`.
     Lastly it is the three ways a tuple or fixed-size array field can go wrong,
     for which see [Tuples and arrays](#tuples-and-arrays) below: the bracket

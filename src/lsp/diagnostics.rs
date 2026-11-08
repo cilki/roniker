@@ -764,9 +764,24 @@ fn validate_enum_node(
         return vec![unknown_variant(type_info, &named.name, named.range)];
     };
 
-    // A bare name carries no data, so the variant is already fully checked.
+    // A bare name is how RON writes a unit variant, and only a unit variant:
+    // `ron` wants the opening parenthesis of any variant that declares a field,
+    // even when every field has a default or is skipped, so `storage: S3` for
+    // `S3(String)` fails to load however the payload is declared.
     if node.kind() != "struct" {
-        return Vec::new();
+        if variant.fields.is_empty() {
+            return Vec::new();
+        }
+        return vec![Diagnostic {
+            range: named.range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!(
+                "Variant '{}' carries data and must be written with parentheses: {}(...)",
+                named.name, named.name
+            ),
+            code: code(codes::TYPE_MISMATCH),
+            ..Default::default()
+        }];
     }
 
     let payload = ts_utils::struct_values(node, content);
@@ -2552,6 +2567,83 @@ mod tests {
             diagnostics.is_empty(),
             "a comment is no data for a unit variant. Got: {diagnostics:?}"
         );
+    }
+
+    /// The other half of the shape check above: a variant that declares any
+    /// field must be written with its parentheses. `ron` answers a bare
+    /// `storage: S3` for `S3(String)` with "Expected opening `(`", and does the
+    /// same for a struct variant whose fields all have defaults or are skipped,
+    /// so none of those may pass as the unit spelling. Checked wherever an enum
+    /// value sits: the root's field, a `Vec` element, a map value, `Some(..)`.
+    #[cfg(feature = "analyze")]
+    #[test]
+    fn test_data_variant_written_as_bare_name() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                pub struct Config {
+                    pub storage: Storage,
+                    #[serde(default)]
+                    pub list: Vec<Storage>,
+                    #[serde(default)]
+                    pub map: HashMap<String, Storage>,
+                    #[serde(default)]
+                    pub opt: Option<Storage>,
+                }
+
+                pub enum Storage {
+                    Memory,
+                    S3(String),
+                    Disk { path: String, sync: bool },
+                    Tuned { #[serde(default)] level: u32 },
+                    Hidden { #[serde(skip)] cache: u32 },
+                }
+                "#,
+            )
+            .unwrap();
+        let root = analyzer
+            .get_type_info("crate::Config")
+            .expect("Config")
+            .clone();
+
+        let shape_errors = |content: &str| {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.message.contains("must be written with parentheses"))
+                .map(|d| (d.range.start.line, d.range.start.character))
+                .collect::<Vec<_>>()
+        };
+
+        for variant in ["S3", "Disk", "Tuned", "Hidden"] {
+            let content = format!("Config(\n    storage: {variant},\n)");
+            assert_eq!(
+                shape_errors(&content),
+                vec![(1, 13)],
+                "'{content}' is refused by ron and should be reported on the name"
+            );
+        }
+
+        let nested = "Config(\n    storage: Memory,\n    list: [Memory, S3],\n    map: {\"a\": Disk},\n    opt: Some(Tuned),\n)";
+        assert_eq!(shape_errors(nested), vec![(2, 19), (3, 15), (4, 14)]);
+
+        // The spellings ron accepts raise nothing.
+        for content in [
+            "Config(\n    storage: Memory,\n)",
+            "Config(\n    storage: S3(\"bucket\"),\n)",
+            "Config(\n    storage: Disk(path: \"/x\", sync: true),\n)",
+            "Config(\n    storage: Tuned(),\n)",
+            "Config(\n    storage: Hidden(),\n)",
+        ] {
+            let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+                "'{content}' is valid and should raise nothing. Got: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]
