@@ -253,8 +253,15 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let uri = params.text_document.uri.to_string();
-        self.documents.write().await.remove(&uri);
+        let url = params.text_document.uri;
+        self.documents.write().await.remove(url.as_str());
+
+        // Diagnostics are only ever computed for open documents, so once one is
+        // closed nothing would replace what was last published for it. A client
+        // keeps showing those (VS Code lists them under Problems indefinitely),
+        // and they go on describing a file that may since have been fixed or
+        // deleted outside the editor. Withdraw them.
+        self.client.publish_diagnostics(url, Vec::new(), None).await;
     }
 
     async fn goto_definition(
@@ -1214,6 +1221,118 @@ mod tests {
 
         drop(client_write);
         draining.abort();
+    }
+
+    /// Diagnostics are only computed for open documents, so closing one has to
+    /// withdraw what was published for it: otherwise the editor goes on listing
+    /// errors for a file the server no longer looks at. Drive open and close
+    /// over a pipe and check that the close is answered with an empty set.
+    #[tokio::test]
+    async fn closing_a_document_clears_its_diagnostics() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let serving = tokio::spawn(serve_on(server_read, server_write, analyzer, false));
+
+        let uri = "file:///config.ron";
+        let open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {"textDocument": {
+                "uri": uri, "languageId": "ron", "version": 1,
+                "text": "Config(port: \"x\")",
+            }},
+        });
+        let close = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {"textDocument": {"uri": uri}},
+        });
+
+        let mut send = async |message: String| {
+            client_write
+                .write_all(format!("Content-Length: {}\r\n\r\n{message}", message.len()).as_bytes())
+                .await
+                .unwrap();
+            client_write.flush().await.unwrap();
+        };
+
+        // The next message the server sends that `wanted` accepts, skipping
+        // every other one.
+        let mut reader = BufReader::new(client_read);
+        let mut next = async |wanted: &dyn Fn(&serde_json::Value) -> bool| loop {
+            let mut length = None;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).await.unwrap();
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.strip_prefix("Content-Length: ") {
+                    length = Some(value.parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).await.unwrap();
+            let message: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if wanted(&message) {
+                return message;
+            }
+        };
+        let diagnostics_for_uri = |message: &serde_json::Value| {
+            message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"] == uri
+        };
+        let count =
+            |message: serde_json::Value| message["params"]["diagnostics"].as_array().unwrap().len();
+        let timeout = std::time::Duration::from_secs(10);
+
+        // Wait for the reply to `initialize` before going on, as a client must:
+        // the server drops notifications that arrive while it is uninitialized.
+        send(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#.into(),
+        )
+        .await;
+        tokio::time::timeout(timeout, next(&|message| message["id"] == 1))
+            .await
+            .expect("no reply to initialize");
+        send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.into()).await;
+
+        send(open.to_string()).await;
+        let opened = tokio::time::timeout(timeout, next(&diagnostics_for_uri))
+            .await
+            .expect("opening the document published nothing for it");
+        assert_eq!(
+            count(opened),
+            1,
+            "a string in a u16 field should be reported"
+        );
+
+        send(close.to_string()).await;
+        let closed = tokio::time::timeout(timeout, next(&diagnostics_for_uri))
+            .await
+            .expect("closing the document published nothing for it");
+        assert_eq!(
+            count(closed),
+            0,
+            "closing the document should withdraw its diagnostics"
+        );
+
+        serving.abort();
     }
 
     /// A JSON-RPC frame doesn't arrive in one `read(2)`, so the reader behind
