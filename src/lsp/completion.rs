@@ -257,6 +257,27 @@ fn struct_body_context(
         return field_completion_context(&field, content, position);
     }
 
+    // In a value written without a name, `(mode: )`, tree-sitter does build the
+    // `field`, giving it a zero-width `MISSING` value right after the colon.
+    // The field then ends there, so a cursor past the space typed after the
+    // colon is outside it, and was read as a new field name.
+    let mut walk = struct_node.walk();
+    let valueless = struct_node
+        .children(&mut walk)
+        .take_while(|child| child.end_byte() <= cursor)
+        .last()
+        .filter(|child| {
+            child.kind() == "field"
+                && ts_utils::field_value(child).is_some_and(|value| value.is_missing())
+                && content
+                    .get(child.end_byte()..cursor)
+                    .is_some_and(|gap| gap.trim().is_empty())
+        });
+    if let Some(field) = valueless {
+        let name = ts_utils::field_name(&field, content).map(str::to_string);
+        return CompletionContext::FieldValue(ValueSlot::field(name));
+    }
+
     // A value with no terminator yet (`mode: `) defeats tree-sitter's `field`
     // production entirely, so there is no field child to find above.
     match tree_sitter_parser::unterminated_value_field(tree, content, position) {
@@ -1316,6 +1337,43 @@ mod tests {
             !labels.contains(&"host".to_string()),
             "a value position is not a field name position: {:?}",
             labels
+        );
+    }
+
+    #[test]
+    fn test_value_completed_for_an_empty_field_of_an_unnamed_value() {
+        // Written without its name, `(mode: )` parses as a field whose value is
+        // a zero-width MISSING node ending at the colon, so the cursor after
+        // the space was outside every field and was offered field names.
+        let (server, analyzer) = nested_fixture();
+
+        for (content, position) in [
+            ("(mode: )", Position::new(0, 7)),
+            ("(mode:)", Position::new(0, 6)),
+            ("(\n    mode: \n)", Position::new(1, 10)),
+            ("(\n    mode:\n    \n)", Position::new(2, 4)),
+        ] {
+            let labels = labels_at(content, position, &server, &analyzer);
+            assert!(
+                labels.contains(&"Production".to_string()),
+                "the enum field's variants should be offered for {content:?}: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"host".to_string()),
+                "a value position is not a field name position for {content:?}: {labels:?}"
+            );
+        }
+
+        // A field that has its value is done with: what follows is a new field.
+        let labels = labels_at(
+            "(mode: Production, )",
+            Position::new(0, 19),
+            &server,
+            &analyzer,
+        );
+        assert!(
+            labels.contains(&"host".to_string()),
+            "field names should be offered after a finished field: {labels:?}"
         );
     }
 
