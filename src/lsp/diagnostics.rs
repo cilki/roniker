@@ -1,7 +1,7 @@
 use super::type_utils::{
     SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type, is_custom_type,
-    is_primitive_type, map_entry_types, missing_required_fields, normalize_type, short_name,
-    tuple_element_types,
+    is_primitive_type, is_wrapped_by, map_entry_types, missing_required_fields, normalize_type,
+    short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{
     FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -946,36 +946,16 @@ fn integer_value(n: &ron::Number) -> Option<i128> {
     })
 }
 
-/// Check if a RON value matches the expected Rust type
+/// Check if a RON value matches the expected Rust type.
+///
+/// Never asked of an `Option<T>`, a `Box<T>` or any other of the
+/// [`TRANSPARENT_WRAPPERS`]: [`validate_nested_value`] always looks through
+/// those to the value inside, reporting what it finds there, so
+/// [`validate_typed_value`] never falls back on this for one.
 fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     let clean_type = normalize_type(expected_type);
     // Use clean_type for error messages to avoid extra spaces
     let display_type = &clean_type;
-
-    // Handle Option types - None is always valid for Option<T>
-    if clean_type.starts_with("Option<") {
-        if matches!(value, Value::Option(None)) {
-            return None;
-        }
-        // Unwrap Some(value) to its inner value; a bare value is fine too (it
-        // will be wrapped). Either way, validate against Option's inner type.
-        if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
-            let value = match value {
-                Value::Option(Some(inner)) => inner,
-                other => other,
-            };
-            return check_type_mismatch(value, inner_type);
-        }
-    }
-
-    // Handle Box, Rc, Arc, Cow, NonZero and friends - they serialize as just
-    // the inner value
-    if let Some(inner_type) = TRANSPARENT_WRAPPERS
-        .iter()
-        .find_map(|w| extract_inner_type(&clean_type, w))
-    {
-        return check_type_mismatch(value, inner_type);
-    }
 
     // What a standard-library type with no generic arguments accepts. These are
     // judged by shape alone: the analyzer has no definition of a `PathBuf` to
@@ -1026,17 +1006,15 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             // Otherwise it's an error
             return Some(format!("expected {}, got string", display_type));
         }
-        Value::Seq(seq) => {
-            if let Some(elem_type) = SEQUENCE_WRAPPERS
-                .iter()
-                .find_map(|w| extract_inner_type(&clean_type, w))
-            {
-                // Check element types if possible
-                for elem in seq {
-                    if let Some(err) = check_type_mismatch(elem, elem_type) {
-                        return Some(format!("in Vec: {}", err));
-                    }
-                }
+        Value::Seq(_) => {
+            if is_wrapped_by(&clean_type, &SEQUENCE_WRAPPERS) {
+                // [`validate_nested_value`] walks a `Vec` written as an array
+                // element by element and never falls back on this, so the
+                // `Seq` here is the tuple spelling — `(1, 2)` — which `ron`
+                // refuses for a `Vec` ("Expected opening `[`").
+                return Some(format!(
+                    "{display_type} is written as an array, not a tuple"
+                ));
             } else if clean_type.contains("HashSet<") || clean_type.contains("BTreeSet<") {
                 // Sets are serialized as arrays in RON
                 return None;
@@ -1072,13 +1050,13 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             }
             return Some(format!("expected {}, got map/struct", display_type));
         }
-        Value::Option(Some(_)) if !clean_type.starts_with("Option<") => {
+        Value::Option(Some(_)) => {
             return Some(format!("expected {}, got Some(...)", display_type));
         }
-        Value::Option(None) if !clean_type.starts_with("Option<") => {
+        Value::Option(None) => {
             return Some(format!("expected {}, got None", display_type));
         }
-        Value::Unit if clean_type != "()" && clean_type != "unit" => {
+        Value::Unit if clean_type != "()" => {
             return Some(format!("expected {}, got ()", display_type));
         }
         _ => {}
@@ -1875,6 +1853,15 @@ mod tests {
                 "written as a tuple, not an array",
             ),
             ("Option<[u32; 2]>", "Some((1, 2, 3))", "expected 2 elements"),
+            // The other way round: `ron` wants brackets for a `Vec`, and
+            // refuses its elements in parentheses however well they fit.
+            ("Vec<u8>", "(1, 2)", "written as an array, not a tuple"),
+            (
+                "Vec<Option<u8>>",
+                "(Some(1), None)",
+                "written as an array, not a tuple",
+            ),
+            ("Box<Vec<u8>>", "(1, 2)", "written as an array, not a tuple"),
         ] {
             let errors = numeric_errors(type_name, literal);
             assert!(
