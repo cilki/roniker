@@ -920,6 +920,8 @@ fn literal_kind(trimmed: &str) -> Option<&'static str> {
         Some("float")
     } else if trimmed.starts_with('"') {
         Some("string")
+    } else if trimmed.starts_with('\'') {
+        Some("char")
     } else if trimmed == "true" || trimmed == "false" {
         Some("bool")
     } else {
@@ -966,6 +968,11 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     match value {
         Value::Bool(_) if clean_type != "bool" => {
             return Some(format!("expected {}, got bool", display_type));
+        }
+        // A char literal (`'a'`) only ever deserializes into a `char`: `ron`
+        // refuses it for a string, a number or a bool alike.
+        Value::Char(_) if clean_type != "char" => {
+            return Some(format!("expected {}, got char", display_type));
         }
         Value::Number(n) => {
             let is_float_value = matches!(n, ron::Number::F32(_) | ron::Number::F64(_));
@@ -1774,6 +1781,66 @@ mod tests {
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// A char literal deserializes into a `char` and nothing else: `ron` refuses
+    /// `'a'` for a string ("Expected string"), a number or a bool. It used to
+    /// pass every check, so a config holding one looked clean in the editor and
+    /// then failed to load.
+    #[test]
+    fn test_char_literal_is_only_a_char() {
+        for (type_name, literal) in [
+            ("char", "'a'"),
+            ("Option<char>", "Some('a')"),
+            ("Vec<char>", "['a', 'b']"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        for (type_name, literal, expected) in [
+            ("String", "'a'", "expected String, got char"),
+            ("u16", "'a'", "expected u16, got char"),
+            ("f64", "'a'", "expected f64, got char"),
+            ("bool", "'a'", "expected bool, got char"),
+            ("PathBuf", "'a'", "expected PathBuf, got char"),
+            ("Option<String>", "Some('a')", "expected String, got char"),
+            ("Vec<u8>", "['a']", "got char"),
+            ("char", r#""a""#, "expected char, got string"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} for {type_name} should report {expected:?}, got {errors:?}"
+            );
+        }
+
+        // A struct field is judged from the source text, not a parsed value.
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Retry".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "attempts".to_string(),
+                type_name: "u8".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let errors: Vec<String> =
+            validate_ron_with_analyzer("Cfg(n: 'a')", None, &single_field_type("Retry"), &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("expected Retry, got char")),
+            "'a' for Retry should be reported, got {errors:?}"
+        );
     }
 
     /// RON writes a Rust tuple and a fixed-size array alike as a parenthesized
