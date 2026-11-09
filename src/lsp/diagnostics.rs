@@ -1,7 +1,7 @@
 use super::type_utils::{
-    SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type, is_custom_type,
-    is_primitive_type, is_wrapped_by, map_entry_types, missing_required_fields, normalize_type,
-    short_name, tuple_element_types,
+    MAP_WRAPPERS, SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type,
+    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, missing_required_fields,
+    normalize_type, short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{
     FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -1033,19 +1033,15 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             }
         }
         Value::Map(_) => {
-            // Maps could be structs or actual maps
-            if clean_type.contains("HashMap<") || clean_type.contains("BTreeMap<") {
-                // It's a map type, which is fine
-                return None;
-            }
-            // Check if it's a custom struct (starts with uppercase)
-            if clean_type
-                .chars()
-                .next()
-                .map(|c| c.is_uppercase())
-                .unwrap_or(false)
+            // `{..}` and `(name: ..)` both reach here as a `Map`. Either fits a
+            // map, a struct the analyzer may know, or a std type written as a
+            // struct (`Duration`). Nothing else: `ron` refuses a map for a
+            // `String`, a `Vec` or a set ("Expected string" / "Expected
+            // opening `[`"), however uppercase the type's name is.
+            if is_wrapped_by(&clean_type, &MAP_WRAPPERS)
+                || is_custom_type(&clean_type)
+                || std_shape == Some(StdShape::Record)
             {
-                // Could be a struct, allow it
                 return None;
             }
             return Some(format!("expected {}, got map/struct", display_type));
@@ -1871,6 +1867,63 @@ mod tests {
             assert!(
                 !errors.iter().any(|m| m.contains("Unknown type")),
                 "{literal} in {type_name} is a std composite, not an unknown type: {errors:?}"
+            );
+        }
+    }
+
+    /// A map or a struct written where something else belongs used to pass
+    /// whenever the declared type's name began with a capital letter, which
+    /// took in `String`, `Vec<T>`, the sets and `PathBuf` along with the
+    /// structs it meant. `ron` refuses every one of these.
+    #[test]
+    fn test_map_is_only_accepted_where_a_map_or_struct_belongs() {
+        for (type_name, literal) in [
+            ("String", "{}"),
+            ("String", r#"{"a": 1}"#),
+            ("String", "(a: 1)"),
+            ("Vec<String>", "{}"),
+            ("Vec<String>", r#"{"a": "b"}"#),
+            ("VecDeque<u8>", "{}"),
+            ("HashSet<String>", "{}"),
+            ("PathBuf", "{}"),
+            ("NonZeroU32", "{}"),
+            ("Option<Vec<u8>>", "Some({})"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains("got map/struct")),
+                "{literal} is not a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Inner".to_string(),
+            kind: TypeKind::Struct(Vec::new()),
+            ..Default::default()
+        });
+        for (type_name, literal) in [
+            ("HashMap<String, u8>", r#"{"a": 1}"#),
+            ("BTreeMap<String, u8>", "{}"),
+            ("Option<HashMap<String, u8>>", "Some({})"),
+            ("Duration", "(secs: 0, nanos: 0)"),
+            ("Inner", "()"),
+            ("Inner", "Inner()"),
+        ] {
+            let content = format!("Cfg(n: {literal})");
+            let errors: Vec<_> = validate_ron_with_analyzer(
+                &content,
+                None,
+                &single_field_type(type_name),
+                &analyzer,
+            )
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect();
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
             );
         }
     }
