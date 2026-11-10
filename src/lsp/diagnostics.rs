@@ -27,6 +27,27 @@ fn code(code: &str) -> Option<NumberOrString> {
     Some(NumberOrString::String(code.to_string()))
 }
 
+/// An error diagnostic: every problem the validator reports is one of these,
+/// told apart by its stable `code`.
+fn error(range: Range, error_code: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        message,
+        code: code(error_code),
+        ..Default::default()
+    }
+}
+
+/// A "Type mismatch: ..." error at `node`, clipped to its first line.
+fn type_mismatch(node: &tree_sitter::Node, content: &str, tail: &str) -> Diagnostic {
+    error(
+        first_line_range(node, content),
+        codes::TYPE_MISMATCH,
+        format!("Type mismatch: {tail}"),
+    )
+}
+
 /// Build a `" (did you mean 'x'?)"` suffix when one of `candidates` is a close
 /// match for the misspelled `target`, or an empty string otherwise. The suffix
 /// is meant to be appended directly to a diagnostic message.
@@ -115,15 +136,13 @@ pub fn validate_ron_with_analyzer(
     // owned tree, which on a large file costs more than the rest of validation
     // put together.
     if let Err(e) = ron::from_str::<serde::de::IgnoredAny>(content) {
-        diagnostics.push(Diagnostic {
-            range: parse_error_range(&e.span, content),
-            severity: Some(DiagnosticSeverity::ERROR),
-            // `e.code` is the message without the span prefix that `e` itself
-            // would print; the span is already carried by `range`.
-            message: format!("RON syntax error: {}", e.code),
-            code: code(codes::SYNTAX_ERROR),
-            ..Default::default()
-        });
+        // `e.code` is the message without the span prefix that `e` itself
+        // would print; the span is already carried by the range.
+        diagnostics.push(error(
+            parse_error_range(&e.span, content),
+            codes::SYNTAX_ERROR,
+            format!("RON syntax error: {}", e.code),
+        ));
         return diagnostics;
     }
 
@@ -193,23 +212,21 @@ fn validate_struct_node(
 
         // Duplicate field — report at the second occurrence
         if present_fields.contains(&field_name) {
-            diagnostics.push(Diagnostic {
-                range: name_range(),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Duplicate field '{}'", field_name),
-                code: code(codes::DUPLICATE_FIELD),
-                ..Default::default()
-            });
+            diagnostics.push(error(
+                name_range(),
+                codes::DUPLICATE_FIELD,
+                format!("Duplicate field '{}'", field_name),
+            ));
             continue;
         }
         present_fields.push(field_name);
 
         let Some(field_info) = expected.matching_field(field_name) else {
             if !expected.allow_unknown_fields {
-                diagnostics.push(Diagnostic {
-                    range: name_range(),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!(
+                diagnostics.push(error(
+                    name_range(),
+                    codes::UNKNOWN_FIELD,
+                    format!(
                         "Unknown field '{}'{}{}",
                         field_name,
                         expected.in_variant(),
@@ -218,9 +235,7 @@ fn validate_struct_node(
                             expected.fields.iter().map(|(name, _)| name.as_str())
                         )
                     ),
-                    code: code(codes::UNKNOWN_FIELD),
-                    ..Default::default()
-                });
+                ));
             }
             continue;
         };
@@ -256,17 +271,15 @@ fn validate_struct_node(
             missing_required_fields(&expected.fields, |name| present_fields.contains(&name));
         if !missing.is_empty() {
             let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
-            diagnostics.push(Diagnostic {
-                range: struct_name_range(node, content),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!(
+            diagnostics.push(error(
+                struct_name_range(node, content),
+                codes::MISSING_REQUIRED_FIELD,
+                format!(
                     "Required fields{}: {}",
                     expected.in_variant(),
                     missing_names.join(", ")
                 ),
-                code: code(codes::MISSING_REQUIRED_FIELD),
-                ..Default::default()
-            });
+            ));
         }
     }
 
@@ -326,19 +339,10 @@ fn validate_typed_value(
         value_text.and_then(|text| ron::from_str::<Value>(text).ok())
     };
 
-    let Some(error_msg) =
-        check_declared_type(parsed_value.as_ref(), declared_type, value_text, analyzer)
-    else {
-        return Vec::new();
-    };
-
-    vec![Diagnostic {
-        range: first_line_range(value_node, content),
-        severity: Some(DiagnosticSeverity::ERROR),
-        message: format!("Type mismatch: {}", error_msg),
-        code: code(codes::TYPE_MISMATCH),
-        ..Default::default()
-    }]
+    check_declared_type(parsed_value.as_ref(), declared_type, value_text, analyzer)
+        .map(|tail| type_mismatch(value_node, content, &tail))
+        .into_iter()
+        .collect()
 }
 
 /// Whether the parse tree on its own settles that this value fits
@@ -493,12 +497,12 @@ fn validate_nested_value<'a>(
     let field_type_normalized = normalize_type(field_type);
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
-    let unknown_type_diag = |inner: &str| Diagnostic {
-        range: super::ts_utils::node_to_lsp_range(value_node, content),
-        severity: Some(DiagnosticSeverity::ERROR),
-        message: format!("Unknown type '{}'", inner),
-        code: code(codes::UNKNOWN_TYPE),
-        ..Default::default()
+    let unknown_type_diag = |inner: &str| {
+        error(
+            super::ts_utils::node_to_lsp_range(value_node, content),
+            codes::UNKNOWN_TYPE,
+            format!("Unknown type '{}'", inner),
+        )
     };
 
     // A wrapper around a custom type the analyzer never registered is reported
@@ -637,15 +641,7 @@ fn validate_tuple_value(
     element_types: &[&str],
     analyzer: &RustAnalyzer,
 ) -> Option<Vec<Diagnostic>> {
-    let mismatch = |tail: String| {
-        vec![Diagnostic {
-            range: first_line_range(value_node, content),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("Type mismatch: {tail}"),
-            code: code(codes::TYPE_MISMATCH),
-            ..Default::default()
-        }]
-    };
+    let mismatch = |tail: String| vec![type_mismatch(value_node, content, &tail)];
 
     let elements = match value_node.kind() {
         "tuple" => super::ts_utils::tuple_elements(value_node),
@@ -696,18 +692,16 @@ fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Di
             .collect(),
         TypeKind::Struct(_) => Vec::new(),
     };
-    Diagnostic {
+    error(
         range,
-        severity: Some(DiagnosticSeverity::ERROR),
-        message: format!(
+        codes::UNKNOWN_VARIANT,
+        format!(
             "Unknown variant '{}' for enum '{}'{}",
             variant_name,
             type_info.name,
             did_you_mean(variant_name, known.iter().map(|s| s.as_str()))
         ),
-        code: code(codes::UNKNOWN_VARIANT),
-        ..Default::default()
-    }
+    )
 }
 
 /// Validate the value `node` against the type it is declared as, recursing into
@@ -772,16 +766,14 @@ fn validate_enum_node(
         if variant.fields.is_empty() {
             return Vec::new();
         }
-        return vec![Diagnostic {
-            range: named.range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!(
+        return vec![error(
+            named.range,
+            codes::TYPE_MISMATCH,
+            format!(
                 "Variant '{}' carries data and must be written with parentheses: {}(...)",
                 named.name, named.name
             ),
-            code: code(codes::TYPE_MISMATCH),
-            ..Default::default()
-        }];
+        )];
     }
 
     let payload = ts_utils::struct_values(node, content);
@@ -791,16 +783,14 @@ fn validate_enum_node(
         if payload.is_empty() && named_fields.is_empty() {
             return Vec::new();
         }
-        return vec![Diagnostic {
-            range: named.range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!(
+        return vec![error(
+            named.range,
+            codes::TYPE_MISMATCH,
+            format!(
                 "Variant '{}' is a unit variant and cannot have data",
                 named.name
             ),
-            code: code(codes::TYPE_MISMATCH),
-            ..Default::default()
-        }];
+        )];
     }
 
     let expected = variant.effective_fields();
