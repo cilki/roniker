@@ -744,10 +744,12 @@ impl Backend {
 
             // A variant of the type the field under the cursor is declared as —
             // the `Short` of `post_type: Short`, which `owner` is not the enum
-            // for because the value names no variant to navigate into.
+            // for because the value names no variant to navigate into. The field
+            // may declare it behind wrappers: `mode: Some(Fast)`, `modes: [Fast]`.
             if let Some(field_name) = cursor_field
                 && let Some(field) = owner.find_field(&field_name)
-                && let Some(field_type) = self.rust_analyzer.get_type_info(&field.type_name)
+                && let Some(field_type) =
+                    navigation::value_type(&self.rust_analyzer, &field.type_name)
                 && let Some(variant) = field_type.find_variant(word)
             {
                 return Some(Symbol::Variant {
@@ -3720,6 +3722,110 @@ PostReference(
             "hover should document PostType::Short. Got: {}",
             markup.value
         );
+    }
+
+    /// A value written inside a wrapper — an element of a `Vec`, the contents
+    /// of a `Some(..)` around a `Box`, a map entry's value — belongs to the type
+    /// the wrapper holds, and the words in it resolve against that type the
+    /// same as they do when the field is declared as the type itself. Only one
+    /// generic layer used to be stripped, and a map's `String,Post` named no
+    /// type at all, so each of these came back with nothing.
+    #[tokio::test]
+    async fn test_hover_and_completion_see_through_wrappers() {
+        let mut analyzer = RustAnalyzer::with_root_type("crate::models::Feed");
+        for info in post_analyzer().get_all_types() {
+            analyzer.add_type(info.clone());
+        }
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        analyzer.add_type(TypeInfo {
+            name: "crate::models::Feed".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("kinds", "Vec<crate::models::PostType>"),
+                field("pinned", "Option<Box<crate::models::Post>>"),
+                field("by_tag", "HashMap<String, crate::models::Post>"),
+                field("default_kind", "Option<crate::models::PostType>"),
+            ]),
+            ..Default::default()
+        });
+
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
+        let uri: Uri = "file:///test/feed.ron".parse().unwrap();
+        let content = "Feed(\n    kinds: [Detailed(length: 1), Detailed()],\n    pinned: Some((id: 1, )),\n    by_tag: {\"a\": (id: 2, )},\n    default_kind: Some(Short),\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+
+        let hover_at = async |line, character| {
+            let hover = backend
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(line, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            match hover {
+                Some(Hover {
+                    contents: HoverContents::Markup(markup),
+                    ..
+                }) => markup.value,
+                _ => String::new(),
+            }
+        };
+        for (label, line, character, expected) in [
+            ("variant in a Vec", 1, 14, "A detailed post"),
+            ("variant field in a Vec", 1, 24, "How long the post is"),
+            ("field in Some(Box)", 2, 18, "The post's identifier"),
+            ("field in a map value", 3, 20, "The post's identifier"),
+            ("bare variant in Some", 4, 25, "A short post"),
+        ] {
+            let hover = hover_at(line, character).await;
+            assert!(
+                hover.contains(expected),
+                "hover on the {label} should document it. Got: {hover:?}"
+            );
+        }
+
+        let complete_at = async |line, character| {
+            let response = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(line, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let items = match response {
+                Some(CompletionResponse::Array(items)) => items,
+                Some(CompletionResponse::List(list)) => list.items,
+                None => Vec::new(),
+            };
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>()
+        };
+        for (label, line, character, expected) in [
+            ("variant in a Vec", 1, 42, "length"),
+            ("Some(Box)", 2, 25, "post_type"),
+            ("map value", 3, 26, "post_type"),
+        ] {
+            let labels = complete_at(line, character).await;
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "completion in the {label} should offer {expected}. Got: {labels:?}"
+            );
+        }
     }
 
     /// A word that names a registered type but nothing in the document's own

@@ -1,6 +1,9 @@
 //! Navigation through nested RON type contexts.
 use super::tree_sitter_parser::TypeContext;
-use super::type_utils::{short_name, strip_outer_generic};
+use super::type_utils::{
+    SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, map_entry_types,
+    normalize_type, short_name,
+};
 use crate::rust_analyzer::{RustAnalyzer, TypeInfo};
 
 /// Navigate through nested type contexts to find the innermost type.
@@ -80,7 +83,7 @@ fn step_by_type_name<'a>(
     // If not found as a variant of the current type, try to find it in field types
     if let Some(fields) = info.fields() {
         for field in fields {
-            if let Some(field_type_info) = analyzer.get_type_info(&field.type_name)
+            if let Some(field_type_info) = value_type(analyzer, &field.type_name)
                 && field_type_info.find_variant(context_name).is_some()
             {
                 return Some(field_type_info);
@@ -92,16 +95,45 @@ fn step_by_type_name<'a>(
 }
 
 /// Resolve the type of an unnamed struct value from the field it is the value
-/// of. A single generic layer is stripped so that `Option<Server>` and
-/// `Vec<Server>` resolve to `Server`, matching how diagnostics recurse into
-/// field values.
+/// of, through whatever wrappers the field's type is declared with — see
+/// [`value_type`].
 fn step_by_field_name<'a>(
     analyzer: &'a RustAnalyzer,
     info: &TypeInfo,
     field_name: &str,
 ) -> Option<&'a TypeInfo> {
     let field = info.find_field_serialized(field_name)?;
-    analyzer
-        .get_type_info(&field.type_name)
-        .or_else(|| analyzer.get_type_info(&strip_outer_generic(&field.type_name)))
+    value_type(analyzer, &field.type_name)
+}
+
+/// Deepest a chain of wrappers is followed by [`value_type`]. No declared type
+/// nests further than this by hand, and the bound keeps a malformed name from
+/// costing more than a few lookups.
+const MAX_WRAPPER_DEPTH: usize = 16;
+
+/// The registered type a struct or enum value written for a field declared as
+/// `type_name` belongs to, seeing through every wrapper on the way down — the
+/// way diagnostics recurse into a field's value.
+///
+/// A value of `Option<Box<Inner>>` is written `Some((a: 1))`, an element of
+/// `Vec<Backend>` is written `Local(root: "/")`, and a value of
+/// `HashMap<String, Limits>` is written `{"a": (max: 1)}`: what sits inside is
+/// a value of `Inner`, `Backend` and `Limits` respectively. Stripping a single
+/// generic layer stopped at `Box<Inner>`, and a map's `String,Limits` named no
+/// type at all, so hover, completion and go-to-definition found nothing there.
+pub fn value_type<'a>(analyzer: &'a RustAnalyzer, type_name: &str) -> Option<&'a TypeInfo> {
+    let mut current = normalize_type(type_name).into_owned();
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        if let Some(info) = analyzer.get_type_info(&current) {
+            return Some(info);
+        }
+        let inner = std::iter::once("Option<")
+            .chain(TRANSPARENT_WRAPPERS)
+            .chain(SEQUENCE_WRAPPERS)
+            .chain(SET_WRAPPERS)
+            .find_map(|wrapper| extract_inner_type(&current, wrapper))
+            .or_else(|| map_entry_types(&current).map(|(_, value)| value))?;
+        current = inner.to_string();
+    }
+    None
 }
