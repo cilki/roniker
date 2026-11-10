@@ -2,7 +2,7 @@ use super::tree_sitter_parser;
 use super::type_utils::{
     MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type,
     is_number_type, is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name,
-    std_type, strip_outer_generic, tuple_element_types,
+    std_type, tuple_element_types,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
@@ -517,7 +517,8 @@ fn workspace_type_completions(type_info: &TypeInfo) -> Vec<CompletionItem> {
 }
 
 /// Type completions for a field whose value is being written as a bare
-/// identifier, looking through one generic wrapper (`Vec<T>`, `Option<T>`).
+/// identifier, looking through the wrappers it is declared with — see
+/// [`value_type`](super::navigation::value_type).
 ///
 /// An enum field's value is a variant name, which the syntactic context
 /// detection can't tell apart from a struct type name (both are bare
@@ -526,8 +527,7 @@ fn generate_type_completions_by_type(
     field_type: &str,
     analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
-    analyzer
-        .get_type_info(&strip_outer_generic(field_type))
+    super::navigation::value_type(analyzer, field_type)
         .map(workspace_type_completions)
         .unwrap_or_default()
 }

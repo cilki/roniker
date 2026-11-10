@@ -255,8 +255,8 @@ impl<'a> NestedWalk<'a> {
     ///
     /// `declared_type` is the type the field holding `value` declares. Array
     /// elements and the contents of a `Some(...)` are visited as values in their
-    /// own right, so `Vec<T>` and `Option<T>` are walked the same as a plain
-    /// `T`.
+    /// own right under the field's declared type, which [`Self::resolve`] sees
+    /// through, so `Vec<T>` and `Option<T>` are walked the same as a plain `T`.
     fn walk_value(
         &self,
         value: &tree_sitter::Node,
@@ -272,14 +272,13 @@ impl<'a> NestedWalk<'a> {
         }
 
         if value.kind() == "array" {
-            let element_type = super::type_utils::strip_outer_generic(declared_type);
             for (index, element) in ts_utils::array_elements(value).iter().enumerate() {
                 if !self.touches(element) {
                     continue;
                 }
                 self.walk_value(
                     element,
-                    &element_type,
+                    declared_type,
                     &format!("{path}[{index}]"),
                     depth - 1,
                     actions,
@@ -393,12 +392,9 @@ impl<'a> NestedWalk<'a> {
         declared_type: &str,
         path: &str,
     ) -> Option<NestedTarget<'a>> {
-        // One generic layer is stripped so `Option<Server>` and `Vec<Server>`
-        // resolve to `Server`, matching how the validator recurses.
-        let info = self.analyzer.get_type_info(declared_type).or_else(|| {
-            self.analyzer
-                .get_type_info(&super::type_utils::strip_outer_generic(declared_type))
-        })?;
+        // `Option<Box<Server>>` and `Vec<Server>` resolve to `Server`, matching
+        // how the validator recurses.
+        let info = super::navigation::value_type(self.analyzer, declared_type)?;
 
         match &info.kind {
             TypeKind::Struct(_) => Some(NestedTarget {
@@ -2210,6 +2206,43 @@ mod tests {
                 "Add 1 required field to certs[1]".to_string(),
                 "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls(cert: \"\")],\n    extra: None,\n)".to_string(),
             )]
+        );
+    }
+
+    /// A field's declared type is seen through every wrapper, the way the
+    /// validator recurses: a value of `Option<Box<Tls>>` and an element of
+    /// `Vec<Option<Tls>>` are both values of `Tls`. Stripping a single generic
+    /// layer stopped at `Box<Tls>` and `Option<Tls>`, which name no type.
+    #[test]
+    fn test_nested_struct_walk_sees_through_every_wrapper() {
+        let (_, analyzer) = nested_struct_fixture();
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "pinned".to_string(),
+                    type_name: "Option<Box<Tls>>".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "chain".to_string(),
+                    type_name: "Vec<Option<Tls>>".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let content = "Cfg(\n    pinned: Some(Tls()),\n    chain: [Some(Tls())],\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, &analyzer)
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Add 1 required field to pinned",
+                "Add 1 required field to chain[0]"
+            ]
         );
     }
 

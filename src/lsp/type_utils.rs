@@ -34,16 +34,6 @@ pub fn extract_inner_type<'a>(type_str: &'a str, wrapper: &str) -> Option<&'a st
     }
 }
 
-/// Get the content of the outermost generic (e.g., `Option<Vec<T>>` -> `Vec<T>`),
-/// or the type itself if it isn't generic. Whitespace is removed.
-pub fn strip_outer_generic(type_name: &str) -> String {
-    let clean = normalize_type(type_name);
-    match (clean.find('<'), clean.rfind('>')) {
-        (Some(start), Some(end)) if start < end => clean[start + 1..end].to_string(),
-        _ => clean.into_owned(),
-    }
-}
-
 /// Check if a type is a primitive type (not a custom enum/struct). A thin
 /// wrapper over [`crate::rust_analyzer::is_primitive`] that normalizes the name
 /// first, so callers holding a raw type name don't each have to.
@@ -304,15 +294,6 @@ mod tests {
         );
         assert_eq!(extract_inner_type("Vec<User>", "Option<"), None);
         assert_eq!(extract_inner_type("User", "Vec<"), None);
-    }
-
-    #[test]
-    fn test_strip_outer_generic() {
-        assert_eq!(strip_outer_generic("Option<Post>"), "Post");
-        assert_eq!(strip_outer_generic("Vec < Post >"), "Post");
-        assert_eq!(strip_outer_generic("Post"), "Post");
-        // Only the outermost layer is stripped.
-        assert_eq!(strip_outer_generic("Option<Vec<Post>>"), "Vec<Post>");
     }
 
     /// A crate that doesn't import a standard-library type names it by its
