@@ -318,24 +318,13 @@ four spaces per level of nesting, one field, element or entry per line, a
 trailing comma after each, `: ` after every field name, and `()`, `[]` and `{}`
 kept closed up when they're empty. A tuple struct holding a single value stays
 on one line (`max_connections: Some(16)`). Comments keep their place — above the
-field they describe, or on the same line as it, or at the top of the file — and
-so do the blank lines that group fields into sections: a blank line between two
-items (or between the header comment and the root value) stays, a run of them
-becomes one, and one just inside an opening or closing delimiter is dropped.
-Laying out a document that is already in this shape changes nothing.
-
-Two things are not laid out again but **deleted**, which is why the Helix
-snippet's `auto-format = true` is worth a second thought if your config files
-hold either:
-
-- RON's extension header: `#![enable(implicit_some)]` and friends. It isn't a
-  comment, and the formatter only writes out the root value and the comments
-  above it, so it goes. With `implicit_some` gone every `Option` written as a
-  bare value stops deserializing, and nothing in the editor says so — the
-  server accepts that spelling whether the extension is enabled or not.
-- Any comment *after* the root value, such as a note at the end of the file.
-
-Both are [#103](https://git.cilki.net/cilki/roniker/issues/103).
+field they describe, or on the same line as it, or at the top or the end of the
+file — and so do the blank lines that group fields into sections: a blank line
+between two items (or between the header comment and the root value) stays, a
+run of them becomes one, and one just inside an opening or closing delimiter is
+dropped. RON's extension header (`#![enable(implicit_some)]` and friends) is
+kept exactly as written, each extension on the line it was on. Laying out a
+document that is already in this shape changes nothing.
 
 A document that doesn't parse — a half-typed `timeout: `, a field name whose
 colon isn't typed yet, an unclosed parenthesis, or one that is still only a

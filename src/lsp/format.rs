@@ -161,15 +161,52 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
         prev_end: None,
     };
 
-    // The comments above the root value, each on a line of its own: nothing
-    // else written before the root survives the layout for one to trail.
-    for comment in collect_inner_comments(&tree.root_node(), content) {
-        if comment.end_byte <= main_value.start_byte() {
-            formatter.own_line_comment(&comment, 0);
+    // The document's top level is laid out like the inside of a container, one
+    // piece per line: the `#![enable(...)]` header (and a type annotation, if
+    // the grammar found one) copied as written, then the root value. Comments
+    // keep their place around them — above a piece, after it on its line, or
+    // at the end of the file. Writing out only the root value deleted the
+    // header, and with `implicit_some` gone a document `ron` accepted no longer
+    // loaded.
+    let root = tree.root_node();
+    let comments = collect_inner_comments(&root, content);
+    let mut cursor = root.walk();
+    let mut pieces: Vec<Node> = root
+        .named_children(&mut cursor)
+        .filter(|child| {
+            child.end_byte() <= main_value.start_byte()
+                && matches!(child.kind(), "extensions" | "extension" | "type_annotation")
+        })
+        .collect();
+    pieces.push(main_value);
+
+    for (i, piece) in pieces.iter().enumerate() {
+        for comment in &comments {
+            if !comment.is_trailing
+                && comment.end_byte <= piece.start_byte()
+                && (i == 0 || comment.start_byte > pieces[i - 1].end_byte())
+            {
+                formatter.own_line_comment(comment, 0);
+            }
+        }
+
+        formatter.separate_from_previous(piece.start_byte());
+        if piece.id() == main_value.id() {
+            formatter.node(piece, 0);
+        } else if let Some(text) = ts_utils::node_text(piece, content) {
+            formatter.output.push_str(text);
+        }
+        formatter.prev_end = Some(piece.end_byte());
+
+        formatter.trailing_comment(&comments, &pieces, i);
+        formatter.output.push_str(newline);
+    }
+
+    for comment in &comments {
+        if !comment.is_trailing && comment.start_byte > main_value.end_byte() {
+            formatter.own_line_comment(comment, 0);
         }
     }
-    formatter.separate_from_previous(main_value.start_byte());
-    formatter.node(&main_value, 0);
 
     // The grammar accepts a few things RON doesn't, without an ERROR node to
     // show for it; the layout notices them on the way and they are left alone
@@ -739,46 +776,54 @@ Post(
     }
 
     /// RON's extension header is a node of the document rather than a comment
-    /// (`source_file: seq(optional($.extensions), ..., $._value)`), and the
-    /// layout writes out the root value and the comments above it and nothing
-    /// else — so the header is dropped. With `implicit_some` that turns a
-    /// document `ron` accepts into one it rejects, since every `Option` written
-    /// as a bare value depends on it.
-    ///
-    /// Pinned because the README documents it; see
-    /// https://git.cilki.net/cilki/roniker/issues/103. When that is fixed this
-    /// assertion inverts and the README changes with it.
+    /// (`source_file: seq(optional($.extensions), ..., $._value)`). The layout
+    /// used to write out only the root value and the comments above it, so the
+    /// header was deleted — and with `implicit_some` gone every `Option`
+    /// written as a bare value stopped deserializing. It is kept as written.
     #[test]
-    fn test_extension_header_is_dropped() {
-        let formatted = format_ron("#![enable(implicit_some)]\nConfig(\n    port: 8080,\n)");
-        assert!(
-            formatted.contains("port: 8080,"),
-            "the value itself survives: {formatted:?}"
-        );
-        assert!(
-            !formatted.contains("implicit_some"),
-            "the extension header does not: {formatted:?}"
+    fn test_extension_header_is_kept() {
+        let input = "#![enable(implicit_some)]\nConfig(port: 8080)";
+        assert_eq!(
+            format_ron(input),
+            "#![enable(implicit_some)]\nConfig(\n    port: 8080,\n)"
         );
     }
 
-    /// Only the comments *before* the root value are written (the document's
-    /// own comments are filtered on `end_byte <= start_byte`), and a comment
-    /// after it is a sibling of the root value rather than a child, so
-    /// collecting the root value's comments doesn't see it either. It is
-    /// dropped. Pinned
-    /// alongside the case above; see
-    /// https://git.cilki.net/cilki/roniker/issues/103.
+    /// Several extensions, the comments among and after them, and the blank
+    /// line between the header and the value all keep their place; a comment
+    /// on the header's own line stays on it.
     #[test]
-    fn test_comment_after_root_value_is_dropped() {
-        let formatted = format_ron("Config(\n    port: 8080,\n)\n// keep this in sync with nginx");
-        assert!(
-            formatted.contains("port: 8080,"),
-            "the value itself survives: {formatted:?}"
+    fn test_extension_header_keeps_its_comments_and_blank_lines() {
+        let input = "#![enable(implicit_some)] // for Option fields\n// and newtypes\n#![enable(unwrap_newtypes)]\n\n// the config\nConfig(\n    port: 8080,\n)";
+        assert_eq!(format_ron(input), input);
+    }
+
+    /// A comment after the root value is a sibling of it rather than a child,
+    /// so the layout of the root value never saw it and it used to be deleted.
+    /// It is kept, on its own line or on the root value's closing line,
+    /// whichever it was written on, along with the blank lines before it.
+    #[test]
+    fn test_comment_after_root_value_is_kept() {
+        let formatted = format_ron(
+            "Config(port: 8080) // end\n// keep this in sync with nginx\n\n/* last */\n",
         );
-        assert!(
-            !formatted.contains("nginx"),
-            "the trailing comment does not: {formatted:?}"
+        assert_eq!(
+            formatted,
+            "Config(\n    port: 8080,\n) // end\n// keep this in sync with nginx\n\n/* last */"
         );
+    }
+
+    /// The header and the comments around it are written with the document's
+    /// own line endings, and formatting the result again changes nothing.
+    #[test]
+    fn test_header_and_trailing_comment_in_crlf_document_are_stable() {
+        let input = "#![enable(implicit_some)]\r\nConfig(port: 8080)\r\n// tail\r\n";
+        let formatted = format_ron(input);
+        assert_eq!(
+            formatted,
+            "#![enable(implicit_some)]\r\nConfig(\r\n    port: 8080,\r\n)\r\n// tail"
+        );
+        assert_eq!(format_ron(&formatted), formatted);
     }
 
     /// A document with no value in it is one tree-sitter reports a missing
