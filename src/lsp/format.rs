@@ -162,14 +162,13 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
     };
 
     // The document's top level is laid out like the inside of a container, one
-    // piece per line: the `#![enable(...)]` header (and a type annotation, if
-    // the grammar found one) copied as written, then the root value. Comments
-    // keep their place around them — above a piece, after it on its line, or
-    // at the end of the file. Writing out only the root value deleted the
-    // header, and with `implicit_some` gone a document `ron` accepted no longer
-    // loaded.
+    // piece per line and nothing after it: the `#![enable(...)]` header (and a
+    // type annotation, if the grammar found one), which `node` copies as
+    // written, then the root value. Comments keep their place around them —
+    // above a piece, after it on its line, or at the end of the file. Writing
+    // out only the root value deleted the header, and with `implicit_some`
+    // gone a document `ron` accepted no longer loaded.
     let root = tree.root_node();
-    let comments = collect_inner_comments(&root, content);
     let mut cursor = root.walk();
     let mut pieces: Vec<Node> = root
         .named_children(&mut cursor)
@@ -179,34 +178,7 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
         })
         .collect();
     pieces.push(main_value);
-
-    for (i, piece) in pieces.iter().enumerate() {
-        for comment in &comments {
-            if !comment.is_trailing
-                && comment.end_byte <= piece.start_byte()
-                && (i == 0 || comment.start_byte > pieces[i - 1].end_byte())
-            {
-                formatter.own_line_comment(comment, 0);
-            }
-        }
-
-        formatter.separate_from_previous(piece.start_byte());
-        if piece.id() == main_value.id() {
-            formatter.node(piece, 0);
-        } else if let Some(text) = ts_utils::node_text(piece, content) {
-            formatter.output.push_str(text);
-        }
-        formatter.prev_end = Some(piece.end_byte());
-
-        formatter.trailing_comment(&comments, &pieces, i);
-        formatter.output.push_str(newline);
-    }
-
-    for comment in &comments {
-        if !comment.is_trailing && comment.start_byte > main_value.end_byte() {
-            formatter.own_line_comment(comment, 0);
-        }
-    }
+    formatter.lines(&root, &pieces, 0, "");
 
     // The grammar accepts a few things RON doesn't, without an ERROR node to
     // show for it; the layout notices them on the way and they are left alone
@@ -295,10 +267,8 @@ impl Formatter<'_> {
         }
     }
 
-    /// Lay out `items` one per line between `delimiters`, with their comments:
-    /// leading comments above the item, the item itself at one extra level of
-    /// indentation, a terminating comma, and any trailing comment after it.
-    /// Comments that follow the last item go before the closing delimiter.
+    /// Lay out `items` one per line between `delimiters`, each at one extra
+    /// level of indentation and ending in a comma, with their comments.
     ///
     /// This is the one layout rule shared by arrays, maps, tuples and
     /// field-style structs — they differ only in their delimiters and in what
@@ -312,27 +282,37 @@ impl Formatter<'_> {
     ) {
         self.output.push(open);
         if !items.is_empty() {
-            let comments = collect_inner_comments(node, self.content);
-
             self.output.push_str(self.newline);
-            self.prev_end = None;
-            for (i, item) in items.iter().enumerate() {
-                self.leading_comments(&comments, items, i, level);
-
-                self.separate_from_previous(item.start_byte());
-                self.indent(level + 1);
-                self.node(item, level + 1);
-                self.prev_end = Some(item.end_byte());
-                self.output.push(',');
-
-                self.trailing_comment(&comments, items, i);
-                self.output.push_str(self.newline);
-            }
-
-            self.remaining_comments(&comments, items, level);
+            self.lines(node, items, level + 1, ",");
             self.indent(level);
         }
         self.output.push(close);
+    }
+
+    /// Lay out `items`, the children of `node`, one per line at `level` levels
+    /// of indentation, with `node`'s comments kept in their place: leading
+    /// comments above the item, the item itself followed by `terminator` and
+    /// any trailing comment after it, and the comments that follow the last
+    /// item on lines of their own after it. Every line written ends in a line
+    /// break, the last one included.
+    fn lines(&mut self, node: &Node, items: &[Node<'_>], level: usize, terminator: &str) {
+        let comments = collect_inner_comments(node, self.content);
+
+        self.prev_end = None;
+        for (i, item) in items.iter().enumerate() {
+            self.leading_comments(&comments, items, i, level);
+
+            self.separate_from_previous(item.start_byte());
+            self.indent(level);
+            self.node(item, level);
+            self.prev_end = Some(item.end_byte());
+            self.output.push_str(terminator);
+
+            self.trailing_comment(&comments, items, i);
+            self.output.push_str(self.newline);
+        }
+
+        self.remaining_comments(&comments, items, level);
     }
 
     /// Lay out a struct value: `Name(...)`, or `(...)` when the document leaves
@@ -406,7 +386,7 @@ impl Formatter<'_> {
     }
 
     /// Emit the leading (non-trailing) comments that fall before `items[i]` and
-    /// after the item before it, one per line at one level deeper than `level`.
+    /// after the item before it, one per line at `level` levels of indentation.
     ///
     /// No comment reaches this twice, so nothing records which ones have
     /// already been written. The window each `i` accepts — past `items[i - 1]`
@@ -427,7 +407,7 @@ impl Formatter<'_> {
                 && comment.end_byte <= items[i].start_byte()
                 && (i == 0 || comment.start_byte > items[i - 1].end_byte())
             {
-                self.own_line_comment(comment, level + 1);
+                self.own_line_comment(comment, level);
             }
         }
     }
@@ -448,14 +428,15 @@ impl Formatter<'_> {
         }
     }
 
-    /// Emit the non-trailing comments that follow the last item in a container.
+    /// Emit the non-trailing comments that follow the last item in a container,
+    /// one per line at `level` levels of indentation.
     fn remaining_comments(&mut self, comments: &[Comment], items: &[Node<'_>], level: usize) {
         let Some(last) = items.last() else {
             return;
         };
         for comment in comments {
             if !comment.is_trailing && comment.start_byte > last.end_byte() {
-                self.own_line_comment(comment, level + 1);
+                self.own_line_comment(comment, level);
             }
         }
     }
