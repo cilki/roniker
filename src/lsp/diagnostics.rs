@@ -779,18 +779,24 @@ fn validate_enum_node(
     let payload = ts_utils::struct_values(node, content);
     let named_fields = ts_utils::struct_fields(node);
 
+    // The bare name is also the *only* way RON writes a unit variant: `ron`
+    // reads `Memory` and then takes a `(` after it for data the variant can't
+    // carry, so `Memory()` fails to load whether or not anything is written
+    // between the parentheses — a comment included. (A unit *struct* is
+    // different, `()` being one of its spellings, but it never gets here.)
     if variant.fields.is_empty() {
-        if payload.is_empty() && named_fields.is_empty() {
-            return Vec::new();
-        }
-        return vec![error(
-            named.range,
-            codes::TYPE_MISMATCH,
+        let message = if payload.is_empty() && named_fields.is_empty() {
+            format!(
+                "Variant '{}' is a unit variant and must be written without parentheses: {}",
+                named.name, named.name
+            )
+        } else {
             format!(
                 "Variant '{}' is a unit variant and cannot have data",
                 named.name
-            ),
-        )];
+            )
+        };
+        return vec![error(named.range, codes::TYPE_MISMATCH, message)];
     }
 
     let expected = variant.effective_fields();
@@ -2657,12 +2663,92 @@ mod tests {
             diagnostics
         );
 
-        // A comment is not data.
-        let content = "Active(/* paused until Monday */)";
-        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
+        // A comment is not data, but the parentheses around it are still not
+        // how a unit variant is written: `ron` refuses `Active()` with or
+        // without a comment inside, so both are reported — as the spelling
+        // mistake they are, not as data.
+        for content in ["Active()", "Active(/* paused until Monday */)"] {
+            let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
+            let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+            assert_eq!(
+                messages,
+                vec![
+                    "Variant 'Active' is a unit variant and must be written without parentheses: Active"
+                ],
+                "'{content}' is refused by ron and should be reported once"
+            );
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
+            );
+        }
+    }
+
+    /// `Memory()` is refused by `ron` wherever the enum sits, so it is reported
+    /// wherever the enum sits: the root's field, a `Vec` element, a map value,
+    /// `Some(..)`, and a document whose root value is the variant itself.
+    #[cfg(feature = "analyze")]
+    #[test]
+    fn test_unit_variant_with_parentheses_reported_at_every_depth() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                pub struct Config {
+                    pub storage: Storage,
+                    #[serde(default)]
+                    pub list: Vec<Storage>,
+                    #[serde(default)]
+                    pub map: HashMap<String, Storage>,
+                    #[serde(default)]
+                    pub opt: Option<Storage>,
+                }
+
+                pub enum Storage {
+                    Memory,
+                    S3(String),
+                }
+                "#,
+            )
+            .unwrap();
+        let root = analyzer
+            .get_type_info("crate::Config")
+            .expect("Config")
+            .clone();
+
+        let shape_errors = |content: &str, type_info: &TypeInfo| {
+            validate_ron_with_analyzer(content, None, type_info, &analyzer)
+                .into_iter()
+                .filter(|d| d.message.contains("must be written without parentheses"))
+                .map(|d| (d.range.start.line, d.range.start.character))
+                .collect::<Vec<_>>()
+        };
+
+        let nested = "Config(\n    storage: Memory(),\n    list: [Memory(), S3(\"b\")],\n    map: {\"a\": Memory( )},\n    opt: Some(Memory()),\n)";
+        assert_eq!(
+            shape_errors(nested, &root),
+            vec![(1, 13), (2, 11), (3, 15), (4, 14)]
+        );
+
+        let storage = analyzer
+            .get_type_info("crate::Storage")
+            .expect("Storage")
+            .clone();
+        assert_eq!(shape_errors("Memory()", &storage), vec![(0, 0)]);
+
+        // The bare name, the one spelling ron accepts, raises nothing.
+        let diagnostics = validate_ron_with_analyzer(
+            "Config(\n    storage: Memory,\n    list: [Memory],\n    map: {\"a\": Memory},\n    opt: Some(Memory),\n)",
+            None,
+            &root,
+            &analyzer,
+        );
         assert!(
-            diagnostics.is_empty(),
-            "a comment is no data for a unit variant. Got: {diagnostics:?}"
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "the bare name is valid and should raise nothing. Got: {diagnostics:?}"
         );
     }
 
