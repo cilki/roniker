@@ -636,21 +636,32 @@ fn generate_value_completions_by_type(
         return generate_value_completions_by_type(inner, analyzer);
     }
 
-    // Check for generic types and try to provide completions for the inner type
-    if clean_type.starts_with("Option<") {
-        let inner = extract_inner_type(&clean_type, "Option<").unwrap_or(&clean_type);
-        let some = match analyzer.get_type_info(inner) {
-            Some(type_info) => {
-                let name = short_name(&type_info.name);
-                snippet_item(
-                    format!("Some({name})"),
-                    "Some variant with nested type",
-                    format!("Some({name}($0))"),
-                )
-            }
-            None => snippet_item("Some()", "Some variant", "Some($0)"),
+    // An `Option<T>` takes `None` and `Some(..)` of every value `T` takes, so
+    // the inner type's completions are offered wrapped in `Some(..)`: an enum's
+    // variants, a struct's snippet, a `bool`'s `true`/`false`. Spelling the
+    // inner type's *name* inside the `Some` instead offered `Some(Auth($0))`
+    // for an `Option<Auth>` enum, which is not how a variant is written.
+    if let Some(inner) = extract_inner_type(&clean_type, "Option<") {
+        let inner_items = generate_value_completions_by_type(inner, analyzer);
+        let mut items: Vec<CompletionItem> = if inner_items.is_empty() {
+            // Nothing is known about the inner type's values: leave the caret
+            // inside the parens for whatever it turns out to be.
+            vec![snippet_item("Some()", "Some variant", "Some($0)")]
+        } else {
+            inner_items
+                .into_iter()
+                .map(|item| CompletionItem {
+                    label: format!("Some({})", item.label),
+                    insert_text: Some(format!(
+                        "Some({})",
+                        item.insert_text.as_deref().unwrap_or(&item.label)
+                    )),
+                    ..item
+                })
+                .collect()
         };
-        return vec![some, value_item("None", "None variant", "None")];
+        items.push(value_item("None", "None variant", "None"));
+        return items;
     }
 
     // Handle primitive types
@@ -1074,7 +1085,7 @@ mod tests {
             ("std::collections::HashSet<String>", vec!["[]", "[...]"]),
             ("HashSet<String>", vec!["[]", "[...]"]),
             ("std::vec::Vec<String>", vec!["[]", "[...]"]),
-            ("std::option::Option<u64>", vec!["Some()", "None"]),
+            ("std::option::Option<u64>", vec!["Some(0)", "None"]),
             ("std::string::String", vec!["\"\""]),
         ] {
             assert_eq!(labels(type_name), expected, "type: {type_name}");
@@ -1138,6 +1149,115 @@ mod tests {
                 .map(|(label, _)| label)
                 .collect::<Vec<_>>(),
             vec!["[]", "[...]"]
+        );
+    }
+
+    /// An `Option<T>` field takes `None` and `Some(..)` of whatever `T` takes.
+    /// An `Option<Auth>` enum field used to be offered `Some(Auth($0))`, which
+    /// spells the enum's *name* where one of its variants belongs and is not a
+    /// value `ron` accepts; the primitives were offered an empty `Some()` and
+    /// left the user to type the value `Some(true)` or `Some("")` by hand.
+    #[test]
+    fn test_option_value_completion_wraps_the_inner_types_values() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Auth".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Anonymous".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Token".to_string(),
+                    fields: vec![FieldInfo {
+                        name: "0".to_string(),
+                        type_name: "String".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("lowercase".to_string()),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Tls".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "cert".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+
+        let completions = |type_name: &str| -> Vec<(String, String)> {
+            generate_value_completions_by_type(type_name, &analyzer)
+                .iter()
+                .map(|c| {
+                    (
+                        c.label.clone(),
+                        c.insert_text.clone().unwrap_or_else(|| c.label.clone()),
+                    )
+                })
+                .collect()
+        };
+        let pair = |label: &str, insert: &str| (label.to_string(), insert.to_string());
+
+        // An enum: one `Some(..)` per variant, under its serialized name, with
+        // the caret inside a data-carrying variant's parens.
+        assert_eq!(
+            completions("Option<Auth>"),
+            vec![
+                pair("Some(anonymous)", "Some(anonymous)"),
+                pair("Some(token)", "Some(token($0))"),
+                pair("None", "None"),
+            ]
+        );
+        // A struct: the same snippet its own field gets, inside the `Some`.
+        assert_eq!(
+            completions("Option<Tls>"),
+            vec![
+                pair("Some(Tls)", "Some(Tls(\n    cert: ${1},\n))"),
+                pair("None", "None"),
+            ]
+        );
+        // The wrappers between the `Option` and the type are seen through.
+        assert_eq!(
+            completions("Option<Box<Auth>>")
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>(),
+            vec!["Some(anonymous)", "Some(token)", "None"]
+        );
+        // Primitives: the values themselves, not an empty `Some()`.
+        assert_eq!(
+            completions("Option<bool>"),
+            vec![
+                pair("Some(true)", "Some(true)"),
+                pair("Some(false)", "Some(false)"),
+                pair("None", "None"),
+            ]
+        );
+        assert_eq!(
+            completions("Option<String>"),
+            vec![pair("Some(\"\")", "Some(\"$0\")"), pair("None", "None")]
+        );
+        assert_eq!(
+            completions("Option<(u32, u32)>"),
+            vec![pair("Some((...))", "Some(($1, $2))"), pair("None", "None")]
+        );
+        assert_eq!(
+            completions("Option<Option<u8>>"),
+            vec![
+                pair("Some(Some(0))", "Some(Some(0))"),
+                pair("Some(None)", "Some(None)"),
+                pair("None", "None"),
+            ]
+        );
+        // A type nothing is known about keeps the caret inside the parens.
+        assert_eq!(
+            completions("Option<Ghost>"),
+            vec![pair("Some()", "Some($0)"), pair("None", "None")]
         );
     }
 
@@ -1427,7 +1547,7 @@ mod tests {
         for (content, position, expected) in [
             ("AppConfig(debug: t)", Position::new(0, 18), "true"),
             ("AppConfig(debug: fal,)", Position::new(0, 20), "false"),
-            ("AppConfig(timeout: So)", Position::new(0, 21), "Some()"),
+            ("AppConfig(timeout: So)", Position::new(0, 21), "Some(0)"),
             ("AppConfig(timeout: N,)", Position::new(0, 20), "None"),
         ] {
             let labels = labels_at(content, position, &root, &analyzer);
