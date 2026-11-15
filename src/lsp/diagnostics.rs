@@ -135,6 +135,27 @@ pub fn validate_ron_with_analyzer(
     // down, validating each value against the type it is declared as. Each
     // value is visited once, so nothing is reported twice.
     if let Some(main_value) = super::ts_utils::find_main_value(tree) {
+        // Every nested value is first asked whether what it names fits the type
+        // it is written for, in [`validate_typed_value`]; the root value has no
+        // field declaring its type and so never got there. `ron` refuses a root
+        // that names another struct (`ServerConfig(..)` for an `AppConfig`) or
+        // a literal written where the struct belongs before it reads a single
+        // field, and so does this: the fields inside are not the root type's
+        // fields gone wrong, and reporting them as unknown would say they are.
+        // An enum root is left to [`validate_enum_node`], which already judges
+        // the variant it names.
+        if matches!(type_info.kind, TypeKind::Struct(_))
+            && let Some(tail) = check_declared_type(
+                None,
+                short_name(&type_info.name),
+                super::ts_utils::node_text(&main_value, content),
+                analyzer,
+            )
+        {
+            diagnostics.push(type_mismatch(&main_value, content, &tail));
+            return diagnostics;
+        }
+
         diagnostics.extend(validate_node_with_type_info(
             &main_value,
             content,
@@ -4607,6 +4628,90 @@ mod tests {
                 vec![expected.to_string()],
                 "for {content}"
             );
+        }
+    }
+
+    /// The root value gets the same check as every nested one: `ron` refuses a
+    /// document whose root names a struct other than the root type
+    /// (`ExpectedDifferentStructName`), or that is a literal where the struct
+    /// belongs (`ExpectedNamedStructLike`), before it reads a single field.
+    /// The server used to validate such a root's fields as though they were
+    /// the root type's and otherwise report nothing, so `Other(host: "x")` for
+    /// a root type `Config` came back as an unknown `host` plus the two fields
+    /// `Config` wants — three reports, none of them the mistake made — and
+    /// `Other(mode: Ephemeral, server: Server(host: "x"))` came back clean,
+    /// and was then rejected by the application.
+    #[test]
+    fn test_root_value_is_checked_against_the_root_type() {
+        for (content, expected) in [
+            // A registered type that isn't the root type, with the root type's
+            // own fields inside: nothing else is wrong with the document.
+            (
+                r#"Other(mode: Ephemeral, server: Server(host: "x"))"#,
+                "Type mismatch: expected Config, got Other",
+            ),
+            // A type nothing in the workspace defines.
+            (
+                r#"Bogus(mode: Ephemeral, server: Server(host: "x"))"#,
+                "Type mismatch: unknown type 'Bogus'",
+            ),
+            // A literal where the struct belongs.
+            ("7", "Type mismatch: expected Config, got integer"),
+            (r#""x""#, "Type mismatch: expected Config, got string"),
+        ] {
+            let (config, analyzer) = named_value_fixture();
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, &analyzer);
+            let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+            assert_eq!(messages, vec![expected], "for {content}");
+            assert_eq!(
+                diagnostics[0].code,
+                code(codes::TYPE_MISMATCH),
+                "for {content}"
+            );
+            assert_eq!(
+                diagnostics[0].range.start,
+                Position::new(0, 0),
+                "reported on the root value, for {content}"
+            );
+        }
+    }
+
+    /// The fields of a root value that names the wrong type are not the root
+    /// type's fields gone wrong, so they are not reported as such: the one
+    /// diagnostic is the name, and `ron` stops there too.
+    #[test]
+    fn test_wrong_root_type_name_does_not_cascade_into_its_fields() {
+        let (config, analyzer) = named_value_fixture();
+        let diagnostics =
+            validate_ron_with_analyzer(r#"Other(host: "x")"#, None, &config, &analyzer);
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["Type mismatch: expected Config, got Other"],
+            "no unknown-field or missing-required-field under the wrong type"
+        );
+    }
+
+    /// What keeps the check quiet on a correct document: the root type's own
+    /// name, under a registered module path as a build script registers it;
+    /// RON's unnamed syntax, which names nothing; and the extension header,
+    /// which comes before the root value without being it.
+    #[test]
+    fn test_root_value_naming_the_root_type_is_not_reported() {
+        let (mut config, analyzer) = named_value_fixture();
+        config.name = "crate::config::Config".to_string();
+        for content in [
+            r#"Config(mode: Ephemeral, server: Server(host: "x"))"#,
+            r#"(mode: Ephemeral, server: Server(host: "x"))"#,
+            "#![enable(implicit_some)]\nConfig(mode: Ephemeral, server: Server(host: \"x\"))",
+            "// the root type\nConfig(mode: Ephemeral, server: Server(host: \"x\"))",
+        ] {
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, &analyzer);
+            let errors: Vec<&Diagnostic> = diagnostics
+                .iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+            assert!(errors.is_empty(), "for {content}: {errors:?}");
         }
     }
 

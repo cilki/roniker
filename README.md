@@ -210,7 +210,11 @@ Opening a RON file matched by the pattern above gets you:
     with or without data inside — `ron` reads a unit variant as its bare name
     and nothing else), or a variant that declares fields written as a bare
     name (`storage: S3` for an `S3(String)` variant, which `ron` refuses for
-    want of the parentheses). Mind the code if you
+    want of the parentheses). The root value is held to the root type the same
+    way: a document that opens `ServerConfig(` where the root type is
+    `Configuration` gets `expected Configuration, got ServerConfig` on that
+    first line and nothing else, since `ron` stops there too and the fields
+    inside are not `Configuration`'s fields gone wrong. Mind the code if you
     filter by it: a message reading *unknown type* or *unknown variant* is
     still tagged `type-mismatch`, not `unknown-type` or `unknown-variant`.
     Lastly it is the three ways a tuple or fixed-size array field can go wrong,
