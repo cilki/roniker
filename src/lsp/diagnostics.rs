@@ -583,13 +583,39 @@ fn validate_nested_value<'a>(
         // configuration crate that defines a `Duration` or a `Path` of its own
         // is validated against its own definition rather than being mistaken
         // for std's.
-        diagnostics.extend(validate_node_with_type_info(
-            value_node,
-            content,
-            nested_type_info,
-            analyzer,
-            false,
-        ));
+        //
+        // A struct value is first held to the name it writes, the way
+        // [`validate_enum_node`] holds an enum value to the variant it names
+        // before looking at the payload. `ron` stops at `Route(..)` written for
+        // a `Backend` field (`ExpectedDifferentStructName`) without reading a
+        // field, and so does this: the fields inside are `Route`'s, not
+        // `Backend`'s gone wrong, and walking them as `Backend`'s reported an
+        // unknown field for each one and a missing field for each of
+        // `Backend`'s — a cascade that named every mistake but the one made,
+        // and hid an unregistered name (`Bogus(..)`) behind it entirely. The
+        // same check used to run only afterwards, as the surface check in
+        // [`validate_typed_value`], which the cascade pre-empted; having been
+        // asked here it has nothing left to add, hence `settled`.
+        let is_struct = matches!(nested_type_info.kind, TypeKind::Struct(_));
+        if is_struct
+            && let Some(tail) = check_declared_type(
+                None,
+                field_type,
+                super::ts_utils::node_text(value_node, content),
+                analyzer,
+            )
+        {
+            diagnostics.push(type_mismatch(value_node, content, &tail));
+        } else {
+            diagnostics.extend(validate_node_with_type_info(
+                value_node,
+                content,
+                nested_type_info,
+                analyzer,
+                false,
+            ));
+        }
+        settled |= is_struct;
     } else if is_custom_type(&field_type_normalized) {
         // Unknown custom type — report an error at the value node. A
         // standard-library type is not one of these: it is absent from the
@@ -4370,9 +4396,10 @@ mod tests {
     }
 
     /// `Config(mode: Mode, server: Server)`, with a second struct `Other` that
-    /// happens to have the same field as `Server` — so that a value naming the
-    /// wrong type still passes the field checks and gets as far as the
-    /// surface-level type check.
+    /// happens to have the same field as `Server`, and a third, `Route`, that
+    /// shares none of them — so that a value naming the wrong type can be
+    /// tested both where its fields would pass as `Server`'s and where they
+    /// would not.
     fn named_value_fixture() -> (TypeInfo, RustAnalyzer) {
         let mut analyzer = RustAnalyzer::new();
         analyzer.add_type(TypeInfo {
@@ -4400,6 +4427,15 @@ mod tests {
                 ..Default::default()
             });
         }
+        analyzer.add_type(TypeInfo {
+            name: "Route".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "backend".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
         let config = TypeInfo {
             name: "Config".to_string(),
             kind: TypeKind::Struct(vec![
@@ -4429,13 +4465,110 @@ mod tests {
             .collect()
     }
 
+    /// A struct value is held to the name it writes *before* its fields are
+    /// walked, the way an enum value is held to the variant it names. `ron`
+    /// refuses `Route(..)` written for a `Server` field without reading a field
+    /// (`ExpectedDifferentStructName`), so the fields inside are `Route`'s, not
+    /// `Server`'s gone wrong. Walking them as `Server`'s used to report an
+    /// unknown `backend` and a missing `host` — and, since the name check only
+    /// ran once the walk had found nothing, never the mistake actually made.
+    /// The same cascade hid an unregistered name entirely: `Bogus(backend: "x")`
+    /// came back as one unknown field.
+    ///
+    /// The check reaches every nested struct value by the one path they share:
+    /// a field's value, an element of a `Vec`, the contents of a `Some(..)`.
+    #[test]
+    fn test_wrong_struct_name_is_reported_instead_of_its_fields() {
+        let (_, analyzer) = named_value_fixture();
+        let config = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "server".to_string(),
+                    type_name: "Server".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "servers".to_string(),
+                    type_name: "Vec<Server>".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "fallback".to_string(),
+                    type_name: "Option<Server>".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        for (content, expected) in [
+            (
+                r#"Config(server: Route(backend: "x"), servers: [], fallback: None)"#,
+                "Type mismatch: expected Server, got Route",
+            ),
+            (
+                r#"Config(server: Bogus(backend: "x"), servers: [], fallback: None)"#,
+                "Type mismatch: unknown type 'Bogus'",
+            ),
+            (
+                r#"Config(server: Server(host: "a"), servers: [Server(host: "b"), Route(backend: "x")], fallback: None)"#,
+                "Type mismatch: expected Server, got Route",
+            ),
+            (
+                r#"Config(server: Server(host: "a"), servers: [], fallback: Some(Route(backend: "x")))"#,
+                "Type mismatch: expected Server, got Route",
+            ),
+        ] {
+            let diagnostics: Vec<Diagnostic> =
+                validate_ron_with_analyzer(content, None, &config, &analyzer)
+                    .into_iter()
+                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                    .collect();
+            let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+            assert_eq!(messages, vec![expected], "for {content}");
+            assert_eq!(
+                diagnostics[0].code,
+                code(codes::TYPE_MISMATCH),
+                "for {content}"
+            );
+            let offset = |pos| super::super::ts_utils::position_to_byte_offset(content, pos);
+            let under =
+                &content[offset(diagnostics[0].range.start)..offset(diagnostics[0].range.end)];
+            assert!(
+                under.starts_with("Route(") || under.starts_with("Bogus("),
+                "reported on the misnamed value, not its fields. Got {under:?} for {content}"
+            );
+        }
+
+        // A value that names the right type, or none, still has its fields
+        // walked — that is where the name check hands over, not what it
+        // replaces.
+        for content in [
+            r#"Config(server: Server(hots: "x"), servers: [], fallback: None)"#,
+            r#"Config(server: (hots: "x"), servers: [], fallback: None)"#,
+            r#"Config(server: Server(host: "a"), servers: [(hots: "x")], fallback: None)"#,
+        ] {
+            let diagnostics = validate_ron_with_analyzer(content, None, &config, &analyzer);
+            let found: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.code.clone())
+                .collect();
+            assert_eq!(
+                found,
+                vec![code(codes::UNKNOWN_FIELD), code(codes::MISSING_REQUIRED_FIELD)],
+                "for {content}. Got: {diagnostics:?}"
+            );
+        }
+    }
+
     /// What a value *names* is checked against the type the field is declared
-    /// as, once the field-by-field checks have found nothing to say. Each of
-    /// these spellings is wrong in a different way and the message has to name
-    /// which: a bare value in an enum field is not one of its variants, a
-    /// struct value naming a type that doesn't exist is a different mistake
-    /// from one naming a type that does, and a literal where a struct belongs
-    /// is reported by what the literal is.
+    /// as. Each of these spellings is wrong in a different way and the message
+    /// has to name which: a bare value in an enum field is not one of its
+    /// variants, a struct value naming a type that doesn't exist is a different
+    /// mistake from one naming a type that does, and a literal where a struct
+    /// belongs is reported by what the literal is.
     #[test]
     fn test_named_type_is_checked_against_the_declared_type() {
         for (content, expected) in [

@@ -199,8 +199,11 @@ Opening a RON file matched by the pattern above gets you:
     `u16`), which `ron` refuses to deserialize. An integer literal in a float
     field is fine — serde widens it — and is not reported. It is also every way
     a value can contradict a struct or enum it is written for: naming a
-    different type (`expected ServerConfig, got ServerMode`), naming a type
-    nothing in the workspace defines (`unknown type 'Bogus'`), a literal where
+    different type (`expected ServerConfig, got ServerMode`) or naming a type
+    nothing in the workspace defines (`unknown type 'Bogus'`) — each reported
+    on the misnamed value and nothing else, wherever it sits in the document,
+    since `ron` stops at the name before reading a field and the fields inside
+    are the named type's, not the expected type's gone wrong —, a literal where
     a struct belongs (`expected ServerConfig, got integer`), a value that names
     no variant at all in an enum field (`unknown variant '42' for enum
     ServerMode`), a unit variant written with parentheses (`storage: Memory()`,
