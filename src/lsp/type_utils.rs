@@ -263,6 +263,23 @@ pub fn missing_fields(
     })
 }
 
+/// The field of `fields` that serde would fill from a RON field named
+/// `field_name`: the one whose serialized name — as the *containing* type
+/// spells it, which for a flattened field is not what the field's own container
+/// would produce — matches, or that accepts the name itself (its Rust name, an
+/// alias). The counterpart of [`missing_fields`]: a name this matches is one
+/// that counts as present there, so the diagnostics and the quick-fixes cannot
+/// disagree about which field a document's name supplies.
+pub fn matching_field<'a>(
+    fields: &'a [(String, FieldInfo)],
+    field_name: &str,
+) -> Option<&'a FieldInfo> {
+    fields
+        .iter()
+        .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
+        .map(|(_, f)| f)
+}
+
 /// The [`missing_fields`] that must be present in the RON: not `Option<T>`, no
 /// default.
 pub fn missing_required_fields(

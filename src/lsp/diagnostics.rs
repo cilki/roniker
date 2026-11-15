@@ -1,7 +1,7 @@
 use super::type_utils::{
     MAP_WRAPPERS, SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type,
-    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, missing_required_fields,
-    normalize_type, short_name, tuple_element_types,
+    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, matching_field,
+    missing_required_fields, normalize_type, short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{
     FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -90,18 +90,6 @@ impl ExpectedStruct<'_> {
             Some(name) => format!(" in variant '{}'", name),
             None => String::new(),
         }
-    }
-
-    /// The field serde would fill from a RON field named `field_name`.
-    ///
-    /// `name` is the serialized name as the *containing* type spells it, which
-    /// for a flattened field is not what the field's own container would
-    /// produce, so it is compared separately from `accepts_name`.
-    fn matching_field(&self, field_name: &str) -> Option<&FieldInfo> {
-        self.fields
-            .iter()
-            .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
-            .map(|(_, f)| f)
     }
 }
 
@@ -218,7 +206,7 @@ fn validate_struct_node(
         }
         present_fields.push(field_name);
 
-        let Some(field_info) = expected.matching_field(field_name) else {
+        let Some(field_info) = matching_field(&expected.fields, field_name) else {
             if !expected.allow_unknown_fields {
                 diagnostics.push(error(
                     name_range(),

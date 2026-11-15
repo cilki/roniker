@@ -126,13 +126,12 @@ pub fn generate_remove_field_actions(
 /// `AppConfig(server: ServerConfig(...))` as much as the `Prod(...)` of
 /// `Cfg(mode: Prod(...))`.
 ///
-/// The root is compared against the document's type (see
-/// [`expected_root_fields`]) and is offered both its required and all of its
-/// missing fields. Everything below it is resolved against the type the field
-/// it belongs to declares, the way the validator does, and is offered its
-/// required fields. The validator reports `missing-required-field` at every
-/// depth, so anything this walk doesn't reach is a diagnostic naming fields the
-/// user then has to type out by hand.
+/// The root is compared against the document's type and is offered both its
+/// required and all of its missing fields. Everything below it is resolved
+/// against the type the field it belongs to declares, the way the validator
+/// does, and is offered its required fields. The validator reports
+/// `missing-required-field` at every depth, so anything this walk doesn't reach
+/// is a diagnostic naming fields the user then has to type out by hand.
 ///
 /// Only the values `range` touches are visited below the root. An editor asks
 /// for code actions wherever the cursor lands, and walking every value in the
@@ -149,11 +148,6 @@ fn generate_missing_field_actions(
     let Some(root) = root_struct_node(tree) else {
         return Vec::new();
     };
-    let Some(target) = expected_root_fields(tree, content, type_info, analyzer) else {
-        return Vec::new();
-    };
-
-    let mut actions = Vec::new();
     let walk = NestedWalk {
         content,
         url,
@@ -163,6 +157,14 @@ fn generate_missing_field_actions(
             super::ts_utils::position_to_byte_offset(content, range.end),
         ),
     };
+    // The root is compared against the document's type the way every nested
+    // value is compared against the type its field declares; it is just not
+    // behind a field, so nothing resolves the type first and nothing names it.
+    let Some(target) = walk.target(type_info, &root, "") else {
+        return Vec::new();
+    };
+
+    let mut actions = Vec::new();
     walk.offer_missing_fields(&root, &target, true, &mut actions);
     // The root's children are named by their field alone, not by the variant
     // the root spells: `server`, not `Prod.server`.
@@ -239,7 +241,7 @@ impl<'a> NestedWalk<'a> {
             };
             // A field the containing type doesn't have is already reported as
             // unknown; there is no type to validate its value against.
-            let Some(field) = matching_field(expected, field_name) else {
+            let Some(field) = super::type_utils::matching_field(expected, field_name) else {
                 continue;
             };
 
@@ -305,14 +307,15 @@ impl<'a> NestedWalk<'a> {
         if value.kind() == "struct" && ts_utils::child_by_kind(value, "(").is_none() {
             return;
         }
-        let Some(target) = self.resolve(value, declared_type, path) else {
+        // `Option<Box<Server>>` and `Vec<Server>` resolve to `Server`, matching
+        // how the validator recurses. A type the analyzer doesn't know (a
+        // `HashMap`, say) is nothing to compare against.
+        let Some(info) = super::navigation::value_type(self.analyzer, declared_type) else {
             return;
         };
-        // Tuple structs and tuple variants have positional fields ("0", "1",
-        // ...), which have no name that could be inserted.
-        if target.fields.iter().any(|(_, field)| field.is_positional()) {
+        let Some(target) = self.target(info, value, path) else {
             return;
-        }
+        };
 
         self.offer_missing_fields(value, &target, false, actions);
         self.walk_struct(value, &target.fields, &target.path, depth - 1, actions);
@@ -381,53 +384,51 @@ impl<'a> NestedWalk<'a> {
         }
     }
 
-    /// What `value` is expected to contain, given the type its field declares.
+    /// What `value`, a value of the type `info`, is expected to contain, named
+    /// in an action's title under `path` — empty for the document root.
     ///
-    /// `None` when there is nothing to compare it against: a type the analyzer
-    /// doesn't know (a `HashMap`, say), or an enum value that names no known
-    /// variant — an unknown-variant error rather than a set of absent fields.
-    fn resolve(
+    /// A struct is compared against its own fields, an enum against the fields
+    /// of whichever variant `value` names; that is the whole difference between
+    /// the two, so everything downstream can ignore it. The root and every
+    /// value below it go through here, so the two cannot drift apart in what
+    /// they offer.
+    ///
+    /// `None` when there is nothing to compare against: an enum value that
+    /// names no known variant — an unknown-variant error rather than a set of
+    /// absent fields — or a tuple/newtype, whose fields are positional (`"0"`,
+    /// `"1"`, ...) and so have no name that could be inserted.
+    fn target(
         &self,
+        info: &TypeInfo,
         value: &tree_sitter::Node,
-        declared_type: &str,
         path: &str,
     ) -> Option<NestedTarget<'a>> {
-        // `Option<Box<Server>>` and `Vec<Server>` resolve to `Server`, matching
-        // how the validator recurses.
-        let info = super::navigation::value_type(self.analyzer, declared_type)?;
-
-        match &info.kind {
-            TypeKind::Struct(_) => Some(NestedTarget {
-                fields: self.analyzer.effective_fields(info),
-                has_default: info.has_default,
-                path: path.to_string(),
-            }),
+        let (fields, path) = match &info.kind {
+            TypeKind::Struct(_) => (self.analyzer.effective_fields(info), path.to_string()),
             TypeKind::Enum(_) => {
                 // A variant with fields is spelled `Variant(...)`, which parses
-                // as a `struct` node named after the variant.
+                // as a `struct` node named after the variant. The root is named
+                // by the variant alone, a nested value by its field and then
+                // the variant: `Prod`, `mode::Prod`.
                 let variant_name = super::ts_utils::struct_name(value, self.content)?;
                 let variant = info.find_variant(variant_name)?;
-                Some(NestedTarget {
-                    fields: Cow::Owned(variant.effective_fields()),
-                    has_default: info.has_default,
-                    path: format!("{path}::{variant_name}"),
-                })
+                let path = match path.is_empty() {
+                    true => variant_name.to_string(),
+                    false => format!("{path}::{variant_name}"),
+                };
+                (Cow::Owned(variant.effective_fields()), path)
             }
+        };
+
+        match fields.iter().any(|(_, field)| field.is_positional()) {
+            true => None,
+            false => Some(NestedTarget {
+                fields,
+                has_default: info.has_default,
+                path,
+            }),
         }
     }
-}
-
-/// The field of `expected` that serde would fill from a RON field named
-/// `field_name`: the one whose serialized name — as the *containing* type spells
-/// it — matches, or that accepts the name itself (its Rust name, an alias).
-fn matching_field<'a>(
-    expected: &'a [(String, FieldInfo)],
-    field_name: &str,
-) -> Option<&'a FieldInfo> {
-    expected
-        .iter()
-        .find(|(name, field)| name == field_name || field.accepts_name(field_name, None))
-        .map(|(_, field)| field)
 }
 
 /// Code actions that write out the type name an unnamed struct leaves to be
@@ -528,50 +529,6 @@ fn insert_type_name_action(
         }],
         None,
     )
-}
-
-/// What the document root is expected to contain, named in a code action's
-/// title by the variant it spells, if any.
-///
-/// A struct root is compared against its own fields, an enum root against the
-/// fields of whichever variant the document names; that is the whole difference
-/// between the two, so everything downstream can ignore it.
-///
-/// `None` when there is nothing to compare against: an enum root that names no
-/// known variant — an unknown-variant error rather than a set of absent fields —
-/// or a tuple/newtype, whose fields are positional (`"0"`, `"1"`, ...) and so
-/// have no name that could be inserted.
-fn expected_root_fields<'a>(
-    tree: &Tree,
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: &'a RustAnalyzer,
-) -> Option<NestedTarget<'a>> {
-    let (fields, path) = match &type_info.kind {
-        TypeKind::Enum(_) => {
-            let name = root_variant_name(tree, content)?;
-            let variant = type_info.find_variant(&name)?;
-            (Cow::Owned(variant.effective_fields()), name)
-        }
-        TypeKind::Struct(_) => (analyzer.effective_fields(type_info), String::new()),
-    };
-
-    match fields.iter().any(|(_, field)| field.is_positional()) {
-        true => None,
-        false => Some(NestedTarget {
-            fields,
-            has_default: type_info.has_default,
-            path,
-        }),
-    }
-}
-
-/// The variant name a root enum value spells out — `Prod` for both the unit
-/// `Prod` and `Prod(...)`. Read off the parse tree, the same way the diagnostics
-/// for that value read it.
-fn root_variant_name(tree: &Tree, content: &str) -> Option<String> {
-    let main_value = super::ts_utils::find_main_value(tree)?;
-    super::ts_utils::extract_enum_variant(&main_value, content).map(|variant| variant.name)
 }
 
 /// The `struct` node holding the document's root value, i.e. the one whose
