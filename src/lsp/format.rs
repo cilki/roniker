@@ -98,28 +98,25 @@ fn is_trailing_comment_in_context(
 
 /// Format RON content using tree-sitter AST, preserving comments.
 ///
-/// For a whole open document, prefer [`format_tree`]: the server already holds
-/// that document's parse tree, and parsing a large file again costs more than
-/// laying it out does.
+/// The server itself never needs this: an open document's tree is already in
+/// hand, so a whole document goes through [`format_tree`] and a selection
+/// through [`format_ron_with_line_ending`]. Tests format from text.
+#[cfg(test)]
 pub fn format_ron(content: &str) -> String {
     format_ron_with_line_ending(content, ts_utils::line_ending(content))
 }
 
-/// [`format_ron`] ending every line it lays out with `newline` rather than with
+/// Lay `content` out, ending every line with `newline` rather than with
 /// whatever `content` itself uses.
 ///
 /// For text cut out of a larger document — a range-formatting selection — whose
 /// own line endings, if it even has a line break, don't say what the document's
 /// are.
 pub fn format_ron_with_line_ending(content: &str, newline: &'static str) -> String {
-    match ts_utils::parse(content) {
-        Some(tree) => layout(&tree, content, newline),
-        // If parsing fails, return original content
-        None => content.to_string(),
-    }
+    layout(&ts_utils::parse(content), content, newline)
 }
 
-/// [`format_ron`] for content whose parse tree the caller already has.
+/// Lay `content` out, whose parse tree the caller already has.
 ///
 /// `tree` must be the tree of `content`: the layout is read off the tree and
 /// the text of each leaf is read out of `content` at the byte offsets the tree

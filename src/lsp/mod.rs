@@ -34,7 +34,7 @@ pub struct Document {
     content: String,
     // Parsed once per change and shared by all request handlers.
     // Cloning a Tree is cheap (tree-sitter trees are copy-on-write).
-    tree: Option<tree_sitter::Tree>,
+    tree: tree_sitter::Tree,
     // Whether `tree` can seed an incremental re-parse after an edit; see
     // `ts_utils::parse_with`.
     tree_reusable: bool,
@@ -86,11 +86,8 @@ impl Document {
             },
         };
 
-        if !self.tree_reusable {
-            self.tree = None;
-        }
-        if let Some(tree) = self.tree.as_mut() {
-            tree.edit(&tree_sitter::InputEdit {
+        let old_tree = if self.tree_reusable {
+            self.tree.edit(&tree_sitter::InputEdit {
                 start_byte,
                 old_end_byte,
                 new_end_byte,
@@ -98,8 +95,11 @@ impl Document {
                 old_end_position,
                 new_end_position,
             });
-        }
-        (self.tree, self.tree_reusable) = ts_utils::parse_with(&self.content, self.tree.as_ref());
+            Some(&self.tree)
+        } else {
+            None
+        };
+        (self.tree, self.tree_reusable) = ts_utils::parse_with(&self.content, old_tree);
     }
 }
 
@@ -315,15 +315,13 @@ impl LanguageServer for Backend {
         let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(tree) = doc.tree.as_ref() else {
-            return Ok(None);
-        };
 
-        let Some(type_info) = self.resolve_completion_owner_at(&doc.content, tree, position) else {
+        let Some(type_info) = self.resolve_completion_owner_at(&doc.content, &doc.tree, position)
+        else {
             return Ok(None);
         };
         let completions = completion::generate_completions_for_type(
-            tree,
+            &doc.tree,
             &doc.content,
             position,
             type_info,
@@ -340,15 +338,12 @@ impl LanguageServer for Backend {
         let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(tree) = doc.tree.as_ref() else {
-            return Ok(None);
-        };
-        let Some(type_info) = self.resolve_root_type_info(&doc.content, Some(tree)) else {
+        let Some(type_info) = self.resolve_root_type_info(&doc.content, &doc.tree) else {
             return Ok(None);
         };
 
         let actions = code_actions::generate_code_actions(
-            tree,
+            &doc.tree,
             &doc.content,
             type_info,
             &url,
@@ -368,10 +363,7 @@ impl LanguageServer for Backend {
             // document's own tree is laid out directly: it is the tree of
             // exactly this content, and parsing a large file again costs more
             // than the layout itself.
-            let formatted = match doc.tree.as_ref() {
-                Some(tree) => format::format_tree(tree, &doc.content),
-                None => format::format_ron(&doc.content),
-            };
+            let formatted = format::format_tree(&doc.tree, &doc.content);
 
             if formatted != doc.content {
                 let line_count = doc.content.lines().count() as u32;
@@ -452,11 +444,8 @@ impl LanguageServer for Backend {
         let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(tree) = doc.tree.as_ref() else {
-            return Ok(None);
-        };
 
-        let symbols = symbols::document_symbols(tree, &doc.content);
+        let symbols = symbols::document_symbols(&doc.tree, &doc.content);
         if symbols.is_empty() {
             return Ok(None);
         }
@@ -474,12 +463,9 @@ impl LanguageServer for Backend {
         let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(tree) = doc.tree.as_ref() else {
-            return Ok(None);
-        };
 
         // Only field name identifiers are renameable
-        Ok(field_name_node_at(tree, &doc.content, position)
+        Ok(field_name_node_at(&doc.tree, &doc.content, position)
             .map(|name_node| {
                 PrepareRenameResponse::Range(ts_utils::node_to_lsp_range(&name_node, &doc.content))
             }))
@@ -502,9 +488,7 @@ impl LanguageServer for Backend {
         let Some(doc) = documents.get(&uri) else {
             return Ok(None);
         };
-        let Some(tree) = doc.tree.as_ref() else {
-            return Ok(None);
-        };
+        let tree = &doc.tree;
         let content = &doc.content;
         let Some(name_node) = field_name_node_at(tree, content, position) else {
             return Ok(None);
@@ -515,7 +499,7 @@ impl LanguageServer for Backend {
 
         // Resolve the type that owns the field being renamed, so occurrences of
         // the same name under *other* types are left alone
-        let target_type = self.resolve_owner_type_at(content, Some(tree), position);
+        let target_type = self.resolve_owner_type_at(content, tree, position);
 
         // Collect the exact name-node ranges of matching fields. Every
         // occurrence is one byte-offset-to-position conversion, and a document
@@ -683,10 +667,10 @@ impl Backend {
     fn resolve_root_type_info(
         &self,
         content: &str,
-        tree: Option<&tree_sitter::Tree>,
+        tree: &tree_sitter::Tree,
     ) -> Option<&rust_analyzer::TypeInfo> {
         self.rust_analyzer.root_type_info().or_else(|| {
-            let main_value = ts_utils::find_main_value(tree?)?;
+            let main_value = ts_utils::find_main_value(tree)?;
             let name = ts_utils::struct_name(&main_value, content)?;
             self.rust_analyzer.get_type_info(name)
         })
@@ -698,7 +682,7 @@ impl Backend {
     async fn symbol_at(&self, params: &TextDocumentPositionParams) -> Option<Symbol<'_>> {
         let documents = self.documents.read().await;
         let doc = documents.get(&params.text_document.uri.to_string())?;
-        self.resolve_symbol(doc.tree.as_ref(), &doc.content, params.position)
+        self.resolve_symbol(&doc.tree, &doc.content, params.position)
     }
 
     /// What the word at `position` refers to, resolved against the type that
@@ -709,14 +693,13 @@ impl Backend {
     /// the analyzer knows about.
     fn resolve_symbol(
         &self,
-        tree: Option<&tree_sitter::Tree>,
+        tree: &tree_sitter::Tree,
         content: &str,
         position: Position,
     ) -> Option<Symbol<'_>> {
         let word = get_word_at_position(content, position)?;
         let word = word.as_str();
-        let owner = self.resolve_owner_type_at(content, tree, position);
-        if let (Some(owner), Some(tree)) = (owner, tree) {
+        if let Some(owner) = self.resolve_owner_type_at(content, tree, position) {
             let cursor_field = tree_sitter_parser::get_field_at_position(tree, content, position);
 
             // The field the cursor is on, when the word is its name: a field of
@@ -770,14 +753,11 @@ impl Backend {
     fn resolve_owner_type_at(
         &self,
         content: &str,
-        tree: Option<&tree_sitter::Tree>,
+        tree: &tree_sitter::Tree,
         position: Position,
     ) -> Option<&rust_analyzer::TypeInfo> {
-        let root = self.resolve_root_type_info(content, tree)?;
-        let contexts = tree
-            .map(|t| tree_sitter_parser::find_type_context_at_position(t, content, position))
-            .unwrap_or_default();
-        navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
+        let contexts = tree_sitter_parser::find_type_context_at_position(tree, content, position);
+        self.resolve_owner_of_contexts(content, tree, &contexts)
     }
 
     /// The type a completion at `position` is answered from: the one owning
@@ -793,13 +773,24 @@ impl Backend {
         tree: &tree_sitter::Tree,
         position: Position,
     ) -> Option<&rust_analyzer::TypeInfo> {
-        let root = self.resolve_root_type_info(content, Some(tree))?;
         let mut contexts =
             tree_sitter_parser::find_type_context_at_position(tree, content, position);
         if tree_sitter_parser::on_struct_value_name(tree, content, position) {
             contexts.pop();
         }
-        navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), &contexts)
+        self.resolve_owner_of_contexts(content, tree, &contexts)
+    }
+
+    /// The document's root type navigated through `contexts`, the nested type
+    /// contexts leading from the root value down to the value in question.
+    fn resolve_owner_of_contexts(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        contexts: &[tree_sitter_parser::TypeContext],
+    ) -> Option<&rust_analyzer::TypeInfo> {
+        let root = self.resolve_root_type_info(content, tree)?;
+        navigation::navigate_type_contexts(&self.rust_analyzer, Some(root), contexts)
     }
 
     /// Every field in the document whose name is spelled `field_name`, as
@@ -819,7 +810,7 @@ impl Backend {
         content: &str,
         field_name: &str,
     ) -> Vec<(tree_sitter::Node<'t>, Option<&'a rust_analyzer::TypeInfo>)> {
-        let root = self.resolve_root_type_info(content, Some(tree));
+        let root = self.resolve_root_type_info(content, tree);
         // The type owning each struct value's fields, by node id, filled in as
         // the walk descends. Nodes carry the id of the struct value enclosing
         // them rather than the type itself, which keeps what the walk passes
@@ -888,10 +879,10 @@ impl Backend {
             }
         };
 
-        let diagnostics = match self.resolve_root_type_info(content, doc.tree.as_ref()) {
+        let diagnostics = match self.resolve_root_type_info(content, &doc.tree) {
             Some(type_info) => diagnostics::validate_ron_with_analyzer(
                 content,
-                doc.tree.as_ref(),
+                Some(&doc.tree),
                 type_info,
                 &self.rust_analyzer,
             ),
@@ -2632,7 +2623,7 @@ User(
         )"#;
         let position = Position::new(1, 12); // On "length" line
 
-        let tree = ts_utils::parse(content).unwrap();
+        let tree = ts_utils::parse(content);
         let variant = tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert_eq!(
             variant,
@@ -2649,7 +2640,7 @@ User(
         )"#;
         let position = Position::new(1, 20); // On "length" line, after colon
 
-        let tree = ts_utils::parse(content).unwrap();
+        let tree = ts_utils::parse(content);
         let variant_name =
             tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert!(
@@ -2752,7 +2743,7 @@ PostReference(
             "Should detect 'length' word"
         );
 
-        let tree = ts_utils::parse(content).unwrap();
+        let tree = ts_utils::parse(content);
         let variant = tree_sitter_parser::find_current_variant_context(&tree, content, position);
         assert_eq!(
             variant,
@@ -2775,7 +2766,7 @@ PostReference(
         assert_eq!(doc.content, "User(\n    id: 1,\n    name: \"Alice\",\n)");
 
         // The reused tree must still answer queries correctly
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         let field = tree_sitter_parser::get_field_at_position(
             tree,
             &doc.content,
@@ -2810,7 +2801,7 @@ PostReference(
         assert_eq!(doc.content, "User(name: \"🚀\", id: 2)");
 
         // The reused tree must still agree with the content.
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert!(fields.contains("name"), "got {fields:?}");
         assert!(fields.contains("id"), "got {fields:?}");
@@ -2845,7 +2836,7 @@ PostReference(
             text: ", name: \"X\"".to_string(),
         });
         assert_eq!(doc.content, "User(id: 1, name: \"X\")");
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert!(fields.contains("name"));
 
@@ -2856,7 +2847,7 @@ PostReference(
             text: "Post(title: \"hi\")".to_string(),
         });
         assert_eq!(doc.content, "Post(title: \"hi\")");
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         let fields = tree_sitter_parser::extract_fields_from_ron(tree, &doc.content, Position::new(0, 0));
         assert_eq!(fields, std::collections::HashSet::from(["title"]));
     }
@@ -2880,10 +2871,10 @@ PostReference(
         assert_eq!(doc.content, "User(\n    id: 1,\n    name: \"Alice\",\n)");
 
         // ...and the reused tree has to agree with it, not just the content.
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         assert_eq!(
             tree.root_node().to_sexp(),
-            ts_utils::parse(&doc.content).unwrap().root_node().to_sexp()
+            ts_utils::parse(&doc.content).root_node().to_sexp()
         );
     }
 
@@ -2911,8 +2902,8 @@ PostReference(
                 text: text.to_string(),
             });
             assert_eq!(
-                doc.tree.as_ref().unwrap().root_node().to_sexp(),
-                ts_utils::parse(&doc.content).unwrap().root_node().to_sexp(),
+                doc.tree.root_node().to_sexp(),
+                ts_utils::parse(&doc.content).root_node().to_sexp(),
                 "after editing to {:?}",
                 doc.content
             );
@@ -2933,10 +2924,10 @@ PostReference(
         });
 
         assert_eq!(doc.content, "User(\n    age: 3,\n    name: \"Bob\",\n)");
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
         assert_eq!(
             tree.root_node().to_sexp(),
-            ts_utils::parse(&doc.content).unwrap().root_node().to_sexp()
+            ts_utils::parse(&doc.content).root_node().to_sexp()
         );
     }
 
@@ -3119,7 +3110,7 @@ PostReference(
     #[test]
     fn test_field_name_node_at() {
         let doc = Document::new("User(\n    id: 1,\n    name: \"Bob\",\n)".to_string());
-        let tree = doc.tree.as_ref().unwrap();
+        let tree = &doc.tree;
 
         // On the field name
         let node = field_name_node_at(tree, &doc.content, Position::new(2, 5)).unwrap();

@@ -142,7 +142,7 @@ thread_local! {
 }
 
 /// Parse RON content using the thread-local reusable parser.
-pub fn parse(content: &str) -> Option<Tree> {
+pub fn parse(content: &str) -> Tree {
     parse_with(content, None).0
 }
 
@@ -156,13 +156,21 @@ pub fn parse(content: &str) -> Option<Tree> {
 /// earlier on turns a later raw string into string contents), which an
 /// incremental re-parse would never look at again. For the same reason
 /// `old_tree` is ignored when `content` holds one.
-pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> (Option<Tree>, bool) {
+///
+/// Parsing always yields a tree: tree-sitter recovers from any syntax error,
+/// and the only ways `Parser::parse` can come back empty — no language set, a
+/// timeout, a cancellation flag — are never set up here.
+pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> (Tree, bool) {
     PARSER.with(|parser| {
         let mut parser = parser.borrow_mut();
-        match mask_raw_strings(content) {
+        let (tree, reusable) = match mask_raw_strings(content) {
             Cow::Borrowed(text) => (parser.parse(text, old_tree), true),
             Cow::Owned(text) => (parser.parse(&text, None), false),
-        }
+        };
+        (
+            tree.expect("tree-sitter parses without a timeout or cancellation flag"),
+            reusable,
+        )
     })
 }
 
@@ -951,7 +959,7 @@ mod tests {
         ];
 
         for content in documents {
-            let tree = parse(content).expect("fixture must parse");
+            let tree = parse(content);
             let nodes = all_nodes(&tree);
             assert!(nodes.len() > 1, "fixture must have children: {content:?}");
 
@@ -984,7 +992,7 @@ mod tests {
     #[test]
     fn test_owning_field_for_children() {
         let content = "Config(server: Some([(port: 1)]))";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         let field_of = |kind: &str, owning| {
             let node = descendants_by_kind(&tree, kind)
@@ -1005,7 +1013,7 @@ mod tests {
         // So does a `Some(..)`, though it parses as a struct: what it wraps is
         // the value of the field the `Some` is written for.
         let content = "Config(server: Some((port: 1)))";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let some = descendants_by_kind(&tree, "struct")
             .into_iter()
             .find(|node| struct_name(node, content) == Some("Some"))
@@ -1026,13 +1034,13 @@ mod tests {
             ron::from_str::<ron::Value>(&content).is_ok(),
             "fixture must be a document ron accepts"
         );
-        let tree = parse(&content).unwrap();
+        let tree = parse(&content);
         assert!(!exceeds_max_depth(&tree.root_node()));
     }
 
     #[test]
     fn test_exceeds_max_depth_rejects_deeply_nested_documents() {
-        let tree = parse(&nested(MAX_TREE_DEPTH + 1)).unwrap();
+        let tree = parse(&nested(MAX_TREE_DEPTH + 1));
         assert!(exceeds_max_depth(&tree.root_node()));
     }
 
@@ -1071,7 +1079,7 @@ mod tests {
         for shape in shapes {
             for depth in 0..=MAX_TREE_DEPTH + 2 {
                 let content = shape(depth);
-                let tree = parse(&content).unwrap();
+                let tree = parse(&content);
                 let root = tree.root_node();
                 assert_eq!(
                     exceeds_max_depth(&root),
@@ -1127,7 +1135,7 @@ mod tests {
     #[test]
     fn test_parse_raw_string_fields() {
         let content = r##"User(a: r#"x"#, b: "y", c: r"z")"##;
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let value = find_main_value(&tree).unwrap();
         let values: Vec<_> = struct_fields(&value)
             .iter()
@@ -1151,14 +1159,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_simple_struct() {
-        let tree = parse("User(id: 1, name: \"test\")");
-        assert!(tree.is_some());
-    }
-
-    #[test]
     fn test_struct_name() {
-        let tree = parse("User(id: 1)").unwrap();
+        let tree = parse("User(id: 1)");
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1171,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_struct_fields() {
-        let tree = parse("User(id: 1, name: \"test\")").unwrap();
+        let tree = parse("User(id: 1, name: \"test\")");
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1187,7 +1189,7 @@ mod tests {
     #[test]
     fn test_struct_fields_in_order_past_comments() {
         let content = "User(\n    // who\n    id: 1, // the id\n    /* and */ name: \"a\",\n)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let value = find_main_value(&tree).unwrap();
 
         let names: Vec<_> = struct_fields(&value)
@@ -1202,7 +1204,7 @@ mod tests {
     #[test]
     fn test_field_value_follows_the_colon() {
         let content = "User(id: 1, name: \"a\", tags: [1, 2])";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let value = find_main_value(&tree).unwrap();
 
         let values: Vec<_> = struct_fields(&value)
@@ -1215,7 +1217,7 @@ mod tests {
     #[test]
     fn test_field_name() {
         let content = "User(id: 1)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let root = tree.root_node();
 
         if let Some(struct_node) = child_by_kind(&root, "struct") {
@@ -1230,7 +1232,7 @@ mod tests {
     #[test]
     fn test_struct_name_extraction() {
         let content = "User(id: 1)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         if let Some(main_value) = find_main_value(&tree) {
             assert_eq!(main_value.kind(), "struct");
@@ -1245,7 +1247,7 @@ mod tests {
     #[test]
     fn test_empty_structure() {
         let content = "Unit()";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         if let Some(value) = find_main_value(&tree) {
             assert_eq!(value.kind(), "struct");
@@ -1262,7 +1264,7 @@ mod tests {
     #[test]
     fn test_struct_values_leave_out_comments() {
         let content = "Some(/* why */ 1)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let value = find_main_value(&tree).unwrap();
         let values = struct_values(&value, content);
         assert_eq!(values.len(), 1);
@@ -1270,7 +1272,7 @@ mod tests {
         assert!(unwrap_some(&value, content).is_some());
 
         let content = "Active(// nothing\n)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
         let value = find_main_value(&tree).unwrap();
         assert!(struct_values(&value, content).is_empty());
     }
@@ -1325,7 +1327,7 @@ mod tests {
     #[test]
     fn test_node_range_is_utf16_not_bytes() {
         let content = "Config(host: \"münchen\", port: 80)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         let port = descendants_by_kind(&tree, "field")
             .into_iter()
@@ -1346,7 +1348,7 @@ mod tests {
         // a column counted in anything but UTF-16 code units resolves to the
         // wrong node.
         let content = "Config(\n    host: \"🚀 prod\", port: 80, debug: true,\n)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         for field in descendants_by_kind(&tree, "field") {
             let name = field.child(0).unwrap();
@@ -1492,7 +1494,7 @@ mod tests {
     fn test_node_ranges_agree_with_row_scan() {
         let content =
             "Config(\n    city: \"münchen\",\n    rockets: \"🚀🚀\",\n    tag: \"ü🚀x\",\n)";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         let mut walked = 0;
         let mut stack = vec![tree.root_node()];
@@ -1536,7 +1538,7 @@ mod tests {
     #[test]
     fn test_node_ranges_against_mismatched_content() {
         let parsed = "Config(\n    city: \"münchen\",\n    port: 8080,\n)";
-        let tree = parse(parsed).unwrap();
+        let tree = parse(parsed);
 
         // Each of these truncates or re-encodes the text the tree describes,
         // so the nodes' byte offsets and columns no longer fit it.
@@ -1558,7 +1560,7 @@ mod tests {
     #[test]
     fn test_field_value_extraction_nested() {
         let content = "Post(author: User(id: 1, name: \"Alice\"))";
-        let tree = parse(content).unwrap();
+        let tree = parse(content);
 
         if let Some(main) = find_main_value(&tree) {
             let fields = struct_fields(&main);
@@ -1571,38 +1573,6 @@ mod tests {
                 assert!(value_text.contains("id: 1"));
                 assert!(value_text.contains("name: \"Alice\""));
             }
-        }
-    }
-
-    #[test]
-    fn test_parse_double_colon_syntax() {
-        let content = "MyEnum::StructVariant(\n    field_a: \"test\"\n)";
-        let tree = parse(content);
-
-        if let Some(tree) = tree {
-            println!("Parsed successfully");
-            let root = tree.root_node();
-            println!("Root sexp: {}", root.to_sexp());
-
-            if let Some(main) = find_main_value(&tree) {
-                println!("Main value kind: {}", main.kind());
-                println!("Main value child count: {}", main.child_count());
-
-                let mut cursor = main.walk();
-                for child in main.children(&mut cursor) {
-                    println!(
-                        "  Child: kind='{}' is_named={}",
-                        child.kind(),
-                        child.is_named()
-                    );
-                }
-
-                if let Some(name) = struct_name(&main, content) {
-                    println!("Struct name: {}", name);
-                }
-            }
-        } else {
-            panic!("Failed to parse");
         }
     }
 }

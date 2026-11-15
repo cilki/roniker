@@ -943,7 +943,7 @@ mod tests {
     use super::*;
 
     fn parse(content: &str) -> Tree {
-        super::super::ts_utils::parse(content).unwrap()
+        super::super::ts_utils::parse(content)
     }
     use crate::rust_analyzer::{EnumVariant, TypeKind};
 

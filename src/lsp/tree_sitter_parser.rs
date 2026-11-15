@@ -212,17 +212,7 @@ mod tests {
     use super::*;
 
     fn parse(content: &str) -> Tree {
-        super::super::ts_utils::parse(content).unwrap()
-    }
-
-    #[test]
-    fn test_parse_simple_struct() {
-        let content = r#"MyStruct(
-    name: "test",
-    age: 30,
-)"#;
-        let tree = super::super::ts_utils::parse(content);
-        assert!(tree.is_some());
+        super::super::ts_utils::parse(content)
     }
 
     #[test]

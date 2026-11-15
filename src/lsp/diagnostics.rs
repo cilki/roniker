@@ -120,13 +120,10 @@ pub fn validate_ron_with_analyzer(
     let local_tree;
     let tree = match tree {
         Some(t) => t,
-        None => match super::ts_utils::parse(content) {
-            Some(t) => {
-                local_tree = t;
-                &local_tree
-            }
-            None => return diagnostics,
-        },
+        None => {
+            local_tree = super::ts_utils::parse(content);
+            &local_tree
+        }
     };
 
     // Whether the document parses as RON at all. `IgnoredAny` makes `ron` run
