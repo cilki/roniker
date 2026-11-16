@@ -699,26 +699,14 @@ pub fn field_value<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     }
 
     // Field structure: identifier ":" value — so the value is the child just
-    // past the colon. Reached through the indexed accessor rather than a
-    // `TreeCursor`, which costs several times as much per child visited (see
-    // [`named_children_by_kind`]); a field has three children, so the
-    // accessor's linear scan never has anything to scan.
-    for index in 0..node.child_count() {
-        let Some(child) = node.child(index) else {
-            break;
-        };
-        if child.kind() == ":" {
-            // A trailing colon has no value after it; fall through to the
-            // fallback rather than reporting the colon itself.
-            if let Some(value) = node.child(index + 1) {
-                return Some(value);
-            }
-            break;
-        }
-    }
-
-    // Fallback: the last child that isn't punctuation.
-    node.named_child(node.named_child_count().checked_sub(1)?)
+    // past the colon, which the grammar always puts there (tree-sitter fills a
+    // value not typed yet in as `MISSING`). Reached through the indexed
+    // accessor rather than a `TreeCursor`, which costs several times as much
+    // per child visited (see [`named_children_by_kind`]); a field has three
+    // children, so the accessor's linear scan never has anything to scan.
+    let colon =
+        (0..node.child_count()).find(|&i| node.child(i).is_some_and(|c| c.kind() == ":"))?;
+    node.child(colon + 1)
 }
 
 /// Find all fields in a struct node (non-recursive, only direct children)

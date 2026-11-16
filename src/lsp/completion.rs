@@ -34,16 +34,16 @@ enum CompletionContext {
 /// containers between that field's colon and the cursor.
 #[derive(Debug, PartialEq, Default)]
 struct ValueSlot {
-    /// The field whose value it is, when the context could tell.
-    field: Option<String>,
+    /// The field whose value it is.
+    field: String,
     /// The containers the cursor is inside of, outermost first.
     steps: Vec<ValueStep>,
 }
 
 impl ValueSlot {
-    fn field(field: Option<String>) -> Self {
+    fn field(field: impl Into<String>) -> Self {
         Self {
-            field,
+            field: field.into(),
             steps: Vec::new(),
         }
     }
@@ -223,14 +223,9 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
 fn inside_struct_body(struct_node: &tree_sitter::Node, content: &str, position: Position) -> bool {
     use super::ts_utils;
 
-    let Some(open_paren) = ts_utils::child_by_kind(struct_node, "(") else {
-        // No parentheses parsed yet (an incomplete struct); treat the whole
-        // node as its body, which is what the cursor is editing.
-        return true;
-    };
-    let open_end = ts_utils::node_end_position(&open_paren, content);
-    position.line > open_end.line
-        || (position.line == open_end.line && position.character >= open_end.character)
+    // The grammar gives every `struct` its `(`, so there is always one to find.
+    ts_utils::child_by_kind(struct_node, "(")
+        .is_some_and(|open| ts_utils::position_to_byte_offset(content, position) >= open.end_byte())
 }
 
 /// The context for a cursor inside a struct's parentheses: the value position of
@@ -273,15 +268,14 @@ fn struct_body_context(
                     .get(child.end_byte()..cursor)
                     .is_some_and(|gap| gap.trim().is_empty())
         });
-    if let Some(field) = valueless {
-        let name = ts_utils::field_name(&field, content).map(str::to_string);
+    if let Some(name) = valueless.and_then(|field| ts_utils::field_name(&field, content)) {
         return CompletionContext::FieldValue(ValueSlot::field(name));
     }
 
     // A value with no terminator yet (`mode: `) defeats tree-sitter's `field`
     // production entirely, so there is no field child to find above.
     match tree_sitter_parser::unterminated_value_field(tree, content, position) {
-        Some(field) => CompletionContext::FieldValue(ValueSlot::field(Some(field))),
+        Some(field) => CompletionContext::FieldValue(ValueSlot::field(field)),
         None => CompletionContext::FieldName,
     }
 }
@@ -296,45 +290,47 @@ fn field_completion_context(
 ) -> CompletionContext {
     use super::ts_utils;
 
-    let field_name_node = field_node.child(0);
-    if let (Some(field_name), Some(value_node)) =
-        (field_name_node, ts_utils::field_value(field_node))
-    {
-        // If cursor is after the field name, we're completing a value
-        let name_end = ts_utils::node_end_position(&field_name, content);
-        if position.line > name_end.line
-            || (position.line == name_end.line && position.character > name_end.character)
-        {
-            let cursor = ts_utils::position_to_byte_offset(content, position);
-            let (steps, innermost) = value_steps(value_node, content, cursor);
-            let slot = ValueSlot {
-                field: ts_utils::field_name(field_node, content).map(str::to_string),
-                steps,
-            };
+    // The grammar makes every `field` an identifier, a colon and a value —
+    // tree-sitter fills one not typed yet in as `MISSING`.
+    let (Some(name_node), Some(value_node)) =
+        (field_node.child(0), ts_utils::field_value(field_node))
+    else {
+        return CompletionContext::FieldName;
+    };
 
-            // On the name of a struct value or variant that already has its
-            // parentheses.
-            if innermost.is_some_and(|value| {
-                !ts_utils::is_some_wrapper(&value, content)
-                    && tree_sitter_parser::cursor_on_struct_name(&value, cursor)
-            }) {
-                return CompletionContext::ValueName(slot);
-            }
-
-            // Check if there's already some text (might be completing a type)
-            if let Some(val_text) = innermost.and_then(|value| ts_utils::node_text(&value, content))
-                && val_text
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
-            {
-                return CompletionContext::StructType(slot);
-            }
-
-            return CompletionContext::FieldValue(slot);
-        }
+    // Only a cursor past the field's name is completing its value.
+    let cursor = ts_utils::position_to_byte_offset(content, position);
+    if cursor <= name_node.end_byte() {
+        return CompletionContext::FieldName;
     }
 
-    CompletionContext::FieldName
+    let (steps, innermost) = value_steps(value_node, content, cursor);
+    let slot = ValueSlot {
+        field: ts_utils::node_text(&name_node, content)
+            .unwrap_or_default()
+            .to_string(),
+        steps,
+    };
+
+    // On the name of a struct value or variant that already has its
+    // parentheses.
+    if innermost.is_some_and(|value| {
+        !ts_utils::is_some_wrapper(&value, content)
+            && tree_sitter_parser::cursor_on_struct_name(&value, cursor)
+    }) {
+        return CompletionContext::ValueName(slot);
+    }
+
+    // Check if there's already some text (might be completing a type)
+    if let Some(val_text) = innermost.and_then(|value| ts_utils::node_text(&value, content))
+        && val_text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+    {
+        return CompletionContext::StructType(slot);
+    }
+
+    CompletionContext::FieldValue(slot)
 }
 
 /// Generate completions for a given type (already navigated to the innermost type).
@@ -353,10 +349,10 @@ pub fn generate_completions_for_type(
     // is written for, found by serialized or Rust name, followed down through
     // the containers the cursor is inside of.
     let field_type = |slot: ValueSlot| {
-        let name = slot
-            .field
-            .or_else(|| tree_sitter_parser::get_field_at_position(tree, content, position))?;
-        let declared = type_info.find_field_serialized(&name)?.type_name.clone();
+        let declared = type_info
+            .find_field_serialized(&slot.field)?
+            .type_name
+            .clone();
         slot.steps
             .iter()
             .try_fold(declared, |declared, step| step.apply(&declared))

@@ -298,13 +298,9 @@ impl<'a> NestedWalk<'a> {
 
         // `unit` is the empty unnamed struct `()`: a value whose fields are all
         // missing, and which has parens of its own to insert them into.
+        // A bare `None`, or any other unit variant, is an `identifier`: it
+        // supplies no fields and has nowhere to insert any.
         if !matches!(value.kind(), "struct" | "unit") {
-            return;
-        }
-        // A bare `None`, or any other unit variant, parses as a `struct` node
-        // with nothing but its name. It supplies no fields and has nowhere to
-        // insert any, so the type its field declares says nothing about it.
-        if value.kind() == "struct" && ts_utils::child_by_kind(value, "(").is_none() {
             return;
         }
         // `Option<Box<Server>>` and `Vec<Server>` resolve to `Server`, matching
