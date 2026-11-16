@@ -924,7 +924,16 @@ fn check_declared_type(
     analyzer: &RustAnalyzer,
 ) -> Option<String> {
     if !is_custom_type(expected_type) {
-        return check_type_mismatch(value?, expected_type);
+        let value = value?;
+        // `ron` reads a bare name — `localhost`, `tru`, `Production` — into
+        // `()`, so the shape check below would answer "got ()" for a value
+        // that contains no parentheses at all. Name what was written instead.
+        if matches!(value, Value::Unit)
+            && let Some(name) = value_text.map(str::trim).filter(|t| is_bare_name(t))
+        {
+            return bare_name_mismatch(name, expected_type);
+        }
+        return check_type_mismatch(value, expected_type);
     }
 
     let expected = normalize_type(expected_type);
@@ -988,6 +997,38 @@ fn check_declared_type(
         expected_type,
         literal_kind(trimmed)?
     ))
+}
+
+/// Whether `text` is a lone identifier, the way RON writes a unit variant or a
+/// unit struct's name.
+fn is_bare_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// What is wrong with the bare name `name` written for the non-custom type
+/// `expected_type`, worded as the tail of a "Type mismatch: ..." message.
+///
+/// The usual causes are a string missing its quotes and a misspelled `true` or
+/// `false`, so those two get a hint at the fix.
+fn bare_name_mismatch(name: &str, expected_type: &str) -> Option<String> {
+    let clean_type = normalize_type(expected_type);
+    if clean_type == "()" {
+        return None;
+    }
+    let is_text = matches!(clean_type.as_ref(), "String" | "&str" | "str")
+        || std_type(&clean_type).map(|std| std.shape) == Some(StdShape::Text);
+    let hint = if is_text {
+        format!(" (strings are written in quotes: \"{name}\")")
+    } else if clean_type == "bool" {
+        did_you_mean(name, ["true", "false"])
+    } else {
+        String::new()
+    };
+    Some(format!("expected {clean_type}, got '{name}'{hint}"))
 }
 
 /// What a bare RON literal is, named the way a "got ..." message wants it.
@@ -3569,6 +3610,60 @@ mod tests {
                     code(codes::TYPE_MISMATCH),
                     "Type mismatch: expected String, got number".to_string()
                 ),
+            ]
+        );
+    }
+
+    /// `ron` reads a bare name into `()`, which made an unquoted string or a
+    /// misspelled bool come back as "got ()" — naming parentheses the document
+    /// never wrote. The name itself is reported instead, with a hint at the
+    /// usual fix.
+    #[test]
+    fn test_bare_name_for_a_primitive_names_what_was_written() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let type_info = TypeInfo {
+            name: "Root".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("host", "String"),
+                field("path", "PathBuf"),
+                field("debug", "bool"),
+                field("port", "u16"),
+                field("names", "Vec<String>"),
+                field("label", "Option<String>"),
+            ]),
+            ..Default::default()
+        };
+        let analyzer = RustAnalyzer::new();
+
+        let content = concat!(
+            "Root(\n",
+            "    host: localhost,\n",
+            "    path: etc,\n",
+            "    debug: tru,\n",
+            "    port: Production,\n",
+            "    names: [a],\n",
+            "    label: Some(b),\n",
+            ")",
+        );
+        let messages: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                "Type mismatch: expected String, got 'localhost' (strings are written in quotes: \"localhost\")",
+                "Type mismatch: expected PathBuf, got 'etc' (strings are written in quotes: \"etc\")",
+                "Type mismatch: expected bool, got 'tru' (did you mean 'true'?)",
+                "Type mismatch: expected u16, got 'Production'",
+                "Type mismatch: expected String, got 'a' (strings are written in quotes: \"a\")",
+                "Type mismatch: expected String, got 'b' (strings are written in quotes: \"b\")",
             ]
         );
     }
