@@ -307,6 +307,13 @@ fn validate_typed_value(
     declared_type: &str,
     analyzer: &RustAnalyzer,
 ) -> Vec<Diagnostic> {
+    // A suffixed number names its own type, and nothing below looks at the
+    // suffix: the tree calls `5u8` an integer and `ron::Value` keeps only its
+    // value, so it has to be settled here, before either is asked.
+    if let Some(tail) = number_suffix_mismatch(value_node, content, declared_type) {
+        return vec![type_mismatch(value_node, content, &tail)];
+    }
+
     // A literal written straight into a primitive field — most of what a
     // configuration file is made of — needs none of the work below: the parse
     // tree has already classified the literal, and a kind that satisfies the
@@ -349,6 +356,50 @@ fn validate_typed_value(
         .map(|tail| type_mismatch(value_node, content, &tail))
         .into_iter()
         .collect()
+}
+
+/// What is wrong with a suffixed number literal (`5u8`, `1.5f32`) written for
+/// `declared_type`, worded as the tail of a "Type mismatch: ..." message.
+///
+/// `ron` reads a suffixed literal only into the type its suffix names, however
+/// well the value would fit another: `5u8` for a `u16` is "Expected an 16-bit
+/// unsigned integer but found 5u8 instead", and `5i32` for an `f64` is not a
+/// float at all. `None` for a literal with no suffix, and for a declared type
+/// that is no number, which the checks after this one report by shape.
+fn number_suffix_mismatch(
+    node: &tree_sitter::Node,
+    content: &str,
+    declared_type: &str,
+) -> Option<String> {
+    if !matches!(node.kind(), "integer" | "float") {
+        return None;
+    }
+    let text = super::ts_utils::node_text(node, content)?;
+    let suffix = super::ts_utils::number_suffix(text)?;
+    let declared = normalize_type(declared_type);
+    let required = required_number_suffix(&declared)?;
+    (suffix != required)
+        .then(|| format!("expected {declared}, got {text}, which reads only as {suffix}"))
+}
+
+/// The suffix `ron` requires on a number written for the numeric type
+/// `declared`: the type serde asks it to deserialize. That is the type itself,
+/// but for `usize`/`isize`, which serde reads as `u64`/`i64`, and the
+/// `NonZero` integers, which it reads as the integer inside.
+fn required_number_suffix(declared: &str) -> Option<&'static str> {
+    if let Some(tail) = declared.strip_prefix("NonZero") {
+        return match tail.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
+            Some(argument) => required_number_suffix(argument),
+            None => required_number_suffix(&tail.to_ascii_lowercase()),
+        };
+    }
+    match declared {
+        "usize" => Some("u64"),
+        "isize" => Some("i64"),
+        _ => super::ts_utils::NUMBER_SUFFIXES
+            .into_iter()
+            .find(|suffix| *suffix == declared),
+    }
 }
 
 /// Whether the parse tree on its own settles that this value fits
@@ -1809,6 +1860,86 @@ mod tests {
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// A suffixed number is read only into the type its suffix names. The
+    /// grammar knew no suffixes, so `Some(30u64)` — which `ron` reads fine —
+    /// was reported as `expected u64, got Some(...)`, while `5u8` for a `u16`,
+    /// which `ron` refuses, passed as the integer 5.
+    #[test]
+    fn test_suffixed_number_must_name_the_declared_type() {
+        for (type_name, literal) in [
+            ("u8", "5u8"),
+            ("u16", "0x1Fu16"),
+            ("i64", "-5i64"),
+            ("u32", "1_000_u32"),
+            ("usize", "5u64"),
+            ("isize", "-5i64"),
+            ("NonZeroU16", "5u16"),
+            ("NonZero<u32>", "5u32"),
+            ("f32", "1.5f32"),
+            ("f64", "2e3f64"),
+            ("f32", "3f32"),
+            ("Option<u64>", "Some(30u64)"),
+            ("Option<u64>", "30u64"),
+            ("Vec<u8>", "[1u8, 2]"),
+            ("Box<i8>", "-1i8"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        for (type_name, literal, expected) in [
+            (
+                "u16",
+                "5u8",
+                "expected u16, got 5u8, which reads only as u8",
+            ),
+            (
+                "u64",
+                "5i32",
+                "expected u64, got 5i32, which reads only as i32",
+            ),
+            (
+                "usize",
+                "5u32",
+                "expected usize, got 5u32, which reads only as u32",
+            ),
+            (
+                "NonZeroU16",
+                "5u32",
+                "expected NonZeroU16, got 5u32, which reads only as u32",
+            ),
+            (
+                "f64",
+                "1.5f32",
+                "expected f64, got 1.5f32, which reads only as f32",
+            ),
+            (
+                "f32",
+                "5u8",
+                "expected f32, got 5u8, which reads only as u8",
+            ),
+            (
+                "Option<u16>",
+                "Some(5u8)",
+                "expected u16, got 5u8, which reads only as u8",
+            ),
+            (
+                "Vec<u16>",
+                "[1u16, 2u8]",
+                "expected u16, got 2u8, which reads only as u8",
+            ),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{literal} for {type_name} should report '{expected}', got {errors:?}"
+            );
+        }
     }
 
     /// A char literal deserializes into a `char` and nothing else: `ron` refuses

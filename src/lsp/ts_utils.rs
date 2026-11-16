@@ -6,9 +6,14 @@ use std::cell::RefCell;
 use tower_lsp_server::ls_types::{Position, Range};
 use tree_sitter::{Node, Parser, Point, Tree};
 
-/// `content` with every raw string (`r"..."`, `r#"..."#`, ...) rewritten as an
-/// ordinary quoted string of exactly the same length, for tree-sitter to parse
-/// in its place.
+/// `content` with what the RON grammar mis-lexes rewritten, byte for byte, as
+/// something it lexes correctly, for tree-sitter to parse in its place: every
+/// raw string (`r"..."`, `r#"..."#`, ...) as an ordinary quoted string, and
+/// every number's type suffix (`5u8`, `1.5f32`) as digit separators.
+///
+/// The grammar knows no number suffixes. It reads `5u8` as the integer `5` and
+/// an `ERROR` holding `u8`, which breaks the value around it — `Some(30u64)`
+/// stops being a `Some` at all — though `ron` reads it fine.
 ///
 /// The RON grammar lexes a raw string as `r`, any `#`s, `"`, as much as it can
 /// of the rest of the line, and a last `"`. That is the longest match, not the
@@ -27,7 +32,7 @@ use tree_sitter::{Node, Parser, Point, Tree};
 /// Comments, strings and chars are skipped the way RON lexes them, so an `r"`
 /// inside one is left alone. Borrowed when there is nothing to mask, which is
 /// almost always.
-pub fn mask_raw_strings(content: &str) -> Cow<'_, str> {
+pub fn mask_for_grammar(content: &str) -> Cow<'_, str> {
     let bytes = content.as_bytes();
     let mut masked: Option<Vec<u8>> = None;
     let mut i = 0;
@@ -109,6 +114,23 @@ pub fn mask_raw_strings(content: &str) -> Cow<'_, str> {
                 out[end - 1] = b'"';
                 i = end;
             }
+            // A number. Identifiers are consumed whole above, so a digit here
+            // always starts a literal and never sits inside a name.
+            b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.'))
+                {
+                    i += 1;
+                }
+                if let Some(suffix) = number_suffix(&content[start..i]) {
+                    // The grammar's number tokens take `_` anywhere after the
+                    // first digit, so filling the suffix with it keeps the
+                    // literal one token spanning the whole of what was written.
+                    let out = masked.get_or_insert_with(|| bytes.to_vec());
+                    out[i - suffix.len()..i].fill(b'_');
+                }
+            }
             _ => i += 1,
         }
     }
@@ -117,6 +139,24 @@ pub fn mask_raw_strings(content: &str) -> Cow<'_, str> {
         Some(out) => Cow::Owned(String::from_utf8(out).expect("masking keeps UTF-8 valid")),
         None => Cow::Borrowed(content),
     }
+}
+
+/// The type suffixes `ron` reads on a number literal.
+pub const NUMBER_SUFFIXES: [&str; 12] = [
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "f32", "f64",
+];
+
+/// The type suffix a number literal is written with — `u8` in `5u8`, `f32` in
+/// `1.5f32` — if it has one.
+///
+/// A hexadecimal literal takes no float suffix: `f` is one of its digits, so
+/// `0x1f32` is the number 0x1f32 to `ron` too.
+pub fn number_suffix(literal: &str) -> Option<&'static str> {
+    let digits = literal.trim_start_matches(['-', '+']);
+    let hex = digits.starts_with("0x");
+    NUMBER_SUFFIXES.into_iter().find(|suffix| {
+        digits.len() > suffix.len() && digits.ends_with(suffix) && !(hex && suffix.starts_with('f'))
+    })
 }
 
 /// The index of the first `needle` in `bytes` at or after `from`.
@@ -150,12 +190,12 @@ pub fn parse(content: &str) -> Tree {
 /// backed by the thread-local reusable parser.
 ///
 /// Alongside the tree comes whether it may be handed back here as `old_tree`
-/// after the next edit. It may not when `content` holds a raw string:
-/// tree-sitter was then shown [masked](mask_raw_strings) text, and an edit can
-/// change the masking of bytes well outside the edited range (opening a `"`
-/// earlier on turns a later raw string into string contents), which an
-/// incremental re-parse would never look at again. For the same reason
-/// `old_tree` is ignored when `content` holds one.
+/// after the next edit. It may not when `content` holds a raw string or a
+/// suffixed number: tree-sitter was then shown [masked](mask_for_grammar) text,
+/// and an edit can change the masking of bytes well outside the edited range
+/// (opening a `"` earlier on turns a later raw string into string contents),
+/// which an incremental re-parse would never look at again. For the same
+/// reason `old_tree` is ignored when `content` holds one.
 ///
 /// Parsing always yields a tree: tree-sitter recovers from any syntax error,
 /// and the only ways `Parser::parse` can come back empty — no language set, a
@@ -163,7 +203,7 @@ pub fn parse(content: &str) -> Tree {
 pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> (Tree, bool) {
     PARSER.with(|parser| {
         let mut parser = parser.borrow_mut();
-        let (tree, reusable) = match mask_raw_strings(content) {
+        let (tree, reusable) = match mask_for_grammar(content) {
             Cow::Borrowed(text) => (parser.parse(text, old_tree), true),
             Cow::Owned(text) => (parser.parse(&text, None), false),
         };
@@ -1078,10 +1118,11 @@ mod tests {
         }
     }
 
-    /// Each raw string becomes a quoted string of the same length, and nothing
-    /// else moves: the tree's offsets, rows and columns all index `content`.
+    /// Each raw string becomes a quoted string of the same length, each number
+    /// suffix digit separators, and nothing else moves: the tree's offsets, rows
+    /// and columns all index `content`.
     #[test]
-    fn test_mask_raw_strings() {
+    fn test_mask_for_grammar() {
         let cases = [
             (r#"(a: r"h", b: "u")"#, r#"(a: "xh", b: "u")"#),
             (r##"(a: r#"q"x"#, b: 1)"##, r#"(a: "xxqxxx", b: 1)"#),
@@ -1090,9 +1131,16 @@ mod tests {
             ("(a: r\"x\ny\")", "(a: \"xx\ny\")"),
             // Non-ASCII contents are left alone.
             ("(a: r\"é🚀\")", "(a: \"xé🚀\")"),
+            // A number's suffix becomes digit separators.
+            ("(a: 5u8, b: -1i64)", "(a: 5__, b: -1___)"),
+            (
+                "(a: 1.5f32, b: 2e3f64, c: 3f32)",
+                "(a: 1.5___, b: 2e3___, c: 3___)",
+            ),
+            ("(a: 0x1Fu16, b: 1_000_u32)", "(a: 0x1F___, b: 1_000____)"),
         ];
         for (content, expected) in cases {
-            let masked = mask_raw_strings(content);
+            let masked = mask_for_grammar(content);
             assert_eq!(masked, expected, "masking {content}");
             assert_eq!(masked.len(), content.len());
         }
@@ -1101,7 +1149,7 @@ mod tests {
     /// What only looks like a raw string is left as it is, and the common case
     /// of no raw string at all costs no copy.
     #[test]
-    fn test_mask_raw_strings_leaves_lookalikes() {
+    fn test_mask_for_grammar_leaves_lookalikes() {
         for content in [
             r#"(a: "r\"x\"", b: 1)"#,
             r#"(a: "x", // r"y"
@@ -1110,9 +1158,12 @@ mod tests {
             r#"(a: '"', b: r#type)"#,
             r#"(bar: 1, var: "x")"#,
             r#"(a: r"unterminated, b: 1)"#,
+            // Numbers with no suffix, a hex number ending in digits that spell
+            // one, and suffix-like names, strings and comments.
+            r#"(a: 5, b: -1.5e3, c: 0xf32, d: u8, e: x5u8, f: "5u8" /* 5u8 */)"#,
         ] {
             assert!(
-                matches!(mask_raw_strings(content), Cow::Borrowed(_)),
+                matches!(mask_for_grammar(content), Cow::Borrowed(_)),
                 "{content} was masked"
             );
         }
@@ -1143,6 +1194,42 @@ mod tests {
                 ("b", "string", r#""y""#),
                 ("c", "string", r#"r"z""#),
             ]
+        );
+    }
+
+    /// A suffixed number is one literal spanning its suffix, and the value
+    /// around it keeps its shape: the grammar alone split `30u64` into `30` and
+    /// an `ERROR`, which turned `Some(30u64)` into something that was no `Some`.
+    #[test]
+    fn test_parse_suffixed_number_fields() {
+        let content = "Cfg(a: 5u8, b: Some(30u64), c: 1.5f32, d: 2)";
+        let tree = parse(content);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let value = find_main_value(&tree).unwrap();
+        let values: Vec<_> = struct_fields(&value)
+            .iter()
+            .map(|field| {
+                let value = field_value(field).unwrap();
+                (value.kind(), node_text(&value, content).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("integer", "5u8"),
+                ("struct", "Some(30u64)"),
+                ("float", "1.5f32"),
+                ("integer", "2"),
+            ]
+        );
+        let some = field_value(&struct_fields(&value)[1]).unwrap();
+        assert_eq!(
+            unwrap_some(&some, content).map(|n| n.kind()),
+            Some("integer")
         );
     }
 
