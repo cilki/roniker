@@ -463,8 +463,8 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
     }
 
     // A standard-library type with no generic arguments is settled by the
-    // literal's kind exactly like a primitive: the tree already knows whether
-    // the `PathBuf` field holds a string. The integer ones fall through to the
+    // literal's kind: the tree already knows whether the `String` or `PathBuf`
+    // field holds a string. The integer ones fall through to the
     // `integer` arm below, which has the range the literal must fit, and the
     // record ones to the full check.
     if std_type(declared).map(|std| std.shape) == Some(StdShape::Text) {
@@ -473,7 +473,6 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
 
     match (node.kind(), declared) {
         ("boolean", "bool") | ("char", "char") => true,
-        ("string", "String" | "&str" | "str") => true,
         // An integer literal in a float field is fine — serde widens it — and
         // [`check_type_mismatch`] deliberately lets it through.
         ("float" | "integer", "f32" | "f64") => true,
@@ -1019,9 +1018,7 @@ fn bare_name_mismatch(name: &str, expected_type: &str) -> Option<String> {
     if clean_type == "()" {
         return None;
     }
-    let is_text = matches!(clean_type.as_ref(), "String" | "&str" | "str")
-        || std_type(&clean_type).map(|std| std.shape) == Some(StdShape::Text);
-    let hint = if is_text {
+    let hint = if std_type(&clean_type).map(|std| std.shape) == Some(StdShape::Text) {
         format!(" (strings are written in quotes: \"{name}\")")
     } else if clean_type == "bool" {
         did_you_mean(name, ["true", "false"])
@@ -1120,17 +1117,9 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
                 return Some(format!("{} is out of range for {}", literal, display_type));
             }
         }
-        Value::String(_) => {
-            // String is valid for String types, and for the std types RON
-            // writes as one: a path, an address.
-            if clean_type == "String"
-                || clean_type == "&str"
-                || clean_type == "str"
-                || std_shape == Some(StdShape::Text)
-            {
-                return None;
-            }
-            // Otherwise it's an error
+        // A string fits the types RON writes as one: a `String`, a path, an
+        // address.
+        Value::String(_) if std_shape != Some(StdShape::Text) => {
             return Some(format!("expected {}, got string", display_type));
         }
         Value::Seq(_) => {

@@ -86,7 +86,7 @@ pub(crate) const STD_GENERIC_NAMES: [&str; 19] = [
 /// written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StdShape {
-    /// A quoted string: a path, an address.
+    /// A quoted string: a `String`, a path, an address.
     Text,
     /// An integer literal, bounded the way the primitive behind it is.
     Integer,
@@ -126,7 +126,12 @@ pub(crate) struct StdType {
 /// quick-fix for a missing one inserted `PathBuf()`.
 pub(crate) fn std_type(clean: &str) -> Option<StdType> {
     let (shape, placeholder) = match clean {
-        "PathBuf" | "Path" | "OsString" | "OsStr" => (StdShape::Text, "\"\""),
+        // The string primitives are [`is_primitive`] too, but they are written
+        // exactly like a path is, so this is the one table every check of
+        // "is this written as a quoted string" reads.
+        "String" | "str" | "&str" | "PathBuf" | "Path" | "OsString" | "OsStr" => {
+            (StdShape::Text, "\"\"")
+        }
         "IpAddr" | "Ipv4Addr" => (StdShape::Text, "\"0.0.0.0\""),
         "Ipv6Addr" => (StdShape::Text, "\"::\""),
         "SocketAddr" | "SocketAddrV4" => (StdShape::Text, "\"0.0.0.0:0\""),
@@ -194,13 +199,9 @@ pub(crate) fn integer_bounds(type_name: &str) -> Option<(i128, i128)> {
 }
 
 /// Whether `head` names a standard-library type, and so one whose module path
-/// [`unqualify_std_type`] drops. `String`/`str` are in the set because the
-/// type checks match them by their bare spelling too, even though they are
-/// primitives rather than one of the categories above.
+/// [`unqualify_std_type`] drops.
 fn is_std_type_name(head: &str) -> bool {
-    STD_GENERIC_NAMES.contains(&head)
-        || std_type(head).is_some()
-        || matches!(head, "String" | "str")
+    STD_GENERIC_NAMES.contains(&head) || std_type(head).is_some()
 }
 
 /// Whether an already-normalized type name uses one of [`STD_GENERIC_NAMES`]
@@ -1042,6 +1043,8 @@ mod tests {
     #[test]
     fn test_std_type_covers_the_names_configs_use() {
         for (name, shape) in [
+            ("String", StdShape::Text),
+            ("&str", StdShape::Text),
             ("PathBuf", StdShape::Text),
             ("SocketAddr", StdShape::Text),
             ("Ipv6Addr", StdShape::Text),

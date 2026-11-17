@@ -741,11 +741,6 @@ fn generate_value_completions_by_type(
                 std.placeholder,
             ),
         }]
-    } else if clean_type == "String" || clean_type == "&str" || clean_type == "str" {
-        // `str` reaches here through a wrapper: a `Cow<'a, str>` field is
-        // written as the string it borrows. Leaving it out sent those fields to
-        // the "every type in the workspace" fallback.
-        vec![snippet_item("\"\"", "String value", "\"$0\"")]
     } else if is_number_type(&clean_type) {
         vec![value_item("0", format!("{field_type} value"), "0")]
     } else {

@@ -753,7 +753,6 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
         }
         _ if is_wrapped_by(&clean, &MAP_WRAPPERS) => Some("{}"),
         "bool" => Some("false"),
-        "String" | "&str" | "str" => Some("\"\""),
         // A `char` is a quoted character, and the one thing it is not is
         // `char()` — which is what the opaque fallback below used to insert.
         "char" => Some("'a'"),
