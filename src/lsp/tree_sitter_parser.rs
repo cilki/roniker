@@ -119,6 +119,10 @@ pub fn unterminated_value_field(tree: &Tree, content: &str, position: Position) 
 
 /// Locate the `identifier` / `ERROR(":")` child pair that an unterminated field
 /// leaves behind in the struct containing `node`, if the cursor is at or past it.
+///
+/// A `,` between the colon and the cursor closes the field off: a field left
+/// without a value (`shape: ,`) is still such a pair, and the cursor anywhere
+/// after its comma is on a later field — or between fields — not on its value.
 fn unterminated_field_pair<'a>(
     tree: &'a Tree,
     node: Node<'a>,
@@ -130,12 +134,17 @@ fn unterminated_field_pair<'a>(
 
     let mut walk = struct_node.walk();
     let children: Vec<Node> = struct_node.children(&mut walk).collect();
-    children
+    let (at, pair) = children
         .windows(2)
-        .filter(|pair| pair[0].kind() == "identifier" && pair[1].kind() == "ERROR")
-        .filter(|pair| node_text(&pair[1], content).map(str::trim) == Some(":"))
-        .rfind(|pair| cursor_byte >= pair[0].start_byte())
-        .map(|pair| (pair[0], pair[1]))
+        .enumerate()
+        .filter(|(_, pair)| pair[0].kind() == "identifier" && pair[1].kind() == "ERROR")
+        .filter(|(_, pair)| node_text(&pair[1], content).map(str::trim) == Some(":"))
+        .rfind(|(_, pair)| cursor_byte >= pair[0].start_byte())?;
+    let closed = children[at + 2..]
+        .iter()
+        .take_while(|child| child.end_byte() <= cursor_byte)
+        .any(|child| child.kind() == ",");
+    (!closed).then_some((pair[0], pair[1]))
 }
 
 /// Whether byte offset `cursor` is on the name `struct_node` is written with —

@@ -1489,6 +1489,58 @@ mod tests {
     }
 
     #[test]
+    fn test_field_names_completed_after_a_field_left_without_a_value() {
+        // In a named value, `mode: ,` parses as a bare `mode` identifier and an
+        // ERROR holding the colon, not as a field. That pair used to claim
+        // every cursor after it in the struct, so the rest of the value was
+        // offered `mode`'s variants instead of field names — on the next line,
+        // and even after further fields — until `mode` got its value.
+        let (server, analyzer) = nested_fixture();
+
+        for (content, position) in [
+            (
+                "AppConfig(\n    server: ServerConfig(\n        mode: ,\n        \n    ),\n)\n",
+                Position::new(3, 8),
+            ),
+            ("ServerConfig(mode: , )", Position::new(0, 21)),
+        ] {
+            let labels = labels_at(content, position, &server, &analyzer);
+            assert!(
+                labels.contains(&"host".to_string()),
+                "field names should be offered for {content:?}: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"Production".to_string()),
+                "past the comma is not `mode`'s value for {content:?}: {labels:?}"
+            );
+        }
+
+        // Nor once another field has been written after it.
+        let labels = labels_at(
+            "AppConfig(\n    server: ServerConfig(\n        mode: ,\n        host: \"x\",\n        \n    ),\n)\n",
+            Position::new(4, 8),
+            &server,
+            &analyzer,
+        );
+        assert!(
+            !labels.contains(&"Production".to_string()),
+            "a later field's line is not `mode`'s value: {labels:?}"
+        );
+
+        // Before its comma, the cursor is still on `mode`'s value.
+        let labels = labels_at(
+            "ServerConfig(mode: , )",
+            Position::new(0, 19),
+            &server,
+            &analyzer,
+        );
+        assert!(
+            labels.contains(&"Production".to_string()),
+            "the enum field's variants should be offered before the comma: {labels:?}"
+        );
+    }
+
+    #[test]
     fn test_struct_type_completed_at_end_of_line() {
         // The cursor an editor sends sits at the end of what has been typed,
         // where the deepest tree node is the enclosing struct rather than the
