@@ -1182,31 +1182,53 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
 ///
 /// RON numbers lines and columns from one and counts columns in characters; LSP
 /// numbers lines from zero and counts columns in UTF-16 code units.
+///
+/// RON opens the span of an unexpected character where it started skipping
+/// whitespace, not at the character itself: `host: )` comes back as the space
+/// before the `)`, and a `)` on the line after `host:` as the end of the
+/// `host:` line. That whitespace is dropped from the front of the span, so the
+/// range lands on what the parser actually stumbled over.
 fn parse_error_range(span: &ron::error::Span, content: &str) -> Range {
-    let start = error_position(&span.start, content);
-    let end = error_position(&span.end, content);
+    use super::ts_utils;
+
+    let (end_row, end) = error_offset(&span.end, content);
+    let (start_row, start) = error_offset(&span.start, content);
+    let (start_row, start) = if start < end {
+        let skipped = &content[start..end];
+        let skipped = &skipped[..skipped.len() - skipped.trim_start().len()];
+        (
+            start_row + skipped.matches('\n').count(),
+            start + skipped.len(),
+        )
+    } else {
+        (start_row, start)
+    };
+
+    let start = ts_utils::byte_offset_to_position(content, start, start_row);
+    let end = ts_utils::byte_offset_to_position(content, end, end_row);
 
     // An empty range is invisible in most editors, so widen it to cover the
     // character the parser stopped on.
-    if start == end {
+    if start >= end {
         Range::new(start, Position::new(start.line, start.character + 1))
     } else {
         Range::new(start, end)
     }
 }
 
-/// One end of a RON error span as an LSP position.
-fn error_position(position: &ron::error::Position, content: &str) -> Position {
-    use super::ts_utils;
-
-    let line = position.line.saturating_sub(1) as u32;
+/// One end of a RON error span as a zero-based row and a byte offset into
+/// `content`.
+fn error_offset(position: &ron::error::Position, content: &str) -> (usize, usize) {
+    let row = position.line.saturating_sub(1);
     let char_col = position.col.saturating_sub(1);
-    let text = ts_utils::line_at(content, line as usize);
+
+    let row_start: usize = content.split_inclusive('\n').take(row).map(str::len).sum();
+    let text = super::ts_utils::line_at(content, row);
     let byte_col = text
         .char_indices()
         .nth(char_col)
         .map_or(text.len(), |(byte, _)| byte);
-    Position::new(line, ts_utils::utf16_column(text, byte_col))
+    (row, (row_start + byte_col).min(content.len()))
 }
 
 #[cfg(test)]
@@ -1324,6 +1346,32 @@ mod tests {
             "Got: {:?}",
             diagnostic
         );
+    }
+
+    /// An unexpected character is underlined itself, not the whitespace RON
+    /// skipped on the way to it. Left to RON's span, a value missing after
+    /// `host:` underlines the blank before the `,` — or, when the `)` is on the
+    /// next line, the end of the `host:` line and the indentation after it.
+    #[test]
+    fn test_syntax_error_skips_whitespace_before_the_offending_character() {
+        for (content, offending) in [
+            ("Config(\n    host: ,\n)", (1, 10)),
+            ("Config(host: \"🚀\", port: )", (0, 25)),
+            ("Config(\n    host:\n\n    )", (3, 4)),
+            ("Config(\n    host: // pending\n    )", (2, 4)),
+        ] {
+            let range = syntax_error(content).range;
+            assert_eq!(
+                (range.start.line, range.start.character),
+                offending,
+                "the error should start on the offending character in {content:?}. Got: {range:?}"
+            );
+            assert_eq!(
+                (range.end.line, range.end.character),
+                (offending.0, offending.1 + 1),
+                "the error should cover that one character in {content:?}. Got: {range:?}"
+            );
+        }
     }
 
     /// Columns go out in UTF-16 code units, while RON counts them in characters.
