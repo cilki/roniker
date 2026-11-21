@@ -37,33 +37,11 @@ pub fn mask_for_grammar(content: &str) -> Cow<'_, str> {
     let mut masked: Option<Vec<u8>> = None;
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(end) = skip_comment_or_quoted(bytes, i) {
+            i = end;
+            continue;
+        }
         match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                i = memchr(b'\n', bytes, i).unwrap_or(bytes.len());
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // RON's block comments nest.
-                let mut depth = 1;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i..].starts_with(b"/*") {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i..].starts_with(b"*/") {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            quote @ (b'"' | b'\'') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
             b if b.is_ascii_alphabetic() || b == b'_' => {
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -157,6 +135,48 @@ pub fn number_suffix(literal: &str) -> Option<&'static str> {
     NUMBER_SUFFIXES.into_iter().find(|suffix| {
         digits.len() > suffix.len() && digits.ends_with(suffix) && !(hex && suffix.starts_with('f'))
     })
+}
+
+/// The index just past the comment, string or char literal starting at
+/// `bytes[i]`, lexed the way RON lexes it, if one starts there; past
+/// `bytes.len()` when it runs to the end of `bytes` without being closed, a
+/// line comment included.
+///
+/// Raw strings are not recognised: run this over [`mask_for_grammar`]'s output
+/// to have them read as ordinary strings.
+pub fn skip_comment_or_quoted(bytes: &[u8], i: usize) -> Option<usize> {
+    let unterminated = bytes.len() + 1;
+    match bytes.get(i..)? {
+        [b'/', b'/', ..] => Some(memchr(b'\n', bytes, i).map_or(unterminated, |nl| nl + 1)),
+        [b'/', b'*', ..] => {
+            // RON's block comments nest.
+            let mut depth = 1;
+            let mut j = i + 2;
+            while j < bytes.len() {
+                if bytes[j..].starts_with(b"/*") {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j..].starts_with(b"*/") {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            Some(unterminated)
+        }
+        [quote @ (b'"' | b'\''), ..] => {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != *quote {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            Some(if j < bytes.len() { j + 1 } else { unterminated })
+        }
+        _ => None,
+    }
 }
 
 /// The index of the first `needle` in `bytes` at or after `from`.

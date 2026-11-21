@@ -493,44 +493,16 @@ fn root_slot(content: &str, cursor: usize) -> RootSlot {
     let mut written = false;
     let mut i = 0;
     while i < cursor {
+        if let Some(end) = super::ts_utils::skip_comment_or_quoted(bytes, i) {
+            // One that runs past the cursor holds it.
+            if end > cursor {
+                return RootSlot::Inside;
+            }
+            written |= depth == 0 && matches!(bytes[i], b'"' | b'\'');
+            i = end;
+            continue;
+        }
         match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                i = bytes[i..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(bytes.len(), |at| i + at);
-                // The comment runs to the end of the line, cursor included.
-                if i >= cursor {
-                    return RootSlot::Inside;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // RON's block comments nest.
-                let mut nesting = 1;
-                i += 2;
-                while i < bytes.len() && nesting > 0 {
-                    if bytes[i..].starts_with(b"/*") {
-                        nesting += 1;
-                        i += 2;
-                    } else if bytes[i..].starts_with(b"*/") {
-                        nesting -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if nesting > 0 {
-                    return RootSlot::Inside;
-                }
-            }
-            quote @ (b'"' | b'\'') => {
-                written |= depth == 0;
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
             // The `#![enable(..)]` header comes before the root value and is
             // not part of it.
             b'#' if depth == 0 && !written && bytes[i..].starts_with(b"#![") => {
