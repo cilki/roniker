@@ -2169,9 +2169,9 @@ Document::new(content.to_string()),
         }
     }
 
-    /// A value written inside a container — an element of a `Vec`, what a
-    /// `Some(..)` wraps, a map entry's key or value — takes the values of the
-    /// type the container holds, not of the field's whole declared type. The
+    /// A value written inside a container — an element of a `Vec` or a tuple,
+    /// what a `Some(..)` wraps, a map entry's key or value — takes the values
+    /// of the type the container holds, not of the field's whole declared type. The
     /// container used to be ignored: inside `modes: [|]` the `Vec<Mode>` was
     /// offered another `[]`/`[...]` where a `Mode` belongs, and inside an empty
     /// `Some(|)` — which is what accepting the `Some` completion leaves behind —
@@ -2189,6 +2189,10 @@ Document::new(content.to_string()),
                     ("maybe_modes", "Option<Vec<Mode>>"),
                     ("by_name", "HashMap<String, Mode>"),
                     ("ports", "Box<Vec<u16>>"),
+                    ("route", "(u16, Mode)"),
+                    ("routes", "Vec<(String, Mode)>"),
+                    ("trio", "[Mode; 3]"),
+                    ("server", "Server"),
                 ]
                 .into_iter()
                 .map(|(name, type_name)| FieldInfo {
@@ -2213,12 +2217,22 @@ Document::new(content.to_string()),
             ),
             ..Default::default()
         });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "host".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
         let service = create_test_backend_with_analyzer(analyzer).await;
         let backend = service.inner();
         let uri: Uri = "file:///test/config.ron".parse().unwrap();
 
         let variants = vec!["Fast", "Slow"];
         let sequence = vec!["[]", "[...]"];
+        let tuple = vec!["(...)"];
         // The document, with `|` marking the cursor, and what completing there
         // offers.
         for (marked, expected) in [
@@ -2233,12 +2247,25 @@ Document::new(content.to_string()),
             ("Config(by_name: {\"a\": Fast, \"b\": Sl|})", &variants),
             ("Config(by_name: {|})", &vec!["\"\""]),
             ("Config(ports: [|])", &vec!["0"]),
+            // A tuple's element takes the type of its position. Inside the
+            // `()` that accepting the tuple's snippet leaves behind, another
+            // `(...)` used to be offered.
+            ("Config(route: (|))", &vec!["0"]),
+            ("Config(route: (1, |))", &variants),
+            ("Config(route: (1, Sl|))", &variants),
+            ("Config(route: (|1, Fast))", &vec!["0"]),
+            ("Config(routes: [(\"a\", |)])", &variants),
+            ("Config(trio: (Fast, Slow, |))", &variants),
+            // Parentheses written for a struct are its own, not a tuple's.
+            ("Config(server: (|))", &vec!["Server"]),
             // One container out, the containers' own spellings are still what
             // the cursor's value takes.
             ("Config(grid: [|])", &sequence),
             ("Config(maybe_modes: Some(|))", &sequence),
             ("Config(modes: |[])", &sequence),
             ("Config(modes: []|)", &sequence),
+            ("Config(route: |())", &tuple),
+            ("Config(routes: [|])", &tuple),
         ] {
             let offset = marked.find('|').unwrap();
             let content = marked.replacen('|', "", 1);
