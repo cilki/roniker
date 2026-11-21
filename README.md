@@ -430,6 +430,12 @@ complaint is reported as broken. Avoid them in config types until
 
 What gets offered depends on where in the value the cursor sits:
 
+- Before the root value's parentheses — an empty file, one holding only
+  comments and the `#![enable(..)]` header, or the root's name half typed: the
+  root type, as a snippet with every field laid out, or an enum root's
+  variants. If the parentheses are already there, only the name is inserted.
+  Past a complete root value nothing is offered, since `ron` accepts nothing
+  more there.
 - In a struct's parentheses: that struct's fields, labeled with the name serde
   expects, inserted as `name: `, and documented with the field's declared type
   and doc comment. Where an enum is expected the variants are offered instead,

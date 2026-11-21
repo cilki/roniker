@@ -391,6 +391,22 @@ pub fn generate_completions_for_type(
             .try_fold(declared, |declared, step| step.apply(&declared))
     };
 
+    // Outside the root value's parentheses there are no fields to name: before
+    // them is where the root value itself is written, and after them nothing
+    // more may be.
+    let cursor = super::ts_utils::position_to_byte_offset(content, position);
+    match root_slot(content, cursor) {
+        RootSlot::Name { parenthesized } => {
+            let items = workspace_type_completions(type_info);
+            return match parenthesized {
+                true => items.into_iter().map(name_only).collect(),
+                false => items,
+            };
+        }
+        RootSlot::Past => return Vec::new(),
+        RootSlot::Inside => {}
+    }
+
     match get_completion_context(tree, content, position) {
         CompletionContext::FieldName => {
             generate_field_completions(tree, content, position, type_info, analyzer)
@@ -428,13 +444,147 @@ pub fn generate_completions_for_type(
             .map(|t| generate_type_completions_by_type(&t, analyzer))
             .unwrap_or_default()
             .into_iter()
-            .map(|item| CompletionItem {
-                insert_text: Some(item.label.clone()),
-                insert_text_format: None,
-                ..item
-            })
+            .map(name_only)
             .collect(),
     }
+}
+
+/// `item` inserting its name and nothing else, for a value whose parentheses
+/// are already written.
+fn name_only(item: CompletionItem) -> CompletionItem {
+    CompletionItem {
+        insert_text: Some(item.label.clone()),
+        insert_text_format: None,
+        ..item
+    }
+}
+
+/// Where a cursor sits relative to the document's root value.
+#[derive(Debug, PartialEq)]
+enum RootSlot {
+    /// Where the root value's name is written: an empty document, one holding
+    /// only comments and a `#![enable(..)]` header, or the root's name half
+    /// typed. `parenthesized` when the parentheses already follow the name.
+    Name { parenthesized: bool },
+    /// After a complete root value, where `ron` accepts nothing more.
+    Past,
+    /// Inside the root value's delimiters, or inside a comment or string.
+    Inside,
+}
+
+/// Find the cursor's [`RootSlot`] from the text before it.
+///
+/// This is read off the text rather than the tree because the documents it
+/// matters for are the ones tree-sitter makes least of: an empty file parses
+/// to a bare `ERROR`, and one whose root is still being typed (`AppConfig(`
+/// with nothing closed) to an `ERROR` holding loose identifiers, neither of
+/// which says whether the cursor is inside the root's parentheses. Counting
+/// the delimiters before the cursor does, once comments and strings are
+/// skipped.
+fn root_slot(content: &str, cursor: usize) -> RootSlot {
+    let masked = super::ts_utils::mask_for_grammar(content);
+    let bytes = masked.as_bytes();
+    let cursor = cursor.min(bytes.len());
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut depth = 0usize;
+    // Whether something other than the word under the cursor was written at
+    // the top level: a root value the cursor is already past.
+    let mut written = false;
+    let mut i = 0;
+    while i < cursor {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |at| i + at);
+                // The comment runs to the end of the line, cursor included.
+                if i >= cursor {
+                    return RootSlot::Inside;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                // RON's block comments nest.
+                let mut nesting = 1;
+                i += 2;
+                while i < bytes.len() && nesting > 0 {
+                    if bytes[i..].starts_with(b"/*") {
+                        nesting += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        nesting -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if nesting > 0 {
+                    return RootSlot::Inside;
+                }
+            }
+            quote @ (b'"' | b'\'') => {
+                written |= depth == 0;
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            // The `#![enable(..)]` header comes before the root value and is
+            // not part of it.
+            b'#' if depth == 0 && !written && bytes[i..].starts_with(b"#![") => {
+                let mut brackets = 0;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'[' => brackets += 1,
+                        b']' => brackets -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                    if brackets == 0 && bytes[i - 1] == b']' {
+                        break;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                written |= depth == 0;
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            b if is_word(b) => {
+                while i < cursor && is_word(bytes[i]) {
+                    i += 1;
+                }
+                // A word running up to the cursor is the one being typed.
+                written |= depth == 0 && i < cursor;
+            }
+            _ => {
+                written |= depth == 0;
+                i += 1;
+            }
+        }
+    }
+
+    // A comment or string that runs past the cursor holds it.
+    if i > cursor || depth > 0 {
+        return RootSlot::Inside;
+    }
+    if written {
+        return RootSlot::Past;
+    }
+    let rest = &bytes[cursor..];
+    let after_word = rest.iter().position(|&b| !is_word(b)).unwrap_or(rest.len());
+    let parenthesized = rest[after_word..]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| b == b'(');
+    RootSlot::Name { parenthesized }
 }
 
 /// Get all types from the workspace as completion items
@@ -1811,5 +1961,129 @@ mod tests {
             "fields already present should not be offered: {:?}",
             labels
         );
+    }
+
+    /// The completion at the end of `content`, which is where the cursor is,
+    /// as `(label, insert_text)` pairs.
+    fn items_at_end(
+        content: &str,
+        type_info: &TypeInfo,
+        analyzer: &RustAnalyzer,
+    ) -> Vec<(String, Option<String>)> {
+        let tree = crate::lsp::ts_utils::parse(content);
+        let row = content.matches('\n').count() as u32;
+        let column = content
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count() as u32;
+        generate_completions_for_type(
+            &tree,
+            content,
+            Position::new(row, column),
+            type_info,
+            analyzer,
+        )
+        .into_iter()
+        .map(|item| (item.label, item.insert_text))
+        .collect()
+    }
+
+    /// Outside the root value's parentheses no field can be written, so field
+    /// names were exactly the wrong thing to offer there: on an empty document
+    /// they were all a new file got, and inserting one left `debug: ` as the
+    /// whole document. Before the root's parentheses, the root value itself is
+    /// what goes; after them, nothing does.
+    #[test]
+    fn test_root_value_completed_outside_its_parentheses() {
+        let (_, analyzer) = nested_fixture();
+        let root = analyzer.get_type_info("AppConfig").unwrap().clone();
+        let snippet = Some("AppConfig(\n    debug: ${1},\n    server: ${2},\n)".to_string());
+        let root_value = vec![("AppConfig".to_string(), snippet)];
+
+        for content in [
+            "",
+            "App",
+            "AppConfig",
+            "// settings for the app\n",
+            "/* a /* nested */ comment */ ",
+            "#![enable(implicit_some)]\n",
+            "#![enable(implicit_some)]\n// header\nApp",
+        ] {
+            assert_eq!(
+                items_at_end(content, &root, &analyzer),
+                root_value,
+                "{content:?}"
+            );
+        }
+
+        // A complete root value leaves nothing to add.
+        for content in [
+            "AppConfig(debug: true)\n",
+            "(debug: true) ",
+            "AppConfig(\n)\n// done\n",
+        ] {
+            assert_eq!(
+                items_at_end(content, &root, &analyzer),
+                vec![],
+                "{content:?}"
+            );
+        }
+
+        // Inside a comment or string, or inside the root's own parentheses —
+        // closed or not yet — this is not the root's to answer.
+        let slot = |content: &str| root_slot(content, content.len());
+        assert_eq!(slot("// App"), RootSlot::Inside);
+        assert_eq!(slot("/* App"), RootSlot::Inside);
+        assert_eq!(slot("(debug: true, "), RootSlot::Inside);
+        assert_eq!(slot("AppConfig(\n    debug: true,\n    "), RootSlot::Inside);
+        // A `)` in a raw string closes nothing.
+        assert_eq!(slot("AppConfig(name: r#\")\"#, "), RootSlot::Inside);
+        let labels = items_at_end("AppConfig(\n    ", &root, &analyzer);
+        assert!(
+            labels.iter().any(|(label, _)| label == "server"),
+            "{labels:?}"
+        );
+    }
+
+    /// On the name of a root value whose parentheses are already written, only
+    /// the name is inserted, as for a nested value — not a second set of
+    /// parentheses with every field laid out again.
+    #[test]
+    fn test_root_name_completed_before_its_parentheses() {
+        let (_, analyzer) = nested_fixture();
+        let root = analyzer.get_type_info("AppConfig").unwrap().clone();
+        let content = "AppConfig(debug: true)";
+
+        let items: Vec<_> = generate_completions_for_type(
+            &crate::lsp::ts_utils::parse(content),
+            content,
+            Position::new(0, 3),
+            &root,
+            &analyzer,
+        )
+        .into_iter()
+        .map(|item| (item.label, item.insert_text, item.insert_text_format))
+        .collect();
+
+        assert_eq!(
+            items,
+            vec![("AppConfig".to_string(), Some("AppConfig".to_string()), None)]
+        );
+    }
+
+    /// A root that is an enum is written as one of its variants.
+    #[test]
+    fn test_enum_root_completed_with_its_variants() {
+        let (_, analyzer) = nested_fixture();
+        let mode = analyzer.get_type_info("ServerMode").unwrap().clone();
+
+        let labels: Vec<_> = items_at_end("Prod", &mode, &analyzer)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+
+        assert_eq!(labels, vec!["Development", "Production"]);
     }
 }
