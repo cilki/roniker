@@ -63,6 +63,9 @@ enum ValueStep {
     MapKey,
     /// The value of a map entry.
     MapValue,
+    /// The element at this position of a tuple or fixed-size array, both
+    /// written `(a, b, ...)`.
+    TupleElement(usize),
 }
 
 impl ValueStep {
@@ -85,6 +88,13 @@ impl ValueStep {
             ValueStep::Some => extract_inner_type(&clean, "Option<"),
             ValueStep::MapKey => map_entry_types(&clean).map(|(key, _)| key),
             ValueStep::MapValue => map_entry_types(&clean).map(|(_, value)| value),
+            ValueStep::TupleElement(index) => match tuple_element_types(&clean) {
+                Some(elements) => elements.get(index).copied(),
+                // Parentheses written for a type that is not a tuple are that
+                // value's own — an unnamed struct, `(host: "x")` — so the
+                // cursor is still completing the declared type itself.
+                None => return Some(declared.to_string()),
+            },
         }
         .map(str::to_string)
     }
@@ -148,6 +158,29 @@ fn value_steps<'a>(
                     // Between entries a new key is about to be written.
                     None => (ValueStep::MapKey, None),
                 }
+            }
+            "tuple" => {
+                // The element the cursor is at is the one after however many
+                // commas precede it; one not typed yet (`(1, |)`) is a
+                // `MISSING` node, which `tuple_elements` leaves out.
+                let mut walk = current.walk();
+                let index = current
+                    .children(&mut walk)
+                    .filter(|child| child.kind() == "," && child.end_byte() <= cursor)
+                    .count();
+                (
+                    ValueStep::TupleElement(index),
+                    ts_utils::tuple_elements(&current)
+                        .into_iter()
+                        .find(contains),
+                )
+            }
+            // `()` is a single token, so the cursor is inside it only when it
+            // sits between its two characters — where a tuple's first element
+            // is about to be written.
+            "unit" if cursor == current.start_byte() + 1 => {
+                steps.push(ValueStep::TupleElement(0));
+                return (steps, None);
             }
             _ => return (steps, Some(current)),
         };
