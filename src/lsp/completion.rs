@@ -1,8 +1,8 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
-    MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type,
-    is_number_type, is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name,
-    std_type, tuple_element_types,
+    ARRAY_WRAPPERS, MAP_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, is_number_type,
+    is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name, std_type,
+    tuple_element_types, wrapped_type,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
 use std::borrow::Cow;
@@ -74,17 +74,11 @@ impl ValueStep {
     fn apply(self, declared: &str) -> Option<String> {
         let clean = normalize_type(declared);
         // A wrapper the document writes straight through holds the container.
-        if let Some(inner) = TRANSPARENT_WRAPPERS
-            .iter()
-            .find_map(|w| extract_inner_type(&clean, w))
-        {
+        if let Some(inner) = wrapped_type(&clean, &TRANSPARENT_WRAPPERS) {
             return self.apply(inner);
         }
         match self {
-            ValueStep::Element => SEQUENCE_WRAPPERS
-                .iter()
-                .chain(SET_WRAPPERS.iter())
-                .find_map(|w| extract_inner_type(&clean, w)),
+            ValueStep::Element => wrapped_type(&clean, &ARRAY_WRAPPERS),
             ValueStep::Some => extract_inner_type(&clean, "Option<"),
             ValueStep::MapKey => map_entry_types(&clean).map(|(key, _)| key),
             ValueStep::MapValue => map_entry_types(&clean).map(|(_, value)| value),
@@ -780,10 +774,7 @@ fn generate_value_completions_by_type(
 
     // A wrapper the document writes straight through — `Box<T>`, `Cow<T>`,
     // `NonZero<T>` — takes exactly the values its inner type does.
-    if let Some(inner) = TRANSPARENT_WRAPPERS
-        .iter()
-        .find_map(|w| extract_inner_type(&clean_type, w))
-    {
+    if let Some(inner) = wrapped_type(&clean_type, &TRANSPARENT_WRAPPERS) {
         return generate_value_completions_by_type(inner, analyzer);
     }
 
@@ -850,9 +841,7 @@ fn generate_value_completions_by_type(
             // whose length is a const generic. Still a tuple in RON.
             None => snippet_item("(...)", format!("{field_type} as a tuple"), "($0)"),
         }]
-    } else if is_wrapped_by(&clean_type, &SEQUENCE_WRAPPERS)
-        || is_wrapped_by(&clean_type, &SET_WRAPPERS)
-    {
+    } else if is_wrapped_by(&clean_type, &ARRAY_WRAPPERS) {
         // A set is written as a sequence too, so it takes the same values.
         vec![
             value_item("[]", "Empty vector/array", "[]"),

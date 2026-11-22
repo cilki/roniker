@@ -493,13 +493,10 @@ fn generate_explicit_type_actions(
 /// pointers RON writes straight through are peeled off, without its generic
 /// arguments. `Option<crate::models::Author>` is written `Author(..)`.
 fn written_type_name(type_name: &str) -> String {
-    use super::type_utils::{TRANSPARENT_WRAPPERS, extract_inner_type, normalize_type, short_name};
+    use super::type_utils::{normalize_type, short_name, single_value_wrapped_type};
 
     let mut clean = normalize_type(type_name).into_owned();
-    while let Some(inner) = std::iter::once(&"Option<")
-        .chain(TRANSPARENT_WRAPPERS.iter())
-        .find_map(|wrapper| extract_inner_type(&clean, wrapper))
-    {
+    while let Some(inner) = single_value_wrapped_type(&clean) {
         clean = normalize_type(inner).into_owned();
     }
     let head = clean.split('<').next().unwrap_or(&clean);
@@ -735,7 +732,8 @@ fn generate_default_value(type_name: &str, analyzer: &RustAnalyzer) -> String {
 
 fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth: usize) -> String {
     use super::type_utils::{
-        MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, is_number_type, is_wrapped_by,
+        ARRAY_WRAPPERS, MAP_WRAPPERS, TRANSPARENT_WRAPPERS, is_number_type, is_wrapped_by,
+        wrapped_type,
     };
 
     let clean = super::type_utils::normalize_type(type_name);
@@ -748,9 +746,7 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
         // A set serializes as a sequence, the same as a `Vec`. A fixed-size
         // array does not, despite the brackets in its name: see the tuple
         // branch below.
-        _ if is_wrapped_by(&clean, &SEQUENCE_WRAPPERS) || is_wrapped_by(&clean, &SET_WRAPPERS) => {
-            Some("[]")
-        }
+        _ if is_wrapped_by(&clean, &ARRAY_WRAPPERS) => Some("[]"),
         _ if is_wrapped_by(&clean, &MAP_WRAPPERS) => Some("{}"),
         "bool" => Some("false"),
         // A `char` is a quoted character, and the one thing it is not is
@@ -801,10 +797,8 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
 
     // Serde sees straight through a smart pointer, and so does RON: a
     // `Box<Server>` field is written exactly like a `Server` one.
-    for wrapper in super::type_utils::TRANSPARENT_WRAPPERS {
-        if let Some(inner) = super::type_utils::extract_inner_type(&clean, wrapper) {
-            return generate_default_value_depth(inner, analyzer, depth - 1);
-        }
+    if let Some(inner) = wrapped_type(&clean, &TRANSPARENT_WRAPPERS) {
+        return generate_default_value_depth(inner, analyzer, depth - 1);
     }
 
     let Some(info) = analyzer.get_type_info(&clean) else {

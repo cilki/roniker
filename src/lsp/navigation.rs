@@ -1,8 +1,8 @@
 //! Navigation through nested RON type contexts.
 use super::tree_sitter_parser::TypeContext;
 use super::type_utils::{
-    SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, map_entry_types,
-    normalize_type, short_name,
+    ARRAY_WRAPPERS, map_entry_types, normalize_type, short_name, single_value_wrapped_type,
+    wrapped_type,
 };
 use crate::rust_analyzer::{RustAnalyzer, TypeInfo};
 
@@ -127,11 +127,8 @@ pub fn value_type<'a>(analyzer: &'a RustAnalyzer, type_name: &str) -> Option<&'a
         if let Some(info) = analyzer.get_type_info(&current) {
             return Some(info);
         }
-        let inner = std::iter::once("Option<")
-            .chain(TRANSPARENT_WRAPPERS)
-            .chain(SEQUENCE_WRAPPERS)
-            .chain(SET_WRAPPERS)
-            .find_map(|wrapper| extract_inner_type(&current, wrapper))
+        let inner = single_value_wrapped_type(&current)
+            .or_else(|| wrapped_type(&current, &ARRAY_WRAPPERS))
             .or_else(|| map_entry_types(&current).map(|(_, value)| value))?;
         current = inner.to_string();
     }

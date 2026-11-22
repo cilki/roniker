@@ -54,22 +54,38 @@ pub const TRANSPARENT_WRAPPERS: [&str; 8] = [
     "Box<", "Rc<", "Arc<", "Cow<", "Cell<", "RefCell<", "Mutex<", "RwLock<",
 ];
 
-/// Standard-library sequences, which RON writes as an array of their elements
-/// and which therefore ask of a value exactly what a `Vec<T>` would.
-///
-/// The sets (`HashSet`, `BTreeSet`) are written the same way, and validated the
-/// same way, but are kept in [`SET_WRAPPERS`] of their own.
-pub const SEQUENCE_WRAPPERS: [&str; 4] = ["Vec<", "VecDeque<", "LinkedList<", "BinaryHeap<"];
-
-/// Standard-library sets, which RON writes as an array exactly like the
-/// [`SEQUENCE_WRAPPERS`].
-pub const SET_WRAPPERS: [&str; 2] = ["HashSet<", "BTreeSet<"];
+/// Standard-library collections RON writes as an array of their elements: the
+/// sequences and the sets alike. `ron` reads a `HashSet<u16>` exactly the way
+/// it reads a `Vec<u16>` — brackets, and every element a `u16` — so each of
+/// these asks of a value exactly what a `Vec<T>` would.
+pub const ARRAY_WRAPPERS: [&str; 6] = [
+    "Vec<",
+    "VecDeque<",
+    "LinkedList<",
+    "BinaryHeap<",
+    "HashSet<",
+    "BTreeSet<",
+];
 
 /// Whether an already-normalized type name starts with one of `wrappers` —
 /// i.e. is that standard-library generic, rather than a user-defined type
 /// whose name merely begins the same way (`Options`, `Vector3`).
 pub fn is_wrapped_by(clean: &str, wrappers: &[&str]) -> bool {
     wrappers.iter().any(|wrapper| clean.starts_with(wrapper))
+}
+
+/// The type argument of an already-normalized type name that is one of
+/// `wrappers`: `Server` for `Box<Server>` against [`TRANSPARENT_WRAPPERS`].
+pub fn wrapped_type<'a>(clean: &'a str, wrappers: &[&str]) -> Option<&'a str> {
+    wrappers
+        .iter()
+        .find_map(|wrapper| extract_inner_type(clean, wrapper))
+}
+
+/// The type an `Option<T>` or one of the [`TRANSPARENT_WRAPPERS`] holds, when
+/// `clean` is one: the wrappers around a single value a document writes.
+pub fn single_value_wrapped_type(clean: &str) -> Option<&str> {
+    extract_inner_type(clean, "Option<").or_else(|| wrapped_type(clean, &TRANSPARENT_WRAPPERS))
 }
 
 /// Whether an already-normalized type name is one of Rust's numeric
@@ -164,9 +180,7 @@ pub const MAP_WRAPPERS: [&str; 2] = ["HashMap<", "BTreeMap<"];
 /// exactly a key and a value (a `HashMap<K, V, S>` with a custom hasher keeps
 /// its first two).
 pub fn map_entry_types(clean: &str) -> Option<(&str, &str)> {
-    let inner = MAP_WRAPPERS
-        .iter()
-        .find_map(|wrapper| extract_inner_type(clean, wrapper))?;
+    let inner = wrapped_type(clean, &MAP_WRAPPERS)?;
     match split_top_level(inner).as_slice() {
         [key, value, ..] if !key.is_empty() && !value.is_empty() => Some((key, value)),
         _ => None,
@@ -398,15 +412,7 @@ mod tests {
     /// [`extract_inner_type`] expects: the name and its opening `<`.
     #[test]
     fn test_wrapper_lists_unwrap_their_inner_type() {
-        for wrapper in TRANSPARENT_WRAPPERS {
-            let declared = format!("{wrapper}Server>");
-            assert_eq!(
-                extract_inner_type(&declared, wrapper),
-                Some("Server"),
-                "{wrapper}"
-            );
-        }
-        for wrapper in SEQUENCE_WRAPPERS {
+        for wrapper in TRANSPARENT_WRAPPERS.iter().chain(&ARRAY_WRAPPERS) {
             let declared = format!("{wrapper}Server>");
             assert_eq!(
                 extract_inner_type(&declared, wrapper),
@@ -418,7 +424,7 @@ mod tests {
         // Every one of them is also a name the path strip and the generic
         // classifier know, or a qualified spelling would fall through as a
         // user-defined type again.
-        for wrapper in TRANSPARENT_WRAPPERS.iter().chain(SEQUENCE_WRAPPERS.iter()) {
+        for wrapper in TRANSPARENT_WRAPPERS.iter().chain(&ARRAY_WRAPPERS) {
             let name = wrapper.trim_end_matches('<');
             assert!(
                 crate::rust_analyzer::STD_GENERIC_NAMES.contains(&name),

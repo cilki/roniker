@@ -1,7 +1,8 @@
 use super::type_utils::{
-    MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name,
-    extract_inner_type, is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types,
-    matching_field, missing_required_fields, normalize_type, short_name, tuple_element_types,
+    ARRAY_WRAPPERS, MAP_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type,
+    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, matching_field,
+    missing_required_fields, normalize_type, short_name, single_value_wrapped_type,
+    tuple_element_types, wrapped_type,
 };
 use crate::rust_analyzer::{
     FieldInfo, IntegerBounds, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -21,20 +22,6 @@ pub mod codes {
     pub const UNKNOWN_VARIANT: &str = "unknown-variant";
     pub const UNKNOWN_TYPE: &str = "unknown-type";
     pub const TYPE_MISMATCH: &str = "type-mismatch";
-}
-
-/// The standard-library collections RON writes as an array of their elements:
-/// the sequences and the sets alike. `ron` reads a `HashSet<u16>` exactly the
-/// way it reads a `Vec<u16>` — brackets, and every element a `u16` — so the
-/// validator holds both to the same rules.
-fn array_wrappers() -> impl Iterator<Item = &'static str> {
-    SEQUENCE_WRAPPERS.into_iter().chain(SET_WRAPPERS)
-}
-
-/// The element type of a collection RON writes as an array, if `clean` (an
-/// already-normalized type name) is one.
-fn array_element_type(clean: &str) -> Option<&str> {
-    array_wrappers().find_map(|wrapper| extract_inner_type(clean, wrapper))
 }
 
 fn code(code: &str) -> Option<NumberOrString> {
@@ -459,13 +446,10 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
         let inner_node = super::ts_utils::unwrap_some(node, content).unwrap_or(*node);
         return tree_satisfies(&inner_node, content, inner);
     }
-    if let Some(inner) = TRANSPARENT_WRAPPERS
-        .iter()
-        .find_map(|wrapper| extract_inner_type(declared, wrapper))
-    {
+    if let Some(inner) = wrapped_type(declared, &TRANSPARENT_WRAPPERS) {
         return !is_custom_type(inner) && tree_satisfies(node, content, inner);
     }
-    if let Some(element) = array_element_type(declared) {
+    if let Some(element) = wrapped_type(declared, &ARRAY_WRAPPERS) {
         return !is_custom_type(element)
             && node.kind() == "array"
             && super::ts_utils::array_elements(node)
@@ -573,7 +557,7 @@ fn validate_nested_value<'a>(
     let unregistered =
         |inner: &str| is_custom_type(inner) && analyzer.get_type_info(inner).is_none();
 
-    if let Some(inner_type) = array_element_type(&field_type_normalized) {
+    if let Some(inner_type) = wrapped_type(&field_type_normalized, &ARRAY_WRAPPERS) {
         // A `Vec<T>` (or a `HashSet<T>`, which RON writes the same way)
         // written as an array: every element is validated against
         // `T` exactly the way a field's value is validated against the field's
@@ -595,10 +579,7 @@ fn validate_nested_value<'a>(
             }
             settled = true;
         }
-    } else if let Some(inner_type) = std::iter::once(&"Option<")
-        .chain(TRANSPARENT_WRAPPERS.iter())
-        .find_map(|w| extract_inner_type(&field_type_normalized, w))
-    {
+    } else if let Some(inner_type) = single_value_wrapped_type(&field_type_normalized) {
         // A single-element wrapper. An `Option` field is usually written
         // `Some(value)`, and what is inside is checked against the inner type
         // exactly the way a field's value is checked against the field's type
@@ -1168,7 +1149,7 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             return Some(format!("expected {}, got string", display_type));
         }
         Value::Seq(_) => {
-            if array_wrappers().any(|wrapper| clean_type.starts_with(wrapper)) {
+            if is_wrapped_by(&clean_type, &ARRAY_WRAPPERS) {
                 // [`validate_nested_value`] walks a `Vec` or a set written as
                 // an array element by element and never falls back on this,
                 // so the `Seq` here is the tuple spelling — `(1, 2)` — which
