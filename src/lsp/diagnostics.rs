@@ -507,18 +507,14 @@ fn first_line_range(node: &tree_sitter::Node, content: &str) -> Range {
     Range::new(start, Position::new(start.line, end_col))
 }
 
-/// The range to report a whole-struct diagnostic at: the struct's name, or a
-/// zero-width range at its start when it is written with unnamed syntax.
+/// The range to report a whole-struct diagnostic at: the struct's name, or —
+/// when it is written with unnamed syntax — its opening parenthesis (all of
+/// `()`, which the grammar hands back as one `unit` token). Never empty: a
+/// zero-width diagnostic doesn't render in most editors, so an unnamed struct
+/// missing a field would show no underline at all.
 fn struct_name_range(node: &tree_sitter::Node, content: &str) -> Range {
-    match node.child(0) {
-        Some(name) if name.kind() == "identifier" => {
-            super::ts_utils::node_to_lsp_range(&name, content)
-        }
-        _ => {
-            let pos = super::ts_utils::node_start_position(node, content);
-            Range::new(pos, pos)
-        }
-    }
+    let anchor = node.child(0).unwrap_or(*node);
+    first_line_range(&anchor, content)
 }
 
 /// What recursing into a value turned up.
@@ -5124,6 +5120,48 @@ mod tests {
             validate_ron_with_analyzer("()", None, &tunables, &analyzer).is_empty(),
             "`()` is a complete value for a struct that needs nothing"
         );
+    }
+
+    /// A struct missing a field is underlined on its name, and one written
+    /// without a name on its opening parenthesis — all of `()` when that is
+    /// the whole value. Never on nothing: a zero-width range doesn't render in
+    /// most editors, so the error would be in the list but not on the page.
+    #[test]
+    fn test_missing_required_field_range_is_not_empty() {
+        let range_of = |content: &'static str| {
+            let (config, analyzer) = named_value_fixture();
+            let ranges: Vec<_> = validate_ron_with_analyzer(content, None, &config, &analyzer)
+                .into_iter()
+                .filter(|d| d.code == code(codes::MISSING_REQUIRED_FIELD))
+                .map(|d| d.range)
+                .collect();
+            assert_eq!(ranges.len(), 1, "one missing-field report for {content:?}");
+            ranges[0]
+        };
+        let range =
+            |line, start, end| Range::new(Position::new(line, start), Position::new(line, end));
+
+        // Named: the name, as before.
+        assert_eq!(
+            range_of("Config(mode: Ephemeral, server: Server())"),
+            range(0, 32, 38)
+        );
+        // Unnamed with fields: the opening parenthesis.
+        assert_eq!(
+            range_of("Config(mode: Ephemeral, server: (bogus: 1))"),
+            range(0, 32, 33)
+        );
+        // Unnamed and spread over lines: still just the parenthesis.
+        assert_eq!(
+            range_of("Config(\n    mode: Ephemeral,\n    server: (\n        bogus: 1,\n    ),\n)"),
+            range(2, 12, 13)
+        );
+        // `()`, nested and as the whole document.
+        assert_eq!(
+            range_of("Config(mode: Ephemeral, server: ())"),
+            range(0, 32, 34)
+        );
+        assert_eq!(range_of("()"), range(0, 0, 2));
     }
 
     /// An element of a `Vec<T>` is a value in its own right, so `()` written as
