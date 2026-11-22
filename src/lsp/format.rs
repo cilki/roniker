@@ -3,9 +3,22 @@
 use super::ts_utils;
 use tree_sitter::{Node, Tree};
 
-/// One level of indentation. The formatter has never offered a choice of width,
-/// so it is a constant rather than something every layout step carries.
-const INDENT: &str = "    ";
+/// One level of indentation when the client doesn't say otherwise: four spaces.
+#[cfg(test)]
+pub const DEFAULT_INDENT: &str = "    ";
+
+/// One level of indentation as the client's formatting options ask for it:
+/// `tab_size` spaces, or a tab when the client indents with tabs.
+///
+/// A width of zero would flatten every level onto the left margin, so it is
+/// read as one space instead.
+pub fn indent_unit(tab_size: u32, insert_spaces: bool) -> String {
+    if insert_spaces {
+        " ".repeat(tab_size.max(1) as usize)
+    } else {
+        "\t".to_string()
+    }
+}
 
 /// Represents a comment found in the source
 #[derive(Debug, Clone)]
@@ -103,7 +116,7 @@ fn is_trailing_comment_in_context(
 /// through [`format_selection`]. Tests format from text.
 #[cfg(test)]
 pub fn format_ron(content: &str) -> String {
-    format_selection(content, ts_utils::line_ending(content), "")
+    format_selection(content, ts_utils::line_ending(content), "", DEFAULT_INDENT)
 }
 
 /// Lay `content` out as text cut out of a larger document — a
@@ -118,8 +131,11 @@ pub fn format_ron(content: &str) -> String {
 /// written from column 0: without `base`, a nested value selected on an
 /// indented line had its fields and its closing bracket pulled out to the
 /// left margin, at or before the column of the line that opened it.
-pub fn format_selection(content: &str, newline: &'static str, base: &str) -> String {
-    layout(&ts_utils::parse(content), content, newline, base)
+///
+/// Each level of nesting is indented by one `indent`, which is
+/// [`indent_unit`] of the client's formatting options.
+pub fn format_selection(content: &str, newline: &'static str, base: &str, indent: &str) -> String {
+    layout(&ts_utils::parse(content), content, newline, base, indent)
 }
 
 /// Lay `content` out, whose parse tree the caller already has.
@@ -128,14 +144,18 @@ pub fn format_selection(content: &str, newline: &'static str, base: &str) -> Str
 /// the text of each leaf is read out of `content` at the byte offsets the tree
 /// recorded, so a tree belonging to different text would reproduce that text's
 /// contents.
-pub fn format_tree(tree: &Tree, content: &str) -> String {
-    layout(tree, content, ts_utils::line_ending(content), "")
+///
+/// Each level of nesting is indented by one `indent`, as in
+/// [`format_selection`].
+pub fn format_tree(tree: &Tree, content: &str, indent: &str) -> String {
+    layout(tree, content, ts_utils::line_ending(content), "", indent)
 }
 
 /// Lay out `content`, whose parse tree is `tree`, ending each line written with
-/// `newline` and starting each but the first with `base`. Comments and other
-/// leaves are copied verbatim, line breaks inside them included.
-fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str) -> String {
+/// `newline` and starting each but the first with `base`, then one `indent`
+/// per level of nesting. Comments and other leaves are copied verbatim, line
+/// breaks inside them included.
+fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str, indent: &str) -> String {
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
     if ts_utils::exceeds_max_depth(&tree.root_node()) {
@@ -160,6 +180,7 @@ fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str) -> Stri
         content,
         newline,
         base,
+        indent,
         output: String::new(),
         malformed: false,
         prev_end: None,
@@ -208,6 +229,8 @@ struct Formatter<'a> {
     /// the indentation of the line a selection sits on — bar the first, which
     /// continues the line the text was cut from.
     base: &'a str,
+    /// One level of indentation, as the client's formatting options ask for.
+    indent: &'a str,
     output: String,
     /// Set when the tree holds something RON can't parse that tree-sitter
     /// accepted anyway, and that the layout would lose part of.
@@ -253,7 +276,7 @@ impl Formatter<'_> {
             self.output.push_str(self.base);
         }
         for _ in 0..level {
-            self.output.push_str(INDENT);
+            self.output.push_str(self.indent);
         }
     }
 
@@ -899,7 +922,7 @@ Post(
 
         // A selection without a line break of its own takes the document's.
         assert_eq!(
-            format_selection("Inner(a: 1)", "\r\n", ""),
+            format_selection("Inner(a: 1)", "\r\n", "", DEFAULT_INDENT),
             "Inner(\r\n    a: 1,\r\n)"
         );
         assert_eq!(format_ron("Inner(a: 1)"), "Inner(\n    a: 1,\n)");
@@ -924,15 +947,45 @@ Post(
     fn test_selection_keeps_its_line_indentation() {
         let input = "// lead\nInner(a: 1,\n\nb: [2], // two\n)";
         assert_eq!(
-            format_selection(input, "\n", "\t"),
+            format_selection(input, "\n", "\t", DEFAULT_INDENT),
             "// lead\n\tInner(\n\t    a: 1,\n\n\t    b: [\n\t        2,\n\t    ], // two\n\t)"
         );
 
         // A multi-line string is a leaf, copied as written: indenting its
         // lines would change the value it holds.
         assert_eq!(
-            format_selection("Inner(a: \"x\ny\")", "\n", "  "),
+            format_selection("Inner(a: \"x\ny\")", "\n", "  ", DEFAULT_INDENT),
             "Inner(\n      a: \"x\ny\",\n  )"
+        );
+    }
+
+    /// Each level is indented the way the client's formatting options ask:
+    /// by `tabSize` spaces, or by a tab. The layout always wrote four spaces,
+    /// so a document kept at two spaces or in tabs was rewritten line by line
+    /// every time it was formatted.
+    #[test]
+    fn test_indentation_follows_the_formatting_options() {
+        let input = "Config(inner: Inner(tags: [\"a\"]), port: 1)";
+        let layout = |indent: &str| format_selection(input, "\n", "", indent);
+
+        assert_eq!(
+            layout(&indent_unit(2, true)),
+            "Config(\n  inner: Inner(\n    tags: [\n      \"a\",\n    ],\n  ),\n  port: 1,\n)"
+        );
+        assert_eq!(
+            layout(&indent_unit(4, false)),
+            "Config(\n\tinner: Inner(\n\t\ttags: [\n\t\t\t\"a\",\n\t\t],\n\t),\n\tport: 1,\n)"
+        );
+        assert_eq!(layout(&indent_unit(4, true)), format_ron(input));
+
+        // A width of zero would put every level on the left margin.
+        assert_eq!(indent_unit(0, true), " ");
+
+        // A selection on an indented line keeps that line's indentation and
+        // nests inside it with the requested unit.
+        assert_eq!(
+            format_selection("Inner(a: 1)", "\n", "\t", &indent_unit(4, false)),
+            "Inner(\n\t\ta: 1,\n\t)"
         );
     }
 }

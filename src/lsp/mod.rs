@@ -363,7 +363,8 @@ impl LanguageServer for Backend {
             // document's own tree is laid out directly: it is the tree of
             // exactly this content, and parsing a large file again costs more
             // than the layout itself.
-            let formatted = format::format_tree(&doc.tree, &doc.content);
+            let indent = format::indent_unit(params.options.tab_size, params.options.insert_spaces);
+            let formatted = format::format_tree(&doc.tree, &doc.content, &indent);
 
             if formatted != doc.content {
                 let line_count = doc.content.lines().count() as u32;
@@ -431,9 +432,10 @@ impl LanguageServer for Backend {
 
         // Lines end the way the document's do: a selection on one line has no
         // line break of its own to go by.
+        let indent = format::indent_unit(params.options.tab_size, params.options.insert_spaces);
         let formatted = format!(
             "{leading}{}{trailing}",
-            format::format_selection(value, ts_utils::line_ending(&doc.content), base)
+            format::format_selection(value, ts_utils::line_ending(&doc.content), base, &indent)
         );
         if formatted == selected_text {
             return Ok(None);
@@ -1170,6 +1172,16 @@ fn push_field_list(hover_text: &mut String, fields: &[rust_analyzer::FieldInfo])
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo, TypeInfo, TypeKind};
+
+    /// The formatting options of a client indenting by four spaces, the
+    /// layout the formatter's own tests are written in.
+    fn four_spaces() -> FormattingOptions {
+        FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            ..Default::default()
+        }
+    }
 
     /// Helper to create a test service around a Backend with a pre-configured
     /// analyzer; the Backend is borrowed from it with `inner()`.
@@ -2451,7 +2463,7 @@ Document::new(content.to_string()),
         let edits = backend
             .formatting(DocumentFormattingParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                options: FormattingOptions::default(),
+                options: four_spaces(),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -2482,13 +2494,85 @@ Document::new(content.to_string()),
             backend
                 .formatting(DocumentFormattingParams {
                     text_document: TextDocumentIdentifier { uri },
-                    options: FormattingOptions::default(),
+                    options: four_spaces(),
                     work_done_progress_params: WorkDoneProgressParams::default(),
                 })
                 .await
                 .unwrap()
                 .is_none(),
             "formatting an already-formatted document should produce no edit"
+        );
+    }
+
+    /// Both formatting requests indent the way the request's options ask. The
+    /// handlers ignored them and always wrote four spaces, so a document kept
+    /// in tabs or at two spaces was rewritten line by line on every format.
+    #[tokio::test]
+    async fn formatting_follows_the_requested_indentation() {
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
+
+        let uri: Uri = "file:///test/indent.ron".parse().unwrap();
+        let content = "Config(\n\tport: 1,\n\tinner: Inner(x: 1),\n)\n";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+
+        let tabs = FormattingOptions {
+            tab_size: 4,
+            insert_spaces: false,
+            ..Default::default()
+        };
+        let edits = backend
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: tabs.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("the nested value on one line should be laid out");
+        assert_eq!(
+            edits[0].new_text,
+            "Config(\n\tport: 1,\n\tinner: Inner(\n\t\tx: 1,\n\t),\n)"
+        );
+
+        let two_spaces = FormattingOptions {
+            tab_size: 2,
+            insert_spaces: true,
+            ..Default::default()
+        };
+        let edits = backend
+            .range_formatting(DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(2, 8), Position::new(2, 19)),
+                options: two_spaces,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("the selected value on one line should be laid out");
+        assert_eq!(edits[0].new_text, "Inner(\n\t  x: 1,\n\t)");
+
+        // A document already indented the way the client asks is left alone.
+        let formatted = "Config(\n\tport: 1,\n)";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(formatted.to_string()));
+        assert!(
+            backend
+                .formatting(DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    options: tabs,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -2995,7 +3079,7 @@ PostReference(
                 .range_formatting(DocumentRangeFormattingParams {
                     text_document: TextDocumentIdentifier { uri: url.clone() },
                     range,
-                    options: Default::default(),
+                    options: four_spaces(),
                     work_done_progress_params: Default::default(),
                 })
                 .await
@@ -3039,7 +3123,7 @@ PostReference(
             .range_formatting(DocumentRangeFormattingParams {
                 text_document: TextDocumentIdentifier { uri: url },
                 range,
-                options: Default::default(),
+                options: four_spaces(),
                 work_done_progress_params: Default::default(),
             })
             .await
@@ -3087,7 +3171,7 @@ PostReference(
                 .range_formatting(DocumentRangeFormattingParams {
                     text_document: TextDocumentIdentifier { uri: url.clone() },
                     range,
-                    options: Default::default(),
+                    options: four_spaces(),
                     work_done_progress_params: Default::default(),
                 })
                 .await
