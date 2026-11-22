@@ -14,9 +14,11 @@ pub fn generate_code_actions(
     range: Range,
     context_diagnostics: &[Diagnostic],
 ) -> Vec<CodeActionOrCommand> {
-    let mut actions = Vec::new();
-
-    // Quick-fixes for diagnostics in the requested range (remove unknown/duplicate fields)
+    // Quick-fixes for diagnostics in the requested range: respell a misspelled
+    // field or variant as the name it was close to, or remove an
+    // unknown/duplicate field. The respelling comes first because it is the
+    // likelier intent, and the only one that keeps the value written.
+    let mut actions = generate_respell_actions(context_diagnostics, url);
     actions.extend(generate_remove_field_actions(
         tree,
         content,
@@ -36,6 +38,56 @@ pub fn generate_code_actions(
     ));
 
     actions
+}
+
+/// Quick-fixes that replace a name flagged as `unknown-field` or
+/// `unknown-variant` with the spelling its "did you mean" suggested, which the
+/// diagnostic carries as its `data`. A diagnostic without a suggestion gets
+/// nothing here.
+pub fn generate_respell_actions(diagnostics: &[Diagnostic], url: &Uri) -> Vec<CodeActionOrCommand> {
+    use super::diagnostics::codes;
+
+    diagnostics
+        .iter()
+        .filter_map(|diag| {
+            let respellable = matches!(
+                &diag.code,
+                Some(NumberOrString::String(c))
+                    if c == codes::UNKNOWN_FIELD || c == codes::UNKNOWN_VARIANT
+            );
+            let Some(LSPAny::String(name)) = diag.data.as_ref().filter(|_| respellable) else {
+                return None;
+            };
+            let mut action = single_file_action(
+                url,
+                format!("Change to '{name}'"),
+                CodeActionKind::QUICKFIX,
+                vec![TextEdit {
+                    range: diag.range,
+                    new_text: ron_identifier(name),
+                }],
+                Some(vec![diag.clone()]),
+            );
+            if let CodeActionOrCommand::CodeAction(action) = &mut action {
+                action.is_preferred = Some(true);
+            }
+            Some(action)
+        })
+        .collect()
+}
+
+/// `name` the way RON writes it as a field or variant name: as it is when it is
+/// a plain identifier, and as a raw identifier (`r#max-retries`) otherwise —
+/// the only way RON can spell a serde name such as a kebab-case rename.
+fn ron_identifier(name: &str) -> String {
+    let mut chars = name.chars();
+    let plain = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("r#{name}")
+    }
 }
 
 /// Quick-fixes that delete fields flagged as `unknown-field` or
@@ -2311,6 +2363,159 @@ mod tests {
             insert("Config(\r\n    host: \"x\" // c\r\n)", &[("port", "u16")]),
             "Config(\r\n    host: \"x\", // c\r\n    port: 0,\r\n)"
         );
+    }
+
+    /// A document with a misspelled field and a misspelled variant, nested and
+    /// at the root, alongside the analyzer and root type it is validated
+    /// against.
+    fn misspelled_fixture() -> (RustAnalyzer, TypeInfo) {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("max_connections", "u32"),
+                FieldInfo {
+                    rename: Some("retry-limit".to_string()),
+                    has_default: true,
+                    ..field("retry_limit", "u32")
+                },
+            ]),
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![field("mode", "Mode"), field("server", "Server")]),
+            ..Default::default()
+        };
+        analyzer.add_type(root.clone());
+        (analyzer, root)
+    }
+
+    /// The "did you mean" of an unknown field or variant is offered as the
+    /// quick-fix it describes. Only removing the field used to be offered,
+    /// which threw the value away along with the typo.
+    #[test]
+    fn test_respell_actions_fix_what_the_diagnostics_suggest() {
+        use super::super::diagnostics::validate_ron_with_analyzer;
+
+        let (analyzer, root) = misspelled_fixture();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let respell = |content: &str| {
+            let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
+            let tree = parse(content);
+            let edits: Vec<TextEdit> = generate_code_actions(
+                &tree,
+                content,
+                &root,
+                &url,
+                &analyzer,
+                WHOLE_DOCUMENT,
+                &diagnostics,
+            )
+            .into_iter()
+            .filter_map(|action| match action {
+                CodeActionOrCommand::CodeAction(a) if a.title.starts_with("Change to") => {
+                    assert_eq!(a.kind, Some(CodeActionKind::QUICKFIX));
+                    assert_eq!(a.is_preferred, Some(true));
+                    Some(a.edit.unwrap().changes.unwrap().remove(&url).unwrap())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+            apply(content, &edits)
+        };
+
+        assert_eq!(
+            respell(
+                "Cfg(\n    mode: Produktion,\n    server: Server(\n        max_conections: 5,\n    ),\n)"
+            ),
+            "Cfg(\n    mode: Production,\n    server: Server(\n        max_connections: 5,\n    ),\n)"
+        );
+
+        // A kebab-case name can only be written as a raw identifier: `ron`
+        // refuses a bare `retry-limit` and says to write `r#retry-limit`.
+        assert_eq!(
+            respell("Cfg(server: Server(max_connections: 5, retry_limit: 3))"),
+            "Cfg(server: Server(max_connections: 5, r#retry-limit: 3))"
+        );
+    }
+
+    /// Respelling has to leave a document the validator then accepts.
+    #[test]
+    fn test_respelled_document_validates() {
+        use super::super::diagnostics::validate_ron_with_analyzer;
+
+        let (analyzer, root) = misspelled_fixture();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "Cfg(\n    mode: Produktion,\n    server: Server(\n        max_conections: 5,\n    ),\n)";
+        let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
+        let edits: Vec<TextEdit> = generate_respell_actions(&diagnostics, &url)
+            .into_iter()
+            .flat_map(|action| match action {
+                CodeActionOrCommand::CodeAction(a) => {
+                    a.edit.unwrap().changes.unwrap().remove(&url).unwrap()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(edits.len(), 2, "one respelling per typo: {edits:?}");
+
+        // A respelled `r#retry-limit` is left out: the grammar does not read
+        // a raw identifier back yet (#68).
+        let fixed = apply(content, &edits);
+        let errors: Vec<_> = validate_ron_with_analyzer(&fixed, None, &root, &analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "the respelled document still has {errors:?}"
+        );
+    }
+
+    /// A name close to nothing serde accepts has no spelling to change to, and
+    /// a suggestion on any other code is not a respelling.
+    #[test]
+    fn test_no_respell_action_without_a_suggestion() {
+        use super::super::diagnostics::validate_ron_with_analyzer;
+
+        let (analyzer, root) = misspelled_fixture();
+        let content = "Cfg(mode: Zzz, unrelated: 1)";
+        let diagnostics = validate_ron_with_analyzer(content, None, &root, &analyzer);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("Unknown variant 'Zzz'"))
+        );
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        assert!(generate_respell_actions(&diagnostics, &url).is_empty());
+
+        let mismatch = Diagnostic {
+            code: Some(NumberOrString::String("type-mismatch".to_string())),
+            data: Some(LSPAny::String("true".to_string())),
+            ..Default::default()
+        };
+        assert!(generate_respell_actions(&[mismatch], &url).is_empty());
     }
 
     #[test]

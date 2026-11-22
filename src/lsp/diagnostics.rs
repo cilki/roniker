@@ -9,7 +9,9 @@ use crate::rust_analyzer::{
 };
 use ron::Value;
 use std::borrow::Cow;
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use tower_lsp_server::ls_types::{
+    Diagnostic, DiagnosticSeverity, LSPAny, NumberOrString, Position, Range,
+};
 use tree_sitter::Tree;
 
 /// Stable diagnostic codes. Clients and code actions can match on these
@@ -56,6 +58,30 @@ fn did_you_mean<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>)
     match closest_name(target, candidates) {
         Some(best) => format!(" (did you mean '{}'?)", best),
         None => String::new(),
+    }
+}
+
+/// An error for the misspelled name `target`, written at `range`, that serde
+/// would have accepted spelled as one of `candidates`. When one of them is a
+/// close match, `message` is followed by a "did you mean" suffix naming it, and
+/// the diagnostic's `data` carries it as a string: that is what the "Change
+/// to" quick-fix reads back to replace `range` with, since a client hands the
+/// diagnostic, `data` and all, back with its code action request.
+fn misspelled_name<'a>(
+    range: Range,
+    error_code: &str,
+    message: String,
+    target: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Diagnostic {
+    let suggestion = closest_name(target, candidates);
+    let message = match suggestion {
+        Some(best) => format!("{message} (did you mean '{best}'?)"),
+        None => message,
+    };
+    Diagnostic {
+        data: suggestion.map(|best| LSPAny::String(best.to_string())),
+        ..error(range, error_code, message)
     }
 }
 
@@ -230,18 +256,12 @@ fn validate_struct_node(
 
         let Some(field_info) = matching_field(&expected.fields, field_name) else {
             if !expected.allow_unknown_fields {
-                diagnostics.push(error(
+                diagnostics.push(misspelled_name(
                     name_range(),
                     codes::UNKNOWN_FIELD,
-                    format!(
-                        "Unknown field '{}'{}{}",
-                        field_name,
-                        expected.in_variant(),
-                        did_you_mean(
-                            field_name,
-                            expected.fields.iter().map(|(name, _)| name.as_str())
-                        )
-                    ),
+                    format!("Unknown field '{}'{}", field_name, expected.in_variant()),
+                    field_name,
+                    expected.fields.iter().map(|(name, _)| name.as_str()),
                 ));
             }
             continue;
@@ -760,15 +780,15 @@ fn unknown_variant(type_info: &TypeInfo, variant_name: &str, range: Range) -> Di
             .collect(),
         TypeKind::Struct(_) => Vec::new(),
     };
-    error(
+    misspelled_name(
         range,
         codes::UNKNOWN_VARIANT,
         format!(
-            "Unknown variant '{}' for enum '{}'{}",
-            variant_name,
-            type_info.name,
-            did_you_mean(variant_name, known.iter().map(|s| s.as_str()))
+            "Unknown variant '{}' for enum '{}'",
+            variant_name, type_info.name
         ),
+        variant_name,
+        known.iter().map(|s| s.as_str()),
     )
 }
 
