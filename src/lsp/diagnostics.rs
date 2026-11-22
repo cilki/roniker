@@ -3085,6 +3085,62 @@ mod tests {
         }
     }
 
+    /// A field declared through a type alias is validated as the type the
+    /// alias stands for. It used to be an `unknown-type` on a correct document,
+    /// and nothing written for it — a string for an aliased `u16`, a number for
+    /// a `String` inside an aliased struct — was ever reported.
+    #[cfg(feature = "analyze")]
+    #[test]
+    fn test_field_declared_through_alias_validated_as_its_target() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate::config",
+                r#"
+                pub struct Config {
+                    pub port: Port,
+                    pub server: Srv,
+                    pub names: Names,
+                }
+
+                pub struct Server {
+                    pub host: String,
+                }
+
+                pub type Port = u16;
+                pub type Srv = Server;
+                pub type Names = Vec<String>;
+                "#,
+            )
+            .unwrap();
+        let root = analyzer
+            .get_type_info("crate::config::Config")
+            .expect("Config")
+            .clone();
+
+        let errors = |content: &str| {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            errors(r#"Config(port: 1, server: Server(host: "h"), names: ["a"])"#),
+            empty
+        );
+        assert_eq!(
+            errors(r#"Config(port: "x", server: Server(host: 1), names: [2])"#),
+            [
+                "Type mismatch: expected u16, got string",
+                "Type mismatch: expected String, got number",
+                "Type mismatch: expected String, got number",
+            ]
+        );
+    }
+
     /// `Memory()` is refused by `ron` wherever the enum sits, so it is reported
     /// wherever the enum sits: the root's field, a `Vec` element, a map value,
     /// `Some(..)`, and a document whose root value is the variant itself.
