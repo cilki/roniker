@@ -166,7 +166,7 @@ pub(crate) fn std_type(clean: &str) -> Option<StdType> {
 /// zero in a *signed* `NonZero` is refused just the same but sits in the middle
 /// of the range rather than at an end, so a range cannot say so and it goes
 /// unreported — a missed error rather than a false one.
-pub(crate) fn integer_bounds(type_name: &str) -> Option<(i128, i128)> {
+pub(crate) fn integer_bounds(type_name: &str) -> Option<IntegerBounds> {
     if let Some(tail) = type_name.strip_prefix("NonZero") {
         // `NonZeroU32` and `NonZero<u32>` are the one type under the two
         // spellings Rust accepts, and a document writes both as the integer.
@@ -174,28 +174,38 @@ pub(crate) fn integer_bounds(type_name: &str) -> Option<(i128, i128)> {
             Some(argument) => Cow::Borrowed(argument),
             None => Cow::Owned(tail.to_ascii_lowercase()),
         };
-        let (min, max) = integer_bounds(&primitive)?;
+        let IntegerBounds { min, max } = integer_bounds(&primitive)?;
         // Only an unsigned range has the zero at its edge to raise.
-        return Some((if min == 0 { 1 } else { min }, max));
+        let min = if min == 0 { 1 } else { min };
+        return Some(IntegerBounds { min, max });
     }
-    Some(match type_name {
-        "i8" => (i8::MIN as i128, i8::MAX as i128),
-        "i16" => (i16::MIN as i128, i16::MAX as i128),
-        "i32" => (i32::MIN as i128, i32::MAX as i128),
-        "i64" => (i64::MIN as i128, i64::MAX as i128),
-        "isize" => (isize::MIN as i128, isize::MAX as i128),
-        "u8" => (0, u8::MAX as i128),
-        "u16" => (0, u16::MAX as i128),
-        "u32" => (0, u32::MAX as i128),
-        "u64" => (0, u64::MAX as i128),
-        "usize" => (0, usize::MAX as i128),
-        // Everything a RON integer literal can be fits in these, so there is
-        // nothing left to check — but they are still integer types, and saying
-        // so is what keeps a value in one from being reported as a non-numeric
-        // field.
-        "i128" | "u128" => (i128::MIN, i128::MAX),
+    let (min, max) = match type_name {
+        "i8" => (i8::MIN as i128, i8::MAX as u128),
+        "i16" => (i16::MIN as i128, i16::MAX as u128),
+        "i32" => (i32::MIN as i128, i32::MAX as u128),
+        "i64" => (i64::MIN as i128, i64::MAX as u128),
+        "i128" => (i128::MIN, i128::MAX as u128),
+        "isize" => (isize::MIN as i128, isize::MAX as u128),
+        "u8" => (0, u8::MAX as u128),
+        "u16" => (0, u16::MAX as u128),
+        "u32" => (0, u32::MAX as u128),
+        "u64" => (0, u64::MAX as u128),
+        "u128" => (0, u128::MAX),
+        "usize" => (0, usize::MAX as u128),
         _ => return None,
-    })
+    };
+    Some(IntegerBounds { min, max })
+}
+
+/// The inclusive range of an integer type, as [`integer_bounds`] gives it.
+///
+/// The two ends are of different types because no one Rust integer spans
+/// every type's range: the bottom of an `i128` is below anything a `u128`
+/// holds, and the top of a `u128` is above anything an `i128` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntegerBounds {
+    pub min: i128,
+    pub max: u128,
 }
 
 /// Whether `head` names a standard-library type, and so one whose module path
@@ -1103,13 +1113,15 @@ mod tests {
     /// for the unsigned ones outright, so one is the bottom of the range.
     #[test]
     fn test_integer_bounds_of_the_nonzero_family() {
-        assert_eq!(integer_bounds("NonZeroU8"), Some((1, u8::MAX as i128)));
-        assert_eq!(integer_bounds("NonZeroU32"), Some((1, u32::MAX as i128)));
+        let bounds = |min, max| Some(IntegerBounds { min, max });
+        assert_eq!(integer_bounds("NonZeroU8"), bounds(1, u8::MAX as u128));
+        assert_eq!(integer_bounds("NonZeroU32"), bounds(1, u32::MAX as u128));
+        assert_eq!(integer_bounds("NonZeroU128"), bounds(1, u128::MAX));
         assert_eq!(
             integer_bounds("NonZeroI32"),
-            Some((i32::MIN as i128, i32::MAX as i128))
+            bounds(i32::MIN as i128, i32::MAX as u128)
         );
-        assert_eq!(integer_bounds("NonZeroUsize").map(|(min, _)| min), Some(1));
+        assert_eq!(integer_bounds("NonZeroUsize").map(|b| b.min), Some(1));
 
         // `NonZero<u32>` is the same type under Rust's other spelling for it,
         // and has to be ranged the same way.

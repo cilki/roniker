@@ -12,7 +12,9 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
-ron = "0.12"
+# `integer128` so that a literal past the 64-bit range is read as the integer
+# it is, rather than as a float, wherever an `i128` or `u128` field holds one.
+ron = { version = "0.12", features = ["integer128"] }
 serde = { version = "1", features = ["derive"] }
 strsim = { version = "0.11", optional = true }
 

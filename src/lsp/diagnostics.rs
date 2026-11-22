@@ -4,7 +4,7 @@ use super::type_utils::{
     matching_field, missing_required_fields, normalize_type, short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{
-    FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
+    FieldInfo, IntegerBounds, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
 };
 use ron::Value;
 use std::borrow::Cow;
@@ -493,12 +493,12 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
             // field's type can hold it. Only a plain decimal literal is read
             // here, and RON's hexadecimal, binary and digit-separated forms
             // fall through to the full check.
-            let Some((min, max)) = integer_bounds(declared) else {
+            let Some(bounds) = integer_bounds(declared) else {
                 return false;
             };
             super::ts_utils::node_text(node, content)
-                .and_then(|text| text.parse::<i128>().ok())
-                .is_some_and(|literal| literal >= min && literal <= max)
+                .and_then(IntegerValue::parse)
+                .is_some_and(|literal| literal.within(bounds))
         }
         _ => false,
     }
@@ -1051,23 +1051,63 @@ fn literal_kind(trimmed: &str) -> Option<&'static str> {
     }
 }
 
-/// The exact value of an integer `ron::Number`, or `None` for a float.
+/// The exact value of an integer `ron::Number`.
 ///
 /// `ron` parses an integer literal into the narrowest variant that holds it, so
 /// the variant says nothing about the field's declared type — only the value
-/// matters here, and every integer variant `ron` yields fits in an `i128`.
-fn integer_value(n: &ron::Number) -> Option<i128> {
-    Some(match n {
-        ron::Number::I8(v) => i128::from(*v),
-        ron::Number::I16(v) => i128::from(*v),
-        ron::Number::I32(v) => i128::from(*v),
-        ron::Number::I64(v) => i128::from(*v),
-        ron::Number::U8(v) => i128::from(*v),
-        ron::Number::U16(v) => i128::from(*v),
-        ron::Number::U32(v) => i128::from(*v),
-        ron::Number::U64(v) => i128::from(*v),
-        _ => return None,
-    })
+/// matters here.
+#[derive(Clone, Copy)]
+enum IntegerValue {
+    Signed(i128),
+    /// Above `i128::MAX`, which only a `u128` holds.
+    Unsigned(u128),
+}
+
+impl IntegerValue {
+    /// The value of `n`, or `None` for a float.
+    fn of(n: &ron::Number) -> Option<Self> {
+        Some(match *n {
+            ron::Number::I8(v) => Self::Signed(v.into()),
+            ron::Number::I16(v) => Self::Signed(v.into()),
+            ron::Number::I32(v) => Self::Signed(v.into()),
+            ron::Number::I64(v) => Self::Signed(v.into()),
+            ron::Number::I128(v) => Self::Signed(v),
+            ron::Number::U8(v) => Self::Signed(v.into()),
+            ron::Number::U16(v) => Self::Signed(v.into()),
+            ron::Number::U32(v) => Self::Signed(v.into()),
+            ron::Number::U64(v) => Self::Signed(v.into()),
+            ron::Number::U128(v) => i128::try_from(v).map_or(Self::Unsigned(v), Self::Signed),
+            _ => return None,
+        })
+    }
+
+    /// The value written as `text`, a plain decimal literal; `None` for any
+    /// other spelling.
+    fn parse(text: &str) -> Option<Self> {
+        match text.parse::<i128>() {
+            Ok(v) => Some(Self::Signed(v)),
+            Err(_) => text.parse::<u128>().ok().map(Self::Unsigned),
+        }
+    }
+
+    fn within(self, IntegerBounds { min, max }: IntegerBounds) -> bool {
+        match self {
+            // A negative value is below every `max`, so only `min` can rule it
+            // out.
+            Self::Signed(v) => v >= min && (v < 0 || v as u128 <= max),
+            // Above `i128::MAX`, and so above every `min`.
+            Self::Unsigned(v) => v <= max,
+        }
+    }
+}
+
+impl std::fmt::Display for IntegerValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signed(v) => v.fmt(f),
+            Self::Unsigned(v) => v.fmt(f),
+        }
+    }
 }
 
 /// Check if a RON value matches the expected Rust type.
@@ -1110,9 +1150,9 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             } else if bounds.is_none() && !is_float_type {
                 // Not a numeric field at all.
                 return Some(format!("expected {}, got number", display_type));
-            } else if let Some((min, max)) = bounds
-                && let Some(literal) = integer_value(n)
-                && (literal < min || literal > max)
+            } else if let Some(bounds) = bounds
+                && let Some(literal) = IntegerValue::of(n)
+                && !literal.within(bounds)
             {
                 // An integer literal the field's type cannot hold: `ron`
                 // refuses the document with "Integer is out of bounds", so the
@@ -2592,6 +2632,11 @@ mod tests {
             ("i8", "-129"),
             ("i16", "32768"),
             ("i32", "2147483648"),
+            // A `u128` is as unsigned as a `u8`: `ron` refuses a negative one,
+            // and a zero for the `NonZero` spelling of it.
+            ("u128", "-1"),
+            ("NonZeroU128", "0"),
+            ("i128", "170141183460469231731687303715884105728"),
         ] {
             let errors = numeric_errors(type_name, literal);
             assert!(
@@ -2618,9 +2663,15 @@ mod tests {
             ("i16", "-32768"),
             ("i32", "2147483647"),
             ("i64", "-9223372036854775808"),
-            // Wide enough to hold every literal `ron` can hand back.
             ("i128", "18446744073709551615"),
             ("u128", "18446744073709551615"),
+            // Past the 64-bit range, where only the 128-bit types reach. These
+            // are integers like any other and must not be read as floats.
+            ("u128", "18446744073709551616"),
+            ("u128", "340282366920938463463374607431768211455"),
+            ("i128", "-9223372036854775809"),
+            ("i128", "-170141183460469231731687303715884105728"),
+            ("i128", "170141183460469231731687303715884105727"),
         ] {
             let errors = numeric_errors(type_name, literal);
             assert!(
