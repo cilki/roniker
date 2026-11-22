@@ -1133,9 +1133,10 @@ mod tests {
             "fast_mode"
         );
 
-        // Lookup by serialized name, with Rust-name fallback
+        // Lookup by serialized name only: serde rejects the Rust name of a
+        // field that rename_all renames
         assert!(config.find_field_serialized("maxConnections").is_some());
-        assert!(config.find_field_serialized("max_connections").is_some());
+        assert!(config.find_field_serialized("max_connections").is_none());
 
         // Every variant lookup goes through EnumVariant::accepts_name: the
         // serialized name, the Rust name, and the Rust name case-insensitively.

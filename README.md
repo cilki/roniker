@@ -362,7 +362,9 @@ your application will deserialize:
   produce a plain RON identifier are handled: `lowercase`, `UPPERCASE`,
   `PascalCase`, `camelCase`, `snake_case`, and `SCREAMING_SNAKE_CASE`. The
   `rename(deserialize = "...")` form is read too, since that's the direction a
-  config file travels.
+  config file travels. A renamed field written under its Rust name is reported
+  as `unknown-field`, suggesting the serde name: serde ignores that key, so the
+  value never reaches your application.
 - `#[serde(alias = "...")]` names are accepted alongside the primary one — on a
   struct field. An alias on an *enum variant* is dropped by the analyzer, so the
   `mode: production` serde accepts for an aliased `Prod` is reported as

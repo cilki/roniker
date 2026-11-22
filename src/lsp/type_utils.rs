@@ -247,9 +247,10 @@ pub fn closest_name<'a>(
 /// The fields the RON doesn't supply. Takes `(serialized_name, field)` pairs
 /// (see `TypeInfo::effective_fields` / `EnumVariant::effective_fields`); a
 /// field counts as present under any name serde would accept for it — its
-/// serialized name, its Rust name, or any `#[serde(alias = "...")]`. Missing
-/// the aliases here would report a field as absent even though the
-/// unknown-field check just accepted the alias that supplies it.
+/// serialized name or any `#[serde(alias = "...")]`. Missing the aliases here
+/// would report a field as absent even though the unknown-field check just
+/// accepted the alias that supplies it. The Rust name of a renamed field is not
+/// one of them: serde rejects it, so it supplies nothing.
 ///
 /// This is the one rule the diagnostics, the field-name completion and the
 /// missing-field quick-fixes all decide presence by, so none of them can
@@ -258,25 +259,25 @@ pub fn missing_fields(
     fields: &[(String, FieldInfo)],
     is_present: impl Fn(&str) -> bool,
 ) -> impl Iterator<Item = &(String, FieldInfo)> {
-    fields.iter().filter(move |(name, f)| {
-        !is_present(name) && !is_present(&f.name) && !f.aliases.iter().any(|a| is_present(a))
-    })
+    fields
+        .iter()
+        .filter(move |(name, f)| !is_present(name) && !f.aliases.iter().any(|a| is_present(a)))
 }
 
 /// The field of `fields` that serde would fill from a RON field named
 /// `field_name`: the one whose serialized name — as the *containing* type
 /// spells it, which for a flattened field is not what the field's own container
-/// would produce — matches, or that accepts the name itself (its Rust name, an
-/// alias). The counterpart of [`missing_fields`]: a name this matches is one
-/// that counts as present there, so the diagnostics and the quick-fixes cannot
-/// disagree about which field a document's name supplies.
+/// would produce — matches, or that has the name as an alias. The counterpart
+/// of [`missing_fields`]: a name this matches is one that counts as present
+/// there, so the diagnostics and the quick-fixes cannot disagree about which
+/// field a document's name supplies.
 pub fn matching_field<'a>(
     fields: &'a [(String, FieldInfo)],
     field_name: &str,
 ) -> Option<&'a FieldInfo> {
     fields
         .iter()
-        .find(|(name, f)| *name == field_name || f.accepts_name(field_name, None))
+        .find(|(name, f)| *name == field_name || f.answers_to_alias(field_name))
         .map(|(_, f)| f)
 }
 
@@ -641,9 +642,10 @@ mod tests {
             missing_required_fields(&fields, |n| n == "debugMode").is_empty(),
             "a field supplied under its serialized name is present"
         );
-        assert!(
-            missing_required_fields(&fields, |n| n == "debug_mode").is_empty(),
-            "a field supplied under its Rust name is present"
+        assert_eq!(
+            missing_required_fields(&fields, |n| n == "debug_mode").len(),
+            1,
+            "serde rejects a renamed field's Rust name, so it supplies nothing"
         );
         assert_eq!(
             missing_required_fields(&fields, |_| false).len(),

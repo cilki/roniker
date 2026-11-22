@@ -3479,15 +3479,23 @@ mod tests {
             diagnostics
         );
 
-        // The Rust name is tolerated as a lenient fallback
+        // serde does not accept the Rust name once rename_all applies: it is
+        // an unknown key, and `ron::from_str` fails on this document with
+        // "missing field maxConnections". So the name is reported, pointed at
+        // the spelling serde wants, and the field it meant to supply is still
+        // missing.
         let content = "(max_connections: 5)";
         let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
         assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
-            "Rust name fallback should be accepted. Got: {:?}",
-            diagnostics
+            messages.contains(&"Unknown field 'max_connections' (did you mean 'maxConnections'?)"),
+            "Rust name of a renamed field should be unknown. Got: {:?}",
+            messages
+        );
+        assert!(
+            messages.contains(&"Required fields: maxConnections"),
+            "Rust name of a renamed field should not supply it. Got: {:?}",
+            messages
         );
 
         // A missing required field is reported under its serialized name
@@ -3524,6 +3532,23 @@ mod tests {
                 .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
             "Renamed field should be accepted. Got: {:?}",
             diagnostics
+        );
+
+        // An explicit rename retires the Rust name, as serde does
+        let content = r#"(config_kind: "full")"#;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Unknown field 'config_kind'")),
+            "Rust name of a renamed field should be unknown. Got: {:?}",
+            messages
+        );
+        assert!(
+            messages.contains(&"Required fields: kind"),
+            "Rust name of a renamed field should not supply it. Got: {:?}",
+            messages
         );
 
         let content = r#"(totally_unknown: "full")"#;

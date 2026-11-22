@@ -439,12 +439,21 @@ impl FieldInfo {
     }
 
     /// Whether serde would accept `name` for this field when deserializing:
-    /// its serialized name (honoring rename/rename_all), its Rust name, or any
+    /// its serialized name (honoring rename/rename_all) or any
     /// `#[serde(alias = "...")]`.
+    ///
+    /// The Rust name is not among them once a rename applies: serde's derived
+    /// deserializer matches only the serialized name and the aliases, so a key
+    /// that spells a renamed field the way the Rust source does is an unknown
+    /// field. It supplies nothing — a required field is then missing, and an
+    /// optional one silently keeps its default.
     pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
-        self.name == name
-            || self.serialized_name(container_rename_all) == name
-            || self.aliases.iter().any(|a| a == name)
+        self.serialized_name(container_rename_all) == name || self.answers_to_alias(name)
+    }
+
+    /// Whether `name` is one of this field's `#[serde(alias = "...")]` names.
+    pub fn answers_to_alias(&self, name: &str) -> bool {
+        self.aliases.iter().any(|a| a == name)
     }
 }
 
@@ -644,7 +653,8 @@ impl TypeInfo {
     }
 
     /// Find a field by the name serde expects in the serialized form
-    /// (honoring rename/rename_all), falling back to the Rust field name.
+    /// (honoring rename/rename_all) or one of its aliases — see
+    /// [`FieldInfo::accepts_name`].
     pub fn find_field_serialized(&self, field_name: &str) -> Option<&FieldInfo> {
         let rename_all = self.rename_all.as_deref();
         match &self.kind {
