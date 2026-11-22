@@ -242,6 +242,12 @@ Opening a RON file matched by the pattern above gets you:
     it (`server.tls`, `mode::Prod`, `certs[1]`). The fields go into that value's
     own parentheses. Only the required-field form is offered here; there is no
     *Add all* counterpart below the root
+  - *Change to '...'*, offered as the preferred quick-fix on an
+    `unknown-field` or `unknown-variant` whose message carries a "did you
+    mean", at whatever depth it was reported. It replaces the misspelled name
+    with the suggested one, which travels as the diagnostic's `data`; a name
+    that isn't a plain identifier, such as a kebab-case rename, is written as
+    the raw identifier `ron` requires (`r#max-retries`)
   - *Remove field '...'*, offered as a quick-fix on `unknown-field` and
     `duplicate-field`, at whatever depth the diagnostic was reported
   - *Make struct name explicit: Configuration* and *Make field type explicit:
