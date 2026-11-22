@@ -784,12 +784,24 @@ impl RustAnalyzer {
     /// Register a type directly with the analyzer.
     ///
     /// This is useful when you have pre-constructed TypeInfo objects.
-    pub fn add_type(&mut self, type_info: TypeInfo) {
+    ///
+    /// Any registered type alias the type's fields are declared through is
+    /// replaced by what it stands for; see [`Self::add_type_alias`].
+    pub fn add_type(&mut self, mut type_info: TypeInfo) {
+        expand_field_aliases(&mut type_info, &self.type_aliases);
         self.type_cache.insert(type_info.name.clone(), type_info);
         self.invalidate_derived();
     }
 
     /// Register a type alias.
+    ///
+    /// A field declared through the alias is then read as the type it stands
+    /// for, wherever in the declared type the alias appears (`Port`,
+    /// `Option<Port>`, `Vec<Port>`). That holds for the types registered before
+    /// the alias as well as after it, so the order a build script adds its
+    /// files in doesn't matter. A field names an alias the way it names a type,
+    /// so the alias resolves under any `::`-delimited tail of its path. Generic
+    /// aliases (`type Pair<T> = (T, T)`) are not expanded.
     ///
     /// # Arguments
     /// * `alias` - The alias name (e.g., "crate::MyAlias")
@@ -797,6 +809,15 @@ impl RustAnalyzer {
     pub fn add_type_alias(&mut self, alias: &str, target: &str) {
         self.type_aliases
             .insert(alias.to_string(), target.to_string());
+
+        // Types registered before this alias were expanded without it.
+        // Expansion is idempotent, so redoing it for every type is enough.
+        let mut types = std::mem::take(&mut self.type_cache);
+        for type_info in types.values_mut() {
+            expand_field_aliases(type_info, &self.type_aliases);
+        }
+        self.type_cache = types;
+        self.invalidate_derived();
     }
 
     /// Remove a type from the analyzer.
@@ -982,6 +1003,102 @@ impl RustAnalyzer {
             None => Some(clean.into_owned()),
         }
     }
+}
+
+/// How many aliases deep [`expand_type_aliases`] follows one alias into
+/// another. Rust rejects a cyclic alias, so this only bounds a cycle handed
+/// to [`RustAnalyzer::add_type_alias`] by hand.
+const ALIAS_EXPANSION_DEPTH: usize = 8;
+
+/// Rewrite the declared type of every field of `type_info`, a variant's
+/// fields included, with the aliases in `aliases` expanded.
+fn expand_field_aliases(type_info: &mut TypeInfo, aliases: &HashMap<String, String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let fields: Vec<&mut FieldInfo> = match &mut type_info.kind {
+        TypeKind::Struct(fields) => fields.iter_mut().collect(),
+        TypeKind::Enum(variants) => variants.iter_mut().flat_map(|v| &mut v.fields).collect(),
+    };
+    for field in fields {
+        if let Some(expanded) =
+            expand_type_aliases(&field.type_name, aliases, ALIAS_EXPANSION_DEPTH)
+        {
+            field.type_name = expanded;
+        }
+    }
+}
+
+/// `type_name` with every path in it that names one of `aliases` replaced by
+/// the alias's target, itself expanded; `None` when nothing in it is an alias.
+///
+/// The rest of the crate reads a declared type by its spelling — `u16`,
+/// `Vec<..>`, `Option<..>` or the name of a registered type — so a field
+/// declared through an alias was unrecognisable to every one of those checks
+/// and got `unknown-type`, while what was written for it went unchecked.
+///
+/// A path followed by `<` is left alone: that is a generic alias, whose
+/// parameters would have to be substituted into the target.
+fn expand_type_aliases(
+    type_name: &str,
+    aliases: &HashMap<String, String>,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    let is_path_char = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
+
+    let mut out = String::with_capacity(type_name.len());
+    let mut changed = false;
+    let mut rest = type_name;
+    while let Some(start) = rest.find(is_path_char) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let end = after_start
+            .find(|c: char| !is_path_char(c))
+            .unwrap_or(after_start.len());
+        let (path, after) = after_start.split_at(end);
+        rest = after;
+
+        let generic = after.trim_start().starts_with('<');
+        match lookup_alias(path, aliases).filter(|_| !generic) {
+            Some(target) => {
+                changed = true;
+                match expand_type_aliases(target, aliases, depth - 1) {
+                    Some(expanded) => out.push_str(&expanded),
+                    None => out.push_str(target),
+                }
+            }
+            None => out.push_str(path),
+        }
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// The target of the alias `path` names: the alias registered under exactly
+/// that path, or else one whose path ends in it at a `::` boundary, the way a
+/// field declaration names a type by a tail of its path.
+fn lookup_alias<'a>(path: &str, aliases: &'a HashMap<String, String>) -> Option<&'a str> {
+    let path = path.trim_start_matches("::");
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(target) = aliases.get(path) {
+        return Some(target);
+    }
+    // Two aliases sharing the tail resolve to the same one every time, rather
+    // than to whichever the map iterates first.
+    aliases
+        .iter()
+        .filter(|(alias, _)| {
+            alias
+                .strip_suffix(path)
+                .is_some_and(|prefix| prefix.ends_with("::"))
+        })
+        .min_by_key(|(alias, _)| alias.as_str())
+        .map(|(_, target)| target.as_str())
 }
 
 #[cfg(feature = "analyze")]

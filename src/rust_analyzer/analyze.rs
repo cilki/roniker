@@ -112,12 +112,10 @@ impl RustAnalyzer {
                     module_prefix,
                     file_path,
                 )),
-                Item::Type(item) => {
-                    self.type_aliases.insert(
-                        qualified_name(module_prefix, &item.ident.to_string()),
-                        type_to_string(&item.ty),
-                    );
-                }
+                Item::Type(item) => self.add_type_alias(
+                    &qualified_name(module_prefix, &item.ident.to_string()),
+                    &type_to_string(&item.ty),
+                ),
                 // Recurse into inline modules, extending the module path.
                 Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
@@ -752,6 +750,89 @@ mod tests {
         let via_alias = analyzer.get_type_info("crate::AliasType");
         assert!(via_alias.is_some());
         assert_eq!(via_alias.unwrap().name, "crate::RealType");
+    }
+
+    /// A field declared through an alias has to read as the type the alias
+    /// stands for: every type check downstream goes by the declared type's
+    /// spelling, so `port: Port` for `type Port = u16` was an `unknown-type`
+    /// with nothing written for it checked. Aliases declared after the struct,
+    /// chained through each other, wrapped, inside a module or reached through
+    /// a tail of their path all count; a generic alias is left as written.
+    #[test]
+    fn test_type_alias_expanded_in_field_types() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate::config",
+                r#"
+                pub type Port = u16;
+
+                pub struct Config {
+                    pub port: Port,
+                    pub backup: Option<Port>,
+                    pub names: Names,
+                    pub server: Srv,
+                    pub tls: net::Cert,
+                    pub pair: Pair<u8>,
+                    pub qualified: crate::config::Port,
+                }
+
+                pub enum Mode {
+                    Fixed(Port),
+                    Named { name: Name },
+                }
+
+                pub type Names = Vec<Name>;
+                pub type Name = String;
+                pub type Srv = Server;
+                pub type Pair<T> = (T, T);
+
+                pub struct Server {
+                    pub host: Name,
+                }
+
+                pub mod net {
+                    pub type Cert = std::path::PathBuf;
+                }
+                "#,
+            )
+            .unwrap();
+
+        let field_types = |path: &str| -> Vec<String> {
+            let info = analyzer.get_type_info(path).expect(path);
+            match &info.kind {
+                TypeKind::Struct(fields) => fields.iter().map(|f| f.type_name.clone()).collect(),
+                TypeKind::Enum(variants) => variants
+                    .iter()
+                    .flat_map(|v| &v.fields)
+                    .map(|f| f.type_name.clone())
+                    .collect(),
+            }
+        };
+
+        assert_eq!(
+            field_types("crate::config::Config"),
+            [
+                "u16",
+                "Option<u16>",
+                "Vec<String>",
+                "Server",
+                "std::path::PathBuf",
+                "Pair<u8>",
+                "u16",
+            ]
+        );
+        assert_eq!(field_types("crate::config::Mode"), ["u16", "String"]);
+        assert_eq!(field_types("crate::config::Server"), ["String"]);
+
+        // Nothing declared through an alias is left for the build-script check
+        // to report, apart from the generic alias it can't see through.
+        let unknown: Vec<_> = analyzer
+            .validate_field_types()
+            .into_iter()
+            .map(|(_, field, _)| field)
+            .collect();
+        assert_eq!(unknown, ["pair"]);
     }
 
     #[test]
