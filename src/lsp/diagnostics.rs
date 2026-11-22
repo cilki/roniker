@@ -1,7 +1,7 @@
 use super::type_utils::{
-    MAP_WRAPPERS, SEQUENCE_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type,
-    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, matching_field,
-    missing_required_fields, normalize_type, short_name, tuple_element_types,
+    MAP_WRAPPERS, SEQUENCE_WRAPPERS, SET_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name,
+    extract_inner_type, is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types,
+    matching_field, missing_required_fields, normalize_type, short_name, tuple_element_types,
 };
 use crate::rust_analyzer::{
     FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
@@ -21,6 +21,20 @@ pub mod codes {
     pub const UNKNOWN_VARIANT: &str = "unknown-variant";
     pub const UNKNOWN_TYPE: &str = "unknown-type";
     pub const TYPE_MISMATCH: &str = "type-mismatch";
+}
+
+/// The standard-library collections RON writes as an array of their elements:
+/// the sequences and the sets alike. `ron` reads a `HashSet<u16>` exactly the
+/// way it reads a `Vec<u16>` — brackets, and every element a `u16` — so the
+/// validator holds both to the same rules.
+fn array_wrappers() -> impl Iterator<Item = &'static str> {
+    SEQUENCE_WRAPPERS.into_iter().chain(SET_WRAPPERS)
+}
+
+/// The element type of a collection RON writes as an array, if `clean` (an
+/// already-normalized type name) is one.
+fn array_element_type(clean: &str) -> Option<&str> {
+    array_wrappers().find_map(|wrapper| extract_inner_type(clean, wrapper))
 }
 
 fn code(code: &str) -> Option<NumberOrString> {
@@ -451,10 +465,7 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
     {
         return !is_custom_type(inner) && tree_satisfies(node, content, inner);
     }
-    if let Some(element) = SEQUENCE_WRAPPERS
-        .iter()
-        .find_map(|wrapper| extract_inner_type(declared, wrapper))
-    {
+    if let Some(element) = array_element_type(declared) {
         return !is_custom_type(element)
             && node.kind() == "array"
             && super::ts_utils::array_elements(node)
@@ -562,11 +573,9 @@ fn validate_nested_value<'a>(
     let unregistered =
         |inner: &str| is_custom_type(inner) && analyzer.get_type_info(inner).is_none();
 
-    if let Some(inner_type) = SEQUENCE_WRAPPERS
-        .iter()
-        .find_map(|wrapper| extract_inner_type(&field_type_normalized, wrapper))
-    {
-        // A `Vec<T>` written as an array: every element is validated against
+    if let Some(inner_type) = array_element_type(&field_type_normalized) {
+        // A `Vec<T>` (or a `HashSet<T>`, which RON writes the same way)
+        // written as an array: every element is validated against
         // `T` exactly the way a field's value is validated against the field's
         // type, so an element of the wrong shape is reported where it is
         // written rather than at the array as a whole — and an element that is
@@ -1119,17 +1128,14 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
             return Some(format!("expected {}, got string", display_type));
         }
         Value::Seq(_) => {
-            if is_wrapped_by(&clean_type, &SEQUENCE_WRAPPERS) {
-                // [`validate_nested_value`] walks a `Vec` written as an array
-                // element by element and never falls back on this, so the
-                // `Seq` here is the tuple spelling — `(1, 2)` — which `ron`
-                // refuses for a `Vec` ("Expected opening `[`").
+            if array_wrappers().any(|wrapper| clean_type.starts_with(wrapper)) {
+                // [`validate_nested_value`] walks a `Vec` or a set written as
+                // an array element by element and never falls back on this,
+                // so the `Seq` here is the tuple spelling — `(1, 2)` — which
+                // `ron` refuses for either ("Expected opening `[`").
                 return Some(format!(
                     "{display_type} is written as an array, not a tuple"
                 ));
-            } else if clean_type.contains("HashSet<") || clean_type.contains("BTreeSet<") {
-                // Sets are serialized as arrays in RON
-                return None;
             } else if clean_type.starts_with("Result<") {
                 // Result variants like Ok(...) and Err(...) are serialized as tuples/arrays
                 return None;
@@ -2169,6 +2175,95 @@ mod tests {
                 "{literal} in {type_name} is a std composite, not an unknown type: {errors:?}"
             );
         }
+    }
+
+    /// A set is written exactly like a `Vec` — brackets, and every element of
+    /// the set's element type — and `ron` refuses it on the same terms. Sets
+    /// used to be waved through whatever they held: `[70000]` for a
+    /// `HashSet<u16>`, `["a"]` for a `BTreeSet<u8>` and the tuple spelling
+    /// `(1, 2)` all passed, and then failed to load.
+    #[test]
+    fn test_set_is_checked_like_a_vec() {
+        for (type_name, literal, expected) in [
+            (
+                "HashSet<u16>",
+                "[1, 70000]",
+                "70000 is out of range for u16",
+            ),
+            ("BTreeSet<u8>", r#"["a"]"#, "expected u8, got string"),
+            (
+                "std::collections::HashSet<String>",
+                "[1]",
+                "expected String, got number",
+            ),
+            ("HashSet<u8>", "(1, 2)", "written as an array, not a tuple"),
+            ("BTreeSet<u8>", "(1, 2)", "written as an array, not a tuple"),
+            ("Option<HashSet<u8>>", "Some([256])", "out of range for u8"),
+            (
+                "HashSet<(u8, bool)>",
+                "[(1, 2)]",
+                "expected bool, got number",
+            ),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
+            );
+        }
+
+        // What `ron` reads into a set raises nothing — duplicates included,
+        // which the set simply folds together.
+        for (type_name, literal) in [
+            ("HashSet<u16>", "[]"),
+            ("HashSet<u16>", "[1, 2, 1]"),
+            ("BTreeSet<String>", r#"["a", r"b"]"#),
+            ("HashSet<(u8, bool)>", "[(1, true)]"),
+        ] {
+            assert_eq!(
+                numeric_errors(type_name, literal),
+                Vec::<String>::new(),
+                "{literal} in {type_name}"
+            );
+        }
+    }
+
+    /// A set of a struct or enum is walked element by element, the way a `Vec`
+    /// of one is, so a bad element is reported where it is written.
+    #[test]
+    fn test_set_of_custom_type_is_checked_per_element() {
+        let mode = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Fast".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let root = single_field_type("HashSet<Mode>");
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(mode);
+
+        let content = "Cfg(n: [\n    Fast,\n    Slow,\n])";
+        let errors: Vec<_> = validate_ron_with_analyzer(content, None, &root, &analyzer)
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 1, "Got: {errors:?}");
+        assert!(
+            errors[0].message.contains("Unknown variant 'Slow'"),
+            "Got: {errors:?}"
+        );
+        assert_eq!(errors[0].range.start.line, 2, "Got: {errors:?}");
+
+        let content = "Cfg(n: [Fast])";
+        assert_eq!(
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            0
+        );
     }
 
     /// A map or a struct written where something else belongs used to pass

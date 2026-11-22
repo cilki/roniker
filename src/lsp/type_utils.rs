@@ -57,8 +57,8 @@ pub const TRANSPARENT_WRAPPERS: [&str; 8] = [
 /// Standard-library sequences, which RON writes as an array of their elements
 /// and which therefore ask of a value exactly what a `Vec<T>` would.
 ///
-/// The sets (`HashSet`, `BTreeSet`) are written the same way but are checked as
-/// a whole rather than element by element, so they are not in this list.
+/// The sets (`HashSet`, `BTreeSet`) are written the same way, and validated the
+/// same way, but are kept in [`SET_WRAPPERS`] of their own.
 pub const SEQUENCE_WRAPPERS: [&str; 4] = ["Vec<", "VecDeque<", "LinkedList<", "BinaryHeap<"];
 
 /// Standard-library sets, which RON writes as an array exactly like the
