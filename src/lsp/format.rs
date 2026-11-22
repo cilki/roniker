@@ -100,20 +100,26 @@ fn is_trailing_comment_in_context(
 ///
 /// The server itself never needs this: an open document's tree is already in
 /// hand, so a whole document goes through [`format_tree`] and a selection
-/// through [`format_ron_with_line_ending`]. Tests format from text.
+/// through [`format_selection`]. Tests format from text.
 #[cfg(test)]
 pub fn format_ron(content: &str) -> String {
-    format_ron_with_line_ending(content, ts_utils::line_ending(content))
+    format_selection(content, ts_utils::line_ending(content), "")
 }
 
-/// Lay `content` out, ending every line with `newline` rather than with
-/// whatever `content` itself uses.
+/// Lay `content` out as text cut out of a larger document — a
+/// range-formatting selection — that sits on a line indented by `base`.
 ///
-/// For text cut out of a larger document — a range-formatting selection — whose
-/// own line endings, if it even has a line break, don't say what the document's
-/// are.
-pub fn format_ron_with_line_ending(content: &str, newline: &'static str) -> String {
-    layout(&ts_utils::parse(content), content, newline)
+/// Every line ends with `newline` rather than with whatever `content` itself
+/// uses: the selection's own line endings, if it even has a line break, don't
+/// say what the document's are.
+///
+/// Every line but the first starts with `base`. The first line is already
+/// where the selection starts in the document, but the ones after it are
+/// written from column 0: without `base`, a nested value selected on an
+/// indented line had its fields and its closing bracket pulled out to the
+/// left margin, at or before the column of the line that opened it.
+pub fn format_selection(content: &str, newline: &'static str, base: &str) -> String {
+    layout(&ts_utils::parse(content), content, newline, base)
 }
 
 /// Lay `content` out, whose parse tree the caller already has.
@@ -123,13 +129,13 @@ pub fn format_ron_with_line_ending(content: &str, newline: &'static str) -> Stri
 /// recorded, so a tree belonging to different text would reproduce that text's
 /// contents.
 pub fn format_tree(tree: &Tree, content: &str) -> String {
-    layout(tree, content, ts_utils::line_ending(content))
+    layout(tree, content, ts_utils::line_ending(content), "")
 }
 
 /// Lay out `content`, whose parse tree is `tree`, ending each line written with
-/// `newline`. Comments and other leaves are copied verbatim, line breaks inside
-/// them included.
-fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
+/// `newline` and starting each but the first with `base`. Comments and other
+/// leaves are copied verbatim, line breaks inside them included.
+fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str) -> String {
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
     if ts_utils::exceeds_max_depth(&tree.root_node()) {
@@ -153,6 +159,7 @@ fn layout(tree: &Tree, content: &str, newline: &'static str) -> String {
     let mut formatter = Formatter {
         content,
         newline,
+        base,
         output: String::new(),
         malformed: false,
         prev_end: None,
@@ -197,6 +204,10 @@ struct Formatter<'a> {
     content: &'a str,
     /// What every line written ends with: the document's own line terminator.
     newline: &'static str,
+    /// What every line written starts with, ahead of its own indentation —
+    /// the indentation of the line a selection sits on — bar the first, which
+    /// continues the line the text was cut from.
+    base: &'a str,
     output: String,
     /// Set when the tree holds something RON can't parse that tree-sitter
     /// accepted anyway, and that the layout would lose part of.
@@ -235,8 +246,12 @@ impl Formatter<'_> {
         }
     }
 
-    /// Write `level` levels of indentation.
+    /// Write `level` levels of indentation, after the base indentation unless
+    /// this is the first line.
     fn indent(&mut self, level: usize) {
+        if !self.output.is_empty() {
+            self.output.push_str(self.base);
+        }
         for _ in 0..level {
             self.output.push_str(INDENT);
         }
@@ -872,7 +887,7 @@ Post(
 
         // A selection without a line break of its own takes the document's.
         assert_eq!(
-            format_ron_with_line_ending("Inner(a: 1)", "\r\n"),
+            format_selection("Inner(a: 1)", "\r\n", ""),
             "Inner(\r\n    a: 1,\r\n)"
         );
         assert_eq!(format_ron("Inner(a: 1)"), "Inner(\n    a: 1,\n)");
@@ -887,5 +902,25 @@ Post(
         let expected = "// top\r\n\r\nConfig(\r\n    a: 1,\r\n\r\n    // net\r\n    b: 2,\r\n)";
         assert_eq!(format_ron(input), expected);
         assert_eq!(format_ron(expected), expected, "formatting is idempotent");
+    }
+
+    /// A selection on an indented line is laid out at that line's
+    /// indentation: everything after its first line, the closing bracket
+    /// included, starts with the line's own indentation, while the first line
+    /// — already where the selection starts — and blank lines get none.
+    #[test]
+    fn test_selection_keeps_its_line_indentation() {
+        let input = "// lead\nInner(a: 1,\n\nb: [2], // two\n)";
+        assert_eq!(
+            format_selection(input, "\n", "\t"),
+            "// lead\n\tInner(\n\t    a: 1,\n\n\t    b: [\n\t        2,\n\t    ], // two\n\t)"
+        );
+
+        // A multi-line string is a leaf, copied as written: indenting its
+        // lines would change the value it holds.
+        assert_eq!(
+            format_selection("Inner(a: \"x\ny\")", "\n", "  "),
+            "Inner(\n      a: \"x\ny\",\n  )"
+        );
     }
 }

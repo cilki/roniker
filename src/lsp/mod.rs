@@ -419,11 +419,21 @@ impl LanguageServer for Backend {
         let value = trimmed_start.trim_end();
         let trailing = &trimmed_start[value.len()..];
 
+        // The value's lines after its first are indented from the line it
+        // starts on, so a nested value closes at the column of the line that
+        // opened it instead of at the left margin.
+        let value_start = start + leading.len();
+        let line_start = doc.content[..value_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = &doc.content[line_start..value_start];
+        let base = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+
         // Lines end the way the document's do: a selection on one line has no
         // line break of its own to go by.
         let formatted = format!(
             "{leading}{}{trailing}",
-            format::format_ron_with_line_ending(value, ts_utils::line_ending(&doc.content))
+            format::format_selection(value, ts_utils::line_ending(&doc.content), base)
         );
         if formatted == selected_text {
             return Ok(None);
@@ -3036,14 +3046,16 @@ PostReference(
             .unwrap()
             .expect("the selected value should be reformatted");
 
+        // The selection starts on a line indented by four spaces, so its lines
+        // after the first are too: `)` closes under `title`, where the line
+        // that opened it starts.
         assert_eq!(
             edits,
             vec![TextEdit {
                 range,
-                new_text: format::format_ron("User(id:1,\nname:\"Bob\")"),
+                new_text: "User(\n        id: 1,\n        name: \"Bob\",\n    )".to_string(),
             }]
         );
-        assert_eq!(edits[0].new_text, "User(\n    id: 1,\n    name: \"Bob\",\n)");
     }
 
     /// A selection of whole lines ends at column 0 of the line after it, and a
@@ -3118,7 +3130,7 @@ PostReference(
             format(lines).await,
             Some(vec![TextEdit {
                 range: lines,
-                new_text: "    [\n    \"a\",\n    \"b\",\n]\n".to_string(),
+                new_text: "    [\n        \"a\",\n        \"b\",\n    ]\n".to_string(),
             }])
         );
     }
