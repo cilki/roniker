@@ -844,6 +844,18 @@ Post(
         }
     }
 
+    /// A signed literal `ron` reads — `+80`, `-inf`, `+NaN` — is laid out like
+    /// any other, sign and all. The grammar knew no `+` and no sign on `inf` or
+    /// `NaN`, so a document holding one parsed with an `ERROR` in it and was
+    /// left alone: format-on-save did nothing to a perfectly valid file.
+    #[test]
+    fn test_signed_literals_are_formatted() {
+        let input = "Cfg(port: +80, lo: -inf, hi: +inf, nan: Some(-NaN), xs: [+1.5, -2])";
+        let expected = "Cfg(\n    port: +80,\n    lo: -inf,\n    hi: +inf,\n    nan: Some(-NaN),\n    xs: [\n        +1.5,\n        -2,\n    ],\n)";
+        assert_eq!(format_ron(input), expected);
+        assert_eq!(format_ron(expected), expected, "formatting is idempotent");
+    }
+
     /// A field name typed without its colon yet — `debug` among `name: value`
     /// fields — isn't RON, but the grammar takes it as a tuple-style value in
     /// a field-style struct and reports no error. Laying out only the fields

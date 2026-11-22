@@ -2022,6 +2022,43 @@ mod tests {
         }
     }
 
+    /// `ron` reads a sign on any number, `inf` and `NaN` included. The grammar
+    /// knew only a `-` on digits, so `-inf` and `+80` each parsed as an `ERROR`
+    /// next to a value, and what they were written for went unchecked: `-inf`
+    /// for a `u16`, which `ron` refuses, passed without a word.
+    #[test]
+    fn test_signed_number_is_checked_against_the_declared_type() {
+        for (type_name, literal) in [
+            ("u16", "+80"),
+            ("u8", "+0x10"),
+            ("u8", "+5u8"),
+            ("f64", "-inf"),
+            ("f64", "+inf"),
+            ("f32", "-NaN"),
+            ("f64", "+1.5"),
+            ("Option<f64>", "Some(-inf)"),
+            ("Vec<f64>", "[+NaN, -inf, +2]"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        for (type_name, literal, expected) in [
+            ("u16", "-inf", "expected u16, got float"),
+            ("u8", "+300", "300 is out of range for u8"),
+            ("bool", "+1", "expected bool, got number"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{literal} for {type_name} should report '{expected}', got {errors:?}"
+            );
+        }
+    }
+
     /// A char literal deserializes into a `char` and nothing else: `ron` refuses
     /// `'a'` for a string ("Expected string"), a number or a bool. It used to
     /// pass every check, so a config holding one looked clean in the editor and

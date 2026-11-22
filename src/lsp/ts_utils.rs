@@ -109,6 +109,31 @@ pub fn mask_for_grammar(content: &str) -> Cow<'_, str> {
                     out[i - suffix.len()..i].fill(b'_');
                 }
             }
+            // A sign, which `ron` reads on any number: the grammar knows `-` on
+            // one, but not `+`, and no sign at all on `inf` or `NaN`, so
+            // `+80`, `-inf` and `+NaN` each read as an `ERROR` and a value.
+            // The one inside an exponent (`1e+3`) is turned into a `-` as well,
+            // which leaves the float the float it was.
+            b'+' | b'-' => {
+                let word = &bytes[i + 1..];
+                let word = &word[..word
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                    .count()];
+                if matches!(word, b"inf" | b"NaN") {
+                    // A float literal of the same length.
+                    let out = masked.get_or_insert_with(|| bytes.to_vec());
+                    out[i..i + 4].copy_from_slice(b"-0.0");
+                    i += 4;
+                } else {
+                    if bytes[i] == b'+' && word.first().is_some_and(u8::is_ascii_digit) {
+                        // The number itself, its suffix included, is masked by
+                        // the arm above on the next byte.
+                        masked.get_or_insert_with(|| bytes.to_vec())[i] = b'-';
+                    }
+                    i += 1;
+                }
+            }
             _ => i += 1,
         }
     }
@@ -1158,6 +1183,13 @@ mod tests {
                 "(a: 1.5___, b: 2e3___, c: 3___)",
             ),
             ("(a: 0x1Fu16, b: 1_000_u32)", "(a: 0x1F___, b: 1_000____)"),
+            // A `+` on a number becomes the `-` the grammar knows, and a signed
+            // `inf` or `NaN` a float literal.
+            ("(a: +80, b: +1.5, c: +5u8)", "(a: -80, b: -1.5, c: -5__)"),
+            (
+                "(a: -inf, b: +inf, c: -NaN, d: [+NaN])",
+                "(a: -0.0, b: -0.0, c: -0.0, d: [-0.0])",
+            ),
         ];
         for (content, expected) in cases {
             let masked = mask_for_grammar(content);
@@ -1181,6 +1213,10 @@ mod tests {
             // Numbers with no suffix, a hex number ending in digits that spell
             // one, and suffix-like names, strings and comments.
             r#"(a: 5, b: -1.5e3, c: 0xf32, d: u8, e: x5u8, f: "5u8" /* 5u8 */)"#,
+            // Signs the grammar already reads, an unsigned `inf`/`NaN`, and
+            // signed words that are neither.
+            r#"(a: -5, b: inf, c: NaN, d: -infinity, e: "+1", f: '+' // -inf
+                )"#,
         ] {
             assert!(
                 matches!(mask_for_grammar(content), Cow::Borrowed(_)),
@@ -1250,6 +1286,38 @@ mod tests {
         assert_eq!(
             unwrap_some(&some, content).map(|n| n.kind()),
             Some("integer")
+        );
+    }
+
+    /// A signed literal `ron` reads is one literal spanning its sign: the
+    /// grammar alone split `+80` and `-inf` into an `ERROR` and a value, and a
+    /// tree with an `ERROR` in it is one the formatter leaves alone.
+    #[test]
+    fn test_parse_signed_number_fields() {
+        let content = "Cfg(a: +80, b: -inf, c: Some(+NaN), d: +1.5e3, e: inf)";
+        let tree = parse(content);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let value = find_main_value(&tree).unwrap();
+        let values: Vec<_> = struct_fields(&value)
+            .iter()
+            .map(|field| {
+                let value = field_value(field).unwrap();
+                (value.kind(), node_text(&value, content).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("integer", "+80"),
+                ("float", "-inf"),
+                ("struct", "Some(+NaN)"),
+                ("float", "+1.5e3"),
+                ("identifier", "inf"),
+            ]
         );
     }
 
