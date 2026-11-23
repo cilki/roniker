@@ -464,6 +464,9 @@ What gets offered depends on where in the value the cursor sits:
 - Every registered type, as a fallback, when the field's declared type yields
   none of the above — anything the build script was not given the source for.
 
+Nothing is offered inside a comment or a string, so typing `// port: 80` or
+`"a, b"` doesn't pop up suggestions.
+
 Fields the value has already written are left out of the field-name
 completions. That is the value the cursor is in, at whatever depth: inside a
 nested `DatabaseConfig(...)` it is that value's `port` that counts, not the root

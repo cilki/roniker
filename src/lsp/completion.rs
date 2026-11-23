@@ -397,7 +397,11 @@ pub fn generate_completions_for_type(
                 false => items,
             };
         }
-        RootSlot::Past => return Vec::new(),
+        // Neither after the root value nor in a comment or string is there
+        // anything to offer: `:`, ` ` and `,` are trigger characters, so
+        // writing `// port: 80` or `"a, b"` would otherwise pop up field
+        // names, or a `""` that splits the string it is inserted into.
+        RootSlot::Past | RootSlot::Literal => return Vec::new(),
         RootSlot::Inside => {}
     }
 
@@ -462,8 +466,10 @@ enum RootSlot {
     Name { parenthesized: bool },
     /// After a complete root value, where `ron` accepts nothing more.
     Past,
-    /// Inside the root value's delimiters, or inside a comment or string.
+    /// Inside the root value's delimiters.
     Inside,
+    /// Inside a comment or a string (or char) literal, wherever it is written.
+    Literal,
 }
 
 /// Find the cursor's [`RootSlot`] from the text before it.
@@ -490,7 +496,7 @@ fn root_slot(content: &str, cursor: usize) -> RootSlot {
         if let Some(end) = super::ts_utils::skip_comment_or_quoted(bytes, i) {
             // One that runs past the cursor holds it.
             if end > cursor {
-                return RootSlot::Inside;
+                return RootSlot::Literal;
             }
             written |= depth == 0 && matches!(bytes[i], b'"' | b'\'');
             i = end;
@@ -537,7 +543,7 @@ fn root_slot(content: &str, cursor: usize) -> RootSlot {
         }
     }
 
-    // A comment or string that runs past the cursor holds it.
+    // A `#![enable(..)]` header that runs past the cursor holds it.
     if i > cursor || depth > 0 {
         return RootSlot::Inside;
     }
@@ -1172,10 +1178,10 @@ mod tests {
         analyzer.add_type(enum_type);
         analyzer.add_type(unrelated);
 
-        // A quoted value puts the cursor in `FieldValue` (not `StructType`)
-        // context, since the value text isn't a bare identifier.
-        let content = "Config(\n    mode: \"\"\n)";
-        let position = Position::new(1, 11); // inside the quotes, after `mode: `
+        // A value not typed yet puts the cursor in `FieldValue` (not
+        // `StructType`) context, since there is no identifier to complete.
+        let content = "Config(\n    mode: \n)";
+        let position = Position::new(1, 10); // after `mode: `
         let tree = crate::lsp::ts_utils::parse(content);
         let completions =
             generate_completions_for_type(&tree, content, position, &parent, &analyzer);
@@ -1995,13 +2001,62 @@ mod tests {
         // Inside a comment or string, or inside the root's own parentheses —
         // closed or not yet — this is not the root's to answer.
         let slot = |content: &str| root_slot(content, content.len());
-        assert_eq!(slot("// App"), RootSlot::Inside);
-        assert_eq!(slot("/* App"), RootSlot::Inside);
+        assert_eq!(slot("// App"), RootSlot::Literal);
+        assert_eq!(slot("/* App"), RootSlot::Literal);
         assert_eq!(slot("(debug: true, "), RootSlot::Inside);
         assert_eq!(slot("AppConfig(\n    debug: true,\n    "), RootSlot::Inside);
         // A `)` in a raw string closes nothing.
         assert_eq!(slot("AppConfig(name: r#\")\"#, "), RootSlot::Inside);
         let labels = items_at_end("AppConfig(\n    ", &root, &analyzer);
+        assert!(
+            labels.iter().any(|(label, _)| label == "server"),
+            "{labels:?}"
+        );
+    }
+
+    /// A comment or a string is prose, not a value: `:`, ` ` and `,` are
+    /// trigger characters, so without this every `// port: 80` comment popped
+    /// up field names, and `host: "a, |"` offered a `""` that would split the
+    /// string it was typed into.
+    #[test]
+    fn test_nothing_completed_in_comments_or_strings() {
+        let (server, analyzer) = nested_fixture();
+        let root = analyzer.get_type_info("AppConfig").unwrap().clone();
+
+        for content in [
+            // Before the root value, inside it, and nested inside a struct.
+            "// port: ",
+            "AppConfig(\n    debug: true, // server: ",
+            "AppConfig(\n    /* server: ",
+            "AppConfig(\n    server: ServerConfig(\n        // mode: ",
+            "AppConfig(\n    server: (host: /* nested /* block */ ",
+            // In a string value, terminated or not, and a raw string.
+            "AppConfig(\n    server: ServerConfig(host: \"a, ",
+            "AppConfig(\n    server: ServerConfig(host: r#\"a: ",
+            "AppConfig(\n    server: (host: 'x",
+        ] {
+            assert_eq!(
+                items_at_end(content, &root, &analyzer),
+                vec![],
+                "{content:?}"
+            );
+        }
+
+        // On the closing quote the cursor is still in the string; past it, it
+        // is back in the struct, where its fields are offered.
+        let content = "AppConfig(\n    server: ServerConfig(host: \"a\", ";
+        let quote = Position::new(1, content.rsplit('\n').next().unwrap().len() as u32 - 3);
+        assert_eq!(
+            labels_at(content, quote, &server, &analyzer),
+            Vec::<String>::new()
+        );
+        let labels = items_at_end(content, &server, &analyzer);
+        assert!(
+            labels.iter().any(|(label, _)| label == "mode"),
+            "{labels:?}"
+        );
+        // The line after a line comment is no longer in it.
+        let labels = items_at_end("// header\nAppConfig(\n    ", &root, &analyzer);
         assert!(
             labels.iter().any(|(label, _)| label == "server"),
             "{labels:?}"
