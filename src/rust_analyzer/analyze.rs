@@ -7,6 +7,7 @@ use super::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Component, Path};
+use syn::ext::IdentExt;
 use syn::{Attribute, Fields, Item};
 
 impl RustAnalyzer {
@@ -191,7 +192,9 @@ fn type_info(
 fn extract_variant(variant: &syn::Variant) -> EnumVariant {
     let start = variant.ident.span().start();
     EnumVariant {
-        name: variant.ident.to_string(),
+        // A raw identifier (`r#Type`) is the name without its `r#` to serde,
+        // and so to RON: the prefix only gets a keyword past the Rust parser.
+        name: variant.ident.unraw().to_string(),
         fields: extract_fields(&variant.fields),
         docs: extract_docs(&variant.attrs),
         line: Some(start.line),
@@ -220,7 +223,14 @@ fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
             let (name, line, column) = match &field.ident {
                 Some(ident) => {
                     let start = ident.span().start();
-                    (ident.to_string(), Some(start.line), Some(start.column))
+                    // `pub r#type: String` is the field `type` to serde, which
+                    // strips the `r#` a keyword needs in Rust; RON writes it as
+                    // `type: ...`.
+                    (
+                        ident.unraw().to_string(),
+                        Some(start.line),
+                        Some(start.column),
+                    )
                 }
                 None => (index.to_string(), None, None),
             };

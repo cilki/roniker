@@ -3161,6 +3161,48 @@ mod tests {
         );
     }
 
+    /// A field or variant declared with a raw identifier, `r#type`, is named
+    /// `type` to serde, which is how `ron` reads and writes it. The `r#` used to
+    /// be kept in the name, so the correct `type: ".."` was an unknown field
+    /// (with "did you mean 'r#type'?") and the struct reported `r#type` as
+    /// missing.
+    #[cfg(feature = "analyze")]
+    #[test]
+    fn test_raw_identifier_field_and_variant_named_without_prefix() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                pub struct Rule {
+                    pub r#type: String,
+                    pub r#match: Kind,
+                }
+
+                #[allow(non_camel_case_types)]
+                pub enum Kind {
+                    r#struct,
+                    Other,
+                }
+                "#,
+            )
+            .unwrap();
+        let root = analyzer.get_type_info("crate::Rule").expect("Rule").clone();
+
+        let errors = |content: &str| {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(errors(r#"Rule(type: "a", match: struct)"#), empty);
+        assert_eq!(errors(r#"Rule(type: "a", match: Other)"#), empty);
+        assert_eq!(errors(r#"Rule(match: Other)"#), ["Required fields: type"]);
+    }
+
     /// `Memory()` is refused by `ron` wherever the enum sits, so it is reported
     /// wherever the enum sits: the root's field, a `Vec` element, a map value,
     /// `Some(..)`, and a document whose root value is the variant itself.
