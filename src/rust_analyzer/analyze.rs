@@ -99,13 +99,16 @@ impl RustAnalyzer {
     ) {
         for item in items {
             match item {
-                Item::Struct(item) => self.add_type(type_info(
-                    &item.ident,
-                    &item.attrs,
-                    TypeKind::Struct(extract_fields(&item.fields)),
-                    module_prefix,
-                    file_path,
-                )),
+                Item::Struct(item) => self.add_type(TypeInfo {
+                    unit: matches!(item.fields, Fields::Unit),
+                    ..type_info(
+                        &item.ident,
+                        &item.attrs,
+                        TypeKind::Struct(extract_fields(&item.fields)),
+                        module_prefix,
+                        file_path,
+                    )
+                }),
                 Item::Enum(item) => self.add_type(type_info(
                     &item.ident,
                     &item.attrs,
@@ -186,6 +189,7 @@ fn type_info(
         // so for one this is always false.
         has_default: serde_attrs.has_default,
         rename_all: serde_attrs.rename_all,
+        unit: false,
     }
 }
 
@@ -507,6 +511,24 @@ mod tests {
 
         let status = analyzer.get_type_info("crate::models::Status");
         assert!(status.is_some(), "Status type should exist");
+    }
+
+    /// Only a `struct Marker;` is a unit struct. One declared with empty braces
+    /// or parentheses has no fields either, but `ron` spells it differently.
+    #[test]
+    fn test_unit_struct_is_told_apart_from_an_empty_one() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "",
+                "pub struct Marker; pub struct Braced {} pub struct Parened(); pub struct Full { x: u8 }",
+            )
+            .unwrap();
+        let unit = |name: &str| analyzer.get_type_info(name).unwrap().unit;
+        assert!(unit("Marker"));
+        assert!(!unit("Braced"));
+        assert!(!unit("Parened"));
+        assert!(!unit("Full"));
     }
 
     #[test]

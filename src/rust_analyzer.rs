@@ -625,6 +625,12 @@ pub struct TypeInfo {
     /// `#[serde(rename_all = "...")]` on the container (e.g. "camelCase")
     #[serde(default)]
     pub rename_all: Option<String>,
+    /// A unit struct, `struct Marker;`. RON writes one as its bare name
+    /// (`Marker`) or as `()`, and `ron` refuses `Marker()`; every other struct
+    /// is the other way round, with `Name(..)` or `(..)` and never a bare
+    /// `Name`. Both have no fields to tell them apart by, so this does.
+    #[serde(default)]
+    pub unit: bool,
 }
 
 impl TypeInfo {

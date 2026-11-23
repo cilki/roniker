@@ -900,6 +900,8 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
                 None => format!("{name}()"),
             }
         }
+        // A unit struct is written as its bare name: `ron` refuses `Marker()`.
+        TypeKind::Struct(_) if info.unit => short,
         TypeKind::Struct(fields) => match positional_elements(fields, analyzer, depth) {
             Some(elements) => format!("{short}({elements})"),
             None => opaque(),
@@ -1341,6 +1343,28 @@ mod tests {
             });
             assert_eq!(generate_default_value(name, &analyzer), format!("{name}()"));
         }
+    }
+
+    /// A unit struct is filled in as its bare name. `Marker()` — what every
+    /// struct used to get — is refused by `ron`, so the quick-fix turned a
+    /// missing field into a document that still didn't load.
+    #[test]
+    fn test_generate_default_value_for_unit_struct() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Marker".to_string(),
+            kind: TypeKind::Struct(Vec::new()),
+            unit: true,
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::config::Braced".to_string(),
+            kind: TypeKind::Struct(Vec::new()),
+            ..Default::default()
+        });
+        assert_eq!(generate_default_value("Marker", &analyzer), "Marker");
+        assert_eq!(generate_default_value("Option<Marker>", &analyzer), "None");
+        assert_eq!(generate_default_value("Braced", &analyzer), "Braced()");
     }
 
     /// The one "make ... explicit" action, among those offered for `content`

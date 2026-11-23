@@ -210,7 +210,12 @@ Opening a RON file matched by the pattern above gets you:
     with or without data inside — `ron` reads a unit variant as its bare name
     and nothing else), or a variant that declares fields written as a bare
     name (`storage: S3` for an `S3(String)` variant, which `ron` refuses for
-    want of the parentheses). The root value is held to the root type the same
+    want of the parentheses). Structs follow the same rule: a unit struct
+    (`struct Marker;`) is written `Marker` or `()` and never `Marker()`, while
+    any other struct — one declared with empty braces included — is written
+    with its parentheses and never as a bare `Server`, even when every field
+    has a default. A type registered by hand rather than through `add_file` is
+    a unit struct only when its `TypeInfo` sets `unit: true`. The root value is held to the root type the same
     way: a document that opens `ServerConfig(` where the root type is
     `Configuration` gets `expected Configuration, got ServerConfig` on that
     first line and nothing else, since `ron` stops there too and the fields
