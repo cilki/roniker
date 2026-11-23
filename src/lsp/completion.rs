@@ -764,7 +764,11 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
         TypeKind::Struct(fields) => {
             let fields: Vec<_> = fields.iter().filter(|f| !f.skip).collect();
 
-            let snippet = if fields.is_empty() {
+            let snippet = if type_info.unit {
+                // `Marker` is a whole unit struct, and `Marker()` is one `ron`
+                // refuses.
+                type_name.to_string()
+            } else if fields.is_empty() {
                 format!("{}()", type_name)
             } else if fields.iter().all(|f| f.is_positional()) {
                 // A tuple or newtype struct is written as its values in order,
@@ -1858,6 +1862,26 @@ mod tests {
             "Point(\n    x: ${1},\n)",
             "a named struct keeps one field per line"
         );
+    }
+
+    /// A unit struct is a whole value by its bare name, and `ron` refuses it
+    /// with parentheses — which is what completing one used to insert. A
+    /// struct declared with empty braces has no fields either, but is the
+    /// other way round.
+    #[test]
+    fn test_unit_struct_completed_as_its_bare_name() {
+        let snippet = |unit: bool| {
+            create_type_completion(&TypeInfo {
+                name: "crate::Marker".to_string(),
+                kind: TypeKind::Struct(Vec::new()),
+                unit,
+                ..Default::default()
+            })
+            .insert_text
+            .unwrap()
+        };
+        assert_eq!(snippet(true), "Marker");
+        assert_eq!(snippet(false), "Marker()");
     }
 
     /// The "already written" filter has to be read off the same value the

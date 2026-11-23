@@ -807,6 +807,9 @@ fn validate_node_with_type_info<'a>(
 ) -> Vec<Diagnostic> {
     match &type_info.kind {
         TypeKind::Struct(_) => {
+            if let Some(diagnostic) = struct_spelling_error(node, content, type_info) {
+                return vec![diagnostic];
+            }
             let expected = ExpectedStruct {
                 // The names serde accepts: serialized names, `skip` excluded,
                 // `flatten` expanded when the analyzer can resolve the target.
@@ -820,6 +823,53 @@ fn validate_node_with_type_info<'a>(
         }
         TypeKind::Enum(_) => validate_enum_node(node, content, type_info, analyzer),
     }
+}
+
+/// A struct value written in the spelling of the other kind of struct, which
+/// `ron` refuses before reading anything inside it: a unit struct
+/// (`struct Marker;`) with parentheses after its name, or any other struct
+/// as its bare name.
+///
+/// A unit struct is `Marker` or `()`, and `Marker()` stops `ron` at the `(`
+/// whether or not anything is written inside. A struct with fields — or with
+/// an empty `{}` or `()` for them — is `Name(..)` or `(..)`, and a bare `Name`
+/// is "expected named struct-like" however many of its fields have defaults:
+/// so `server: ServerConfig` is no shorthand for a server built of defaults,
+/// and was passing as clean because a bare name has no fields to walk.
+fn struct_spelling_error(
+    node: &tree_sitter::Node<'_>,
+    content: &str,
+    type_info: &TypeInfo,
+) -> Option<Diagnostic> {
+    let name = short_name(&type_info.name);
+    if type_info.unit {
+        if node.kind() != "struct" {
+            return None;
+        }
+        let message = if super::ts_utils::struct_name(node, content).is_some()
+            && super::ts_utils::struct_values(node, content).is_empty()
+            && super::ts_utils::struct_fields(node).is_empty()
+        {
+            format!(
+                "Struct '{name}' is a unit struct and must be written without parentheses: {name}"
+            )
+        } else {
+            format!("Struct '{name}' is a unit struct and cannot have data")
+        };
+        return Some(error(
+            struct_name_range(node, content),
+            codes::TYPE_MISMATCH,
+            message,
+        ));
+    }
+    if node.kind() == "identifier" && super::ts_utils::node_text(node, content) == Some(name) {
+        return Some(error(
+            super::ts_utils::node_to_lsp_range(node, content),
+            codes::TYPE_MISMATCH,
+            format!("Struct '{name}' must be written with parentheses: {name}(...)"),
+        ));
+    }
+    None
 }
 
 /// Validate a value written where an enum is expected: the variant it names
@@ -3103,6 +3153,88 @@ mod tests {
                 Some(NumberOrString::String(codes::TYPE_MISMATCH.to_string()))
             );
         }
+    }
+
+    /// A unit struct is written `Marker` or `()`, and any other struct
+    /// `Name(..)` or `(..)` — never the other way round, which `ron` refuses
+    /// before reading anything inside. Both mistakes used to pass as clean:
+    /// `Marker()` because it looks like any other struct, and `Braced` because
+    /// a bare name has no fields to walk.
+    #[test]
+    fn test_unit_struct_and_bare_struct_name_spellings() {
+        let mut analyzer = RustAnalyzer::new();
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        analyzer.add_type(TypeInfo {
+            name: "crate::Marker".to_string(),
+            unit: true,
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Braced".to_string(),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Server".to_string(),
+            kind: TypeKind::Struct(vec![field("port", "u16")]),
+            has_default: true,
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "crate::Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("m", "Marker"),
+                field("b", "Braced"),
+                field("s", "Option<Server>"),
+            ]),
+            ..Default::default()
+        };
+        let messages = |content: &str| -> Vec<String> {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
+        };
+
+        // Every spelling `ron` reads.
+        for content in [
+            "Cfg(m: Marker, b: Braced(), s: Some(Server()))",
+            "Cfg(m: (), b: (), s: Some((port: 1)))",
+            "Cfg(m: Marker, b: Braced(), s: None)",
+        ] {
+            assert_eq!(messages(content), Vec::<String>::new(), "{content}");
+        }
+
+        assert_eq!(
+            messages("Cfg(m: Marker(), b: (), s: None)"),
+            vec![
+                "Struct 'Marker' is a unit struct and must be written without parentheses: Marker"
+            ]
+        );
+        for content in [
+            "Cfg(m: Marker(1), b: (), s: None)",
+            "Cfg(m: (x: 1), b: (), s: None)",
+        ] {
+            assert_eq!(
+                messages(content),
+                vec!["Struct 'Marker' is a unit struct and cannot have data"],
+                "{content}"
+            );
+        }
+        assert_eq!(
+            messages("Cfg(m: Marker, b: Braced, s: None)"),
+            vec!["Struct 'Braced' must be written with parentheses: Braced(...)"]
+        );
+        // Not even when every field has a default: serde still wants the
+        // parentheses, and so does what is behind an `Option`.
+        assert_eq!(
+            messages("Cfg(m: Marker, b: (), s: Some(Server))"),
+            vec!["Struct 'Server' must be written with parentheses: Server(...)"]
+        );
     }
 
     /// A field declared through a type alias is validated as the type the
