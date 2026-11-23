@@ -411,6 +411,19 @@ fn field_completion_context(
             .to_string(),
         steps,
     };
+    value_context(slot, innermost, content, cursor)
+}
+
+/// The context for a cursor completing the value `slot` describes, given the
+/// value it is on inside the innermost container — `None` in the space where a
+/// new one is about to be written.
+fn value_context(
+    slot: ValueSlot,
+    innermost: Option<tree_sitter::Node>,
+    content: &str,
+    cursor: usize,
+) -> CompletionContext {
+    use super::ts_utils;
 
     // On the name of a struct value or variant that already has its
     // parentheses.
@@ -482,6 +495,20 @@ pub fn generate_completions_for_type(
         CompletionContext::FieldName => {
             generate_field_completions(tree, content, position, type_info, analyzer)
         }
+        context => value_completions(context, field_type, analyzer),
+    }
+}
+
+/// Completions for a value being written, given the context the cursor is in
+/// and how to find the type of the value a [`ValueSlot`] stands for.
+fn value_completions(
+    context: CompletionContext,
+    field_type: impl Fn(ValueSlot) -> Option<String>,
+    analyzer: &RustAnalyzer,
+) -> Vec<CompletionItem> {
+    match context {
+        // Not a value: answered by `generate_field_completions`.
+        CompletionContext::FieldName => Vec::new(),
         CompletionContext::FieldValue(slot) => {
             let completions = field_type(slot)
                 .map(|t| generate_value_completions_by_type(&t, analyzer))
@@ -690,12 +717,78 @@ fn generate_field_completions(
         }
     };
 
+    // A tuple struct's or tuple variant's fields are named by their index,
+    // which RON never writes: `Rect(Point(..), Point(..))`, not `Rect(0: ..)`.
+    // Inside their parentheses is where the values go, in order.
+    if !fields.is_empty() && fields.iter().all(|(_, field)| field.is_positional()) {
+        return positional_completions(tree, content, position, &fields, analyzer);
+    }
+
     // Offer only the fields not already written, under any name serde
     // accepts for them.
     let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content, position);
     missing_fields(&fields, |name| used_fields.contains(name))
         .map(|(name, field)| field_completion(name, field))
         .collect()
+}
+
+/// Completions inside the parentheses of a tuple struct or tuple variant,
+/// whose (positional) `fields` are given: the values of the element the cursor
+/// is at, which is the one after however many commas precede it.
+fn positional_completions(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+    fields: &[(String, FieldInfo)],
+    analyzer: &RustAnalyzer,
+) -> Vec<CompletionItem> {
+    use super::ts_utils;
+
+    let cursor = ts_utils::position_to_byte_offset(content, position);
+    let Some(body) = ts_utils::node_at_position(tree, content, position).and_then(|node| {
+        ts_utils::ancestors(tree, node).find(|ancestor| {
+            ancestor.kind() == "struct"
+                && !ts_utils::is_some_wrapper(ancestor, content)
+                && inside_struct_body(ancestor, content, position)
+        })
+    }) else {
+        return Vec::new();
+    };
+
+    let mut walk = body.walk();
+    let index = body
+        .children(&mut walk)
+        .filter(|child| child.kind() == "," && child.end_byte() <= cursor)
+        .count();
+    // Past the last element there is nothing more to write.
+    let Some((name, field)) = fields.get(index) else {
+        return Vec::new();
+    };
+
+    let element = ts_utils::struct_values(&body, content)
+        .into_iter()
+        .find(|value| {
+            !value.is_missing() && value.start_byte() <= cursor && cursor <= value.end_byte()
+        });
+    let (steps, innermost) = match element {
+        Some(element) => value_steps(element, content, cursor),
+        None => (Vec::new(), None),
+    };
+    let slot = ValueSlot {
+        field: name.clone(),
+        steps,
+    };
+    value_completions(
+        value_context(slot, innermost, content, cursor),
+        |slot| {
+            slot.steps
+                .iter()
+                .try_fold(field.type_name.clone(), |declared, step| {
+                    step.apply(&declared)
+                })
+        },
+        analyzer,
+    )
 }
 
 /// Completion items offering an enum's variants, serialized (honoring
