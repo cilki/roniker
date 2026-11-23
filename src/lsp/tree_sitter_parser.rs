@@ -176,10 +176,12 @@ pub fn find_current_variant_context(
     content: &str,
     position: Position,
 ) -> Option<String> {
-    // Walk up to find the innermost struct node with a name
+    // Walk up to find the innermost struct node with a name. An `Option`'s
+    // `Some(..)` names no variant of the enum being completed: it wraps one of
+    // the values of the variant around it, `Pair(Fast, Some(|))`.
     let current = node_at_position(tree, content, position)?;
     ancestors(tree, current).find_map(|node| {
-        if node.kind() != "struct" {
+        if node.kind() != "struct" || is_some_wrapper(&node, content) {
             return None;
         }
         // A struct is a variant when it has a name that starts uppercase.

@@ -2428,6 +2428,127 @@ Document::new(content.to_string()),
         }
     }
 
+    /// Inside the parentheses of a tuple struct or a tuple variant go its
+    /// values, in order. Their fields are named by their index, and those
+    /// names used to be offered as field names: `Wrapper(|)` offered `0: `,
+    /// which accepted turns a valid document into `Wrapper(0: )`, a syntax
+    /// error.
+    #[tokio::test]
+    async fn test_completion_inside_a_tuple_struct_or_variant() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![field("port", "Port"), field("shapes", "Vec<Shape>")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Port".to_string(),
+            kind: TypeKind::Struct(vec![field("0", "u16")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(
+                ["Fast", "Slow"]
+                    .into_iter()
+                    .map(|name| EnumVariant {
+                        name: name.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Shape".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Pair".to_string(),
+                    fields: vec![field("0", "Mode"), field("1", "Option<Mode>")],
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Named".to_string(),
+                    fields: vec![field("0", "String")],
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Many".to_string(),
+                    fields: vec![field("0", "Vec<Mode>")],
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Circle".to_string(),
+                    fields: vec![field("radius", "f64")],
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+
+        let modes = vec!["Fast", "Slow"];
+        let none: Vec<&str> = Vec::new();
+        for (marked, expected) in [
+            ("Config(port: Port(|))", &vec!["0"]),
+            ("Config(shapes: [Pair(|)])", &modes),
+            ("Config(shapes: [Pair(Sl|)])", &modes),
+            (
+                "Config(shapes: [Pair(Fast, |)])",
+                &vec!["Some(Fast)", "Some(Slow)", "None"],
+            ),
+            ("Config(shapes: [Pair(Fast, Some(|))])", &modes),
+            ("Config(shapes: [Pair(Fast, None, |)])", &none),
+            // The index names a different field in each variant: it is the
+            // variant written that decides.
+            ("Config(shapes: [Named(|)])", &vec!["\"\""]),
+            ("Config(shapes: [Many([|])])", &modes),
+            // A struct variant still takes its fields by name.
+            ("Config(shapes: [Circle(|)])", &vec!["radius"]),
+        ] {
+            let offset = marked.find('|').unwrap();
+            let content = marked.replacen('|', "", 1);
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(0, offset as u32),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(&labels, expected, "completion in {marked:?}");
+            assert!(
+                items.iter().all(|item| !item
+                    .insert_text
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(|c: char| c.is_ascii_digit())
+                        && text.ends_with(": "))),
+                "completion in {marked:?} offered a positional field name: {items:?}"
+            );
+        }
+    }
+
     /// On the name of a value that already has its parentheses — a struct or
     /// a variant carrying data — completion offers what the field it is
     /// written for takes, and inserts only the name. It used to resolve the
