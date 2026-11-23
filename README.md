@@ -348,14 +348,13 @@ formatting on save never rewrites a file you are in the middle of editing. Note
 that this includes an empty struct written with space inside it, `( )`: the
 grammar only knows `()`, so a document holding one is not formatted.
 
-Range formatting ("format selection") is advertised by the server but only
-does anything when the selection is exactly one whole value, such as a single
-nested struct from its name to its closing parenthesis — and then it lays that
-value out as though it were the root, so a nested one loses its indentation.
-Any other selection — a few fields, a few elements of an array — doesn't parse
-on its own and is left unchanged
-([#67](https://git.cilki.net/cilki/roniker/issues/67)). Format the whole
-document instead.
+Range formatting ("format selection") lays out the selected value, indented
+from the line it starts on. A selection that isn't one whole value on its own —
+a few fields, a few elements of an array, part of a line — is widened to the
+smallest struct, array, tuple or map in the document that holds all of it, and
+that container is laid out instead; nothing outside it is touched. Widening
+needs the document to parse, so in a document that doesn't, only a selection of
+one whole value is formatted.
 
 ### Serde attributes
 
