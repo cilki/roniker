@@ -316,6 +316,33 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
+        // Parentheses just opened for an unnamed struct don't parse as one, so
+        // they are completed from a copy of the document in which they do —
+        // when the value written there really is a struct with named fields.
+        // A unit struct's `()` is already complete, and a tuple's or a tuple
+        // struct's parentheses take values, not field names.
+        if let Some(patched) = completion::with_open_unnamed_struct(&doc.content, position) {
+            let tree = ts_utils::parse(&patched);
+            if let Some(type_info) = self
+                .resolve_completion_owner_at(&patched, &tree, position)
+                .filter(|info| {
+                    info.fields().is_some_and(|fields| {
+                        !fields.is_empty() && !fields.iter().any(|f| f.is_positional())
+                    })
+                })
+            {
+                return Ok(Some(CompletionResponse::Array(
+                    completion::generate_completions_for_type(
+                        &tree,
+                        &patched,
+                        position,
+                        type_info,
+                        &self.rust_analyzer,
+                    ),
+                )));
+            }
+        }
+
         let Some(type_info) = self.resolve_completion_owner_at(&doc.content, &doc.tree, position)
         else {
             return Ok(None);
@@ -2278,8 +2305,9 @@ Document::new(content.to_string()),
             ("Config(route: (|1, Fast))", &vec!["0"]),
             ("Config(routes: [(\"a\", |)])", &variants),
             ("Config(trio: (Fast, Slow, |))", &variants),
-            // Parentheses written for a struct are its own, not a tuple's.
-            ("Config(server: (|))", &vec!["Server"]),
+            // Parentheses written for a struct are its own, not a tuple's: they
+            // take the struct's fields, even before the first one is typed.
+            ("Config(server: (|))", &vec!["host"]),
             // One container out, the containers' own spellings are still what
             // the cursor's value takes.
             ("Config(grid: [|])", &sequence),
@@ -2288,6 +2316,87 @@ Document::new(content.to_string()),
             ("Config(modes: []|)", &sequence),
             ("Config(route: |())", &tuple),
             ("Config(routes: [|])", &tuple),
+        ] {
+            let offset = marked.find('|').unwrap();
+            let content = marked.replacen('|', "", 1);
+            let line = content[..offset].matches('\n').count() as u32;
+            let character = (offset - content[..offset].rfind('\n').map_or(0, |i| i + 1)) as u32;
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(line, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(&labels, expected, "completion in {marked:?}");
+        }
+    }
+
+    /// The parentheses of a struct value written without its name take that
+    /// struct's fields from the moment they are opened. Until a `name:` was
+    /// typed in them they didn't parse as a struct — `()` is a unit value, and
+    /// `( )` or a half-typed `(ho)` is a syntax error — so the type's name was
+    /// offered inside its own parentheses, or the error recovery put the cursor
+    /// in the enclosing struct and its fields were offered instead; see
+    /// <https://git.cilki.net/cilki/roniker/issues/157>.
+    #[tokio::test]
+    async fn test_completion_in_the_empty_parentheses_of_an_unnamed_struct() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("server", "Server"),
+                field("servers", "Vec<Server>"),
+                field("backup", "Option<Server>"),
+                field("route", "(u16, u16)"),
+                field("name", "String"),
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![field("host", "String"), field("port", "u16")]),
+            ..Default::default()
+        });
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+
+        let server = vec!["host", "port"];
+        for (marked, expected) in [
+            ("Config(server: (|))", &server),
+            ("Config(server: ( | ))", &server),
+            ("Config(server: (\n    |\n))", &server),
+            ("Config(server: (ho|))", &server),
+            ("Config(server: (h|o))", &server),
+            ("Config(name: \"\", server: (|), route: (1, 2))", &server),
+            ("Config(servers: [(|)])", &server),
+            ("Config(servers: [Server(host: \"a\"), (|)])", &server),
+            ("Config(backup: Some((|)))", &server),
+            // Once a field is written the value parsed as a struct already.
+            ("Config(server: (host: \"a\", |))", &vec!["port"]),
+            // A tuple's parentheses still take the values of its positions.
+            ("Config(route: (|))", &vec!["0"]),
         ] {
             let offset = marked.find('|').unwrap();
             let content = marked.replacen('|', "", 1);

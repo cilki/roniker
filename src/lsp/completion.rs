@@ -209,6 +209,79 @@ fn inside_delimiters(node: &tree_sitter::Node, cursor: usize) -> bool {
     cursor >= open.end_byte() && close.is_none_or(|close| cursor <= close.start_byte())
 }
 
+/// The field name the parentheses of an unnamed struct value are given by
+/// [`with_open_unnamed_struct`] so that they parse as a struct. No Rust field can
+/// be named this way and it is never offered, so it stands for nothing but
+/// "a field goes here".
+const PLACEHOLDER_FIELD: &str = "__roniker_placeholder__: ()";
+
+/// `content` rewritten so that the unnamed struct value the cursor has only
+/// just opened parses as a struct, or `None` when the cursor is anywhere else.
+///
+/// A struct value written without its name has nothing but its fields to tell
+/// it apart from a unit or a tuple, so until the first `name:` is typed the
+/// grammar can't read it as one: `server: ()` is a unit value, and `( )`,
+/// `(\n    \n)` and a half-typed `(ho)` don't parse at all. Completion then found
+/// no struct around the cursor, and offered either the type name — which can't
+/// go inside its own parentheses — or, from the error recovery, the fields of
+/// the struct *around* the value ([#157]).
+///
+/// The rewrite blanks the half-typed word (completion filters on it client-side)
+/// and puts [`PLACEHOLDER_FIELD`] at the cursor, so the parentheses become a
+/// struct body with the cursor on a field name. Nothing before the cursor moves,
+/// so `position` means the same in both documents.
+///
+/// Only parentheses written where a value goes are rewritten — after a field's
+/// colon, inside a `[..]`, a `{..}` or another value's parentheses, or after a
+/// comma — not ones that follow a name: `ServerConfig(|)` and `Some(|)` already
+/// parse as what they are.
+///
+/// [#157]: https://git.cilki.net/cilki/roniker/issues/157
+pub fn with_open_unnamed_struct(content: &str, position: Position) -> Option<String> {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = content.as_bytes();
+    let cursor = super::ts_utils::position_to_byte_offset(content, position);
+
+    // `(`, whitespace, at most one word with the cursor in or around it,
+    // whitespace, `)`.
+    let word_start = cursor
+        - bytes[..cursor]
+            .iter()
+            .rev()
+            .take_while(|&&b| is_word(b))
+            .count();
+    let open = content[..word_start].trim_end_matches(|c: char| c.is_ascii_whitespace());
+    let open = open.strip_suffix('(')?.len();
+    let word_end = cursor + bytes[cursor..].iter().take_while(|&&b| is_word(b)).count();
+    let close = word_end
+        + bytes[word_end..]
+            .iter()
+            .take_while(|b| b.is_ascii_whitespace())
+            .count();
+    if bytes.get(close) != Some(&b')') {
+        return None;
+    }
+    if !content[..open]
+        .trim_end()
+        .ends_with([':', '[', '{', '(', ','])
+    {
+        return None;
+    }
+
+    let blank = |text: &str| -> String {
+        text.chars()
+            .map(|c| if c.is_ascii_whitespace() { c } else { ' ' })
+            .collect()
+    };
+    let mut patched = String::with_capacity(content.len() + PLACEHOLDER_FIELD.len());
+    patched.push_str(&content[..=open]);
+    patched.push_str(&blank(&content[open + 1..cursor]));
+    patched.push_str(PLACEHOLDER_FIELD);
+    patched.push_str(&blank(&content[cursor..close]));
+    patched.push_str(&content[close..]);
+    Some(patched)
+}
+
 /// Determine what we're completing based on cursor position using tree-sitter
 fn get_completion_context(tree: &Tree, content: &str, position: Position) -> CompletionContext {
     use super::ts_utils;
