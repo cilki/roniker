@@ -112,6 +112,51 @@ fn order(a: Position, b: Position) -> (Position, Position) {
     }
 }
 
+/// What a range-formatting request over the bytes `start..end` of `content`
+/// (the document `range` covers, whose tree is `tree`) lays out: those bytes
+/// and `range` themselves when the text between them is one whole value, and
+/// otherwise the smallest struct, array, tuple or map in the document that
+/// holds all of it, with that container's own range.
+///
+/// The layout formats one value. A selection of a few fields or elements — the
+/// usual "select these lines, format selection" — doesn't parse on its own, so
+/// it used to be left as it was. Formatting the value around it instead lays
+/// out what was selected, at the depth it really sits at, and touches nothing
+/// outside that value.
+///
+/// `None` when the selection isn't a value and the document doesn't parse
+/// either: there is no tree to find the surrounding value in that the layout
+/// would accept.
+fn formatting_span(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    start: usize,
+    end: usize,
+    range: Range,
+) -> Option<(usize, usize, Range)> {
+    let selected = &content[start..end];
+    let value = selected.trim();
+    if value.is_empty() || !ts_utils::parse(value).root_node().has_error() {
+        return Some((start, end, range));
+    }
+    if tree.root_node().has_error() {
+        return None;
+    }
+
+    let value_start = start + (selected.len() - selected.trim_start().len());
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(value_start, value_start + value.len())?;
+    while !matches!(node.kind(), "struct" | "array" | "tuple" | "map") {
+        node = node.parent()?;
+    }
+    Some((
+        node.start_byte(),
+        node.end_byte(),
+        ts_utils::node_to_lsp_range(&node, content),
+    ))
+}
+
 /// Compute the tree-sitter Point (row + byte column) for a byte offset.
 fn byte_point(content: &str, byte_offset: usize, line: usize) -> tree_sitter::Point {
     let line_start = content[..byte_offset]
@@ -431,10 +476,15 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        // The selection is exactly the document's text between its two ends,
-        // each clamped to the end of its line.
+        // The selection is the document's text between its two ends, each
+        // clamped to the end of its line — widened to the value around it when
+        // it is only part of one.
         let start = ts_utils::position_to_byte_offset(&doc.content, range.start);
         let end = ts_utils::position_to_byte_offset(&doc.content, range.end);
+        let Some((start, end, range)) = formatting_span(&doc.tree, &doc.content, start, end, range)
+        else {
+            return Ok(None);
+        };
         let selected_text = &doc.content[start..end];
 
         // Only the value is laid out; the whitespace around it is kept as it
@@ -3446,6 +3496,76 @@ PostReference(
                 range: lines,
                 new_text: "    [\n        \"a\",\n        \"b\",\n    ]\n".to_string(),
             }])
+        );
+    }
+
+    /// A selection that is only part of a value — a few of a struct's field
+    /// lines, a single field, a few array elements — doesn't parse on its own,
+    /// and used to be left as it was. It is widened to the smallest container
+    /// around it, which is laid out at the depth it sits at; a document that
+    /// doesn't parse has no such container to widen to and is left alone.
+    #[tokio::test]
+    async fn test_range_formatting_widens_a_partial_selection() {
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "Post(\n    author: User(\n      id:1,\n            name:\"Bob\",\n    ),\n    tags: [\"a\",   \"b\"],\n)\n";
+
+        let open = async |text: &str| {
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: url.clone(),
+                        language_id: "ron".to_string(),
+                        version: 1,
+                        text: text.to_string(),
+                    },
+                })
+                .await
+        };
+        let format = async |range| {
+            backend
+                .range_formatting(DocumentRangeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: url.clone() },
+                    range,
+                    options: four_spaces(),
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .unwrap()
+        };
+        open(content).await;
+
+        // `User(...)`, from its name to its closing paren, at one level deep.
+        let user = vec![TextEdit {
+            range: Range::new(Position::new(1, 12), Position::new(4, 5)),
+            new_text: "User(\n        id: 1,\n        name: \"Bob\",\n    )".to_string(),
+        }];
+        // Its two field lines, whole.
+        assert_eq!(
+            format(Range::new(Position::new(2, 0), Position::new(4, 0))).await,
+            Some(user.clone())
+        );
+        // One field, from its name to the end of its value.
+        assert_eq!(
+            format(Range::new(Position::new(3, 12), Position::new(3, 22))).await,
+            Some(user)
+        );
+
+        // The array's two elements, without its brackets.
+        assert_eq!(
+            format(Range::new(Position::new(5, 11), Position::new(5, 21))).await,
+            Some(vec![TextEdit {
+                range: Range::new(Position::new(5, 10), Position::new(5, 22)),
+                new_text: "[\n        \"a\",\n        \"b\",\n    ]".to_string(),
+            }])
+        );
+
+        // An unclosed paren further down leaves nothing to widen to.
+        open(&content.replace("tags: [\"a\",   \"b\"],", "extra: (")).await;
+        assert_eq!(
+            format(Range::new(Position::new(2, 0), Position::new(4, 0))).await,
+            None
         );
     }
 
