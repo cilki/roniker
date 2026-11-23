@@ -438,15 +438,20 @@ impl LanguageServer for Backend {
             let indent = format::indent_unit(params.options.tab_size, params.options.insert_spaces);
             let formatted = format::format_tree(&doc.tree, &doc.content, &indent);
 
-            if formatted != doc.content {
-                let line_count = doc.content.lines().count() as u32;
-                let last_line = line_count.saturating_sub(1);
-                let last_column = ts_utils::line_width(&doc.content, last_line as usize);
+            // The edit stops at the end of the last line, so the line break a
+            // file ends with is kept rather than replaced — and the layout,
+            // which ends at the root value, is compared with exactly the text
+            // it would replace. Comparing with the whole content instead never
+            // matched a file ending in a newline, so every format of an
+            // already-formatted file handed the editor a whole-document edit.
+            let line_count = doc.content.lines().count() as u32;
+            let last_line = line_count.saturating_sub(1);
+            let last_column = ts_utils::line_width(&doc.content, last_line as usize);
+            let end = Position::new(last_line, last_column);
+            let replaced = &doc.content[..ts_utils::position_to_byte_offset(&doc.content, end)];
+            if formatted != replaced {
                 return Ok(Some(vec![TextEdit {
-                    range: Range::new(
-                        Position::new(0, 0),
-                        Position::new(last_line, last_column),
-                    ),
+                    range: Range::new(Position::new(0, 0), end),
                     new_text: formatted,
                 }]));
             }
@@ -2781,6 +2786,68 @@ Document::new(content.to_string()),
                 .unwrap()
                 .is_none(),
             "formatting an already-formatted document should produce no edit"
+        );
+    }
+
+    /// An already-formatted file almost always ends in a line break, which the
+    /// layout doesn't write and the edit's range doesn't cover. Such a file is
+    /// left alone too, rather than being handed a whole-document edit that
+    /// changes nothing on every format-on-save.
+    #[tokio::test]
+    async fn formatting_a_formatted_document_ending_in_a_newline_is_a_no_op() {
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
+
+        for (name, content) in [
+            ("lf", "// leading\nConfig(\n    port: 8080,\n)\n"),
+            ("crlf", "// leading\r\nConfig(\r\n    port: 8080,\r\n)\r\n"),
+            ("trailing comment", "Config(\n    port: 8080,\n)\n// tail\n"),
+        ] {
+            let uri: Uri = format!("file:///test/{}.ron", name.replace(' ', "_"))
+                .parse()
+                .unwrap();
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content.to_string()));
+
+            let edits = backend
+                .formatting(DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    options: four_spaces(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                edits, None,
+                "{name}: a formatted document should produce no edit"
+            );
+        }
+
+        // A file that does need laying out still gets its edit, and the line
+        // break it ends with stays outside the replaced range.
+        let uri: Uri = "file:///test/unformatted.ron".parse().unwrap();
+        let content = "Config(port: 8080)\n";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(content.to_string()));
+        let edits = backend
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                options: four_spaces(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("an unformatted document should produce an edit");
+        assert_eq!(edits[0].new_text, "Config(\n    port: 8080,\n)");
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 18))
         );
     }
 
