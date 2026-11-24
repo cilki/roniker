@@ -341,6 +341,28 @@ impl<'a> NestedWalk<'a> {
             return;
         }
 
+        // Each value of a `HashMap<K, V>` or `BTreeMap<K, V>` is a value of `V`
+        // in its own right, the way each element of a `Vec<T>` is one of `T`:
+        // `value_type` sees through the map's declared type to `V`. The keys
+        // are left alone. The validator reports a required field missing from
+        // a map value, and without this the quick-fix for it never showed up.
+        if value.kind() == "map" {
+            for (key, entry) in ts_utils::map_entries(value) {
+                if !self.touches(&entry) {
+                    continue;
+                }
+                let key = ts_utils::node_text(&key, self.content).unwrap_or("?");
+                self.walk_value(
+                    &entry,
+                    declared_type,
+                    &format!("{path}[{key}]"),
+                    depth - 1,
+                    actions,
+                );
+            }
+            return;
+        }
+
         // RON spells an inhabited `Option` as `Some(value)`. The field's type
         // describes the value inside, not the `Some` wrapper.
         if let Some(inner) = ts_utils::unwrap_some(value, self.content) {
@@ -2203,6 +2225,33 @@ mod tests {
             vec![(
                 "Add 1 required field to certs[1]".to_string(),
                 "Cfg(\n    server: Server(host: \"h\", port: 1),\n    certs: [Tls(cert: \"a\"), Tls(cert: \"\")],\n    extra: None,\n)".to_string(),
+            )]
+        );
+    }
+
+    /// Each value of a `HashMap<K, V>` is a value of `V`, the same as an
+    /// element of a `Vec<V>`, and the action names it by its key. The walk
+    /// stopped at the map, so the validator's `missing-required-field` on a
+    /// map value came with no quick-fix.
+    #[test]
+    fn test_nested_struct_walk_visits_map_values() {
+        let (_, analyzer) = nested_struct_fixture();
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "certs".to_string(),
+                type_name: "HashMap<String, Option<Tls>>".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let content = "Cfg(\n    certs: {\n        \"a\": Some(Tls(cert: \"x\")),\n        \"b\": Some(Tls()),\n    },\n)";
+
+        assert_eq!(
+            missing_field_actions(content, &root, &analyzer),
+            vec![(
+                "Add 1 required field to certs[\"b\"]".to_string(),
+                "Cfg(\n    certs: {\n        \"a\": Some(Tls(cert: \"x\")),\n        \"b\": Some(Tls(cert: \"\")),\n    },\n)".to_string(),
             )]
         );
     }
