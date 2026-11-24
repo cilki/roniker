@@ -943,10 +943,17 @@ fn check_declared_type(
 
     let expected = normalize_type(expected_type);
     let trimmed = value_text?.trim();
-    // `Name(..)` and a bare `Name` both name a type or variant. RON's unnamed
-    // struct syntax (`(..)`) leaves nothing before the paren and so names
-    // nothing, which never contradicts the declared type.
-    let named = trimmed.split('(').next().unwrap_or("").trim();
+    // `Name(..)` and a bare `Name` both name a type or variant. Anything else
+    // names nothing: RON's unnamed struct syntax (`(..)`) leaves nothing before
+    // the paren, and an array, a map or a string opens with a bracket or a
+    // quote — even when a `(` turns up further in, inside an element or the
+    // string, so what comes before that paren is no name.
+    let head = trimmed.split('(').next().unwrap_or("").trim();
+    let named = if is_bare_name(head.strip_prefix("r#").unwrap_or(head)) {
+        head
+    } else {
+        ""
+    };
 
     // A name that could be a type or a variant is resolved against the
     // analyzer; anything else (`42`, `"x"`) is judged by its shape below.
@@ -988,20 +995,20 @@ fn check_declared_type(
     if !expected.starts_with(char::is_uppercase) {
         return None;
     }
-    if trimmed.contains('(') {
-        if named.is_empty() {
-            // Unnamed struct syntax infers the type, so it always fits.
-            return None;
-        }
+    if !named.is_empty() && trimmed.contains('(') {
         return Some(format!("expected {}, got {}", expected_type, named));
     }
-    // A bare value. Anything that is not a literal is most likely an enum
-    // variant, which there is no enum definition here to check it against.
-    Some(format!(
-        "expected {}, got {}",
-        expected_type,
-        literal_kind(trimmed)?
-    ))
+    let found = match trimmed.as_bytes().first() {
+        // Unnamed struct syntax infers the type, so it always fits.
+        Some(b'(') => return None,
+        // `ron` takes neither for a struct or an enum, whatever is inside.
+        Some(b'[') => "array",
+        Some(b'{') => "map",
+        // A bare value. Anything that is not a literal is most likely an enum
+        // variant, which there is no enum definition here to check it against.
+        _ => literal_kind(trimmed)?,
+    };
+    Some(format!("expected {}, got {}", expected_type, found))
 }
 
 /// Whether `text` is a lone identifier, the way RON writes a unit variant or a
@@ -2157,6 +2164,104 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("expected Retry, got char")),
             "'a' for Retry should be reported, got {errors:?}"
+        );
+    }
+
+    /// An array, a map or a string written where a struct or an enum belongs
+    /// names no type, and `ron` refuses each of them (`ExpectedNamedStructLike`
+    /// / `ExpectedIdentifier`). Everything before the first `(` was taken for
+    /// the name the value wrote, so the messages quoted a fragment of the
+    /// value — `got [Server`, `unknown variant '"Empty"'` — and an array with
+    /// no `(` in it was not reported at all.
+    #[test]
+    fn test_array_map_or_string_for_a_struct_or_enum_is_named_by_its_shape() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "port".to_string(),
+                type_name: "u16".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Shape".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Empty".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Rect".to_string(),
+                    fields: vec![FieldInfo {
+                        name: "0".to_string(),
+                        type_name: "u32".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let errors = |type_name: &str, value: &str| -> Vec<String> {
+            validate_ron_with_analyzer(
+                &format!("Cfg(n: {value})"),
+                None,
+                &single_field_type(type_name),
+                &analyzer,
+            )
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message)
+            .collect()
+        };
+
+        for (type_name, value, expected) in [
+            ("Server", "[1, 2]", "expected Server, got array"),
+            ("Server", "[]", "expected Server, got array"),
+            ("Server", "[Server(port: 1)]", "expected Server, got array"),
+            (
+                "Server",
+                r#"{"a": Server(port: 1)}"#,
+                "expected Server, got map",
+            ),
+            ("Server", r#""a(b""#, "expected Server, got string"),
+            ("Shape", "[Empty]", "expected Shape, got array"),
+            ("Shape", "[Rect(1)]", "expected Shape, got array"),
+            ("Shape", r#""Empty""#, "expected Shape, got string"),
+            ("Shape", r#""Rect(1)""#, "expected Shape, got string"),
+            ("Shape", "{}", "expected Shape, got map"),
+        ] {
+            let found = errors(type_name, value);
+            assert!(
+                found.len() == 1 && found[0].contains(expected),
+                "{value} for {type_name} should report only {expected:?}, got {found:?}"
+            );
+        }
+
+        // What a value does name is still held to the declared type.
+        for (type_name, value) in [
+            ("Server", "Server(port: 1)"),
+            ("Server", "(port: 1)"),
+            ("Shape", "Empty"),
+            ("Shape", "Rect(1)"),
+        ] {
+            let found = errors(type_name, value);
+            assert!(
+                found.is_empty(),
+                "{value} is a valid {type_name}, got {found:?}"
+            );
+        }
+        assert!(
+            errors("Server", "Shape(port: 1)")
+                .iter()
+                .any(|m| m.contains("expected Server, got Shape")),
+        );
+        assert!(
+            errors("Shape", "Circle")
+                .iter()
+                .any(|m| m.contains("Unknown variant 'Circle'")),
         );
     }
 
@@ -5152,17 +5257,17 @@ mod tests {
 
     /// What a value *names* is checked against the type the field is declared
     /// as. Each of these spellings is wrong in a different way and the message
-    /// has to name which: a bare value in an enum field is not one of its
-    /// variants, a struct value naming a type that doesn't exist is a different
-    /// mistake from one naming a type that does, and a literal where a struct
-    /// belongs is reported by what the literal is.
+    /// has to name which: a struct value naming a type that doesn't exist is a
+    /// different mistake from one naming a type that does, and a literal where
+    /// a struct or an enum belongs is reported by what the literal is.
     #[test]
     fn test_named_type_is_checked_against_the_declared_type() {
         for (content, expected) in [
-            // A value that names no variant of the enum it is declared as.
+            // A literal where an enum belongs names no variant at all, and is
+            // reported by what it is, the way one where a struct belongs is.
             (
                 r#"Config(mode: 42, server: Server(host: "x"))"#,
-                "Type mismatch: unknown variant '42' for enum Mode",
+                "Type mismatch: expected Mode, got integer",
             ),
             // A struct value naming a type that is registered, but not the one
             // the field is declared as.
