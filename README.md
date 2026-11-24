@@ -238,8 +238,9 @@ Opening a RON file matched by the pattern above gets you:
     `(secs: 0, nanos: 0)` for a `Duration`
   - *Add N required fields to `path`* for any value nested below it that the
     cursor (or selection) is in — a struct, an enum variant, an element of a
-    `Vec`, or the contents of a `Some(...)` — naming it the way the file spells
-    it (`server.tls`, `mode::Prod`, `certs[1]`). The fields go into that value's
+    `Vec`, a value of a `HashMap`/`BTreeMap`, or the contents of a `Some(...)` —
+    naming it the way the file spells it (`server.tls`, `mode::Prod`,
+    `certs[1]`, `backends["main"]`). The fields go into that value's
     own parentheses. Only the required-field form is offered here; there is no
     *Add all* counterpart below the root
   - *Change to '...'*, offered as the preferred quick-fix on an
