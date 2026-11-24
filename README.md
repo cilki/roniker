@@ -244,7 +244,10 @@ Opening a RON file matched by the pattern above gets you:
 - code actions:
   - *Add N required fields* and *Add all N missing fields* on the root value,
     for structs and for enum variants alike. An enum root's titles name the
-    variant the fields belong to: *Add all 2 missing fields to Prod*. Each
+    variant the fields belong to: *Add all 2 missing fields to Prod*. *Add
+    all* is only offered when it adds more than *Add required* does: when
+    every missing field is required, the two would make the same edit and
+    only *Add N required fields* is listed. Each
     field is filled in with a value `ron` will read, which for the types of
     [Standard-library types](#standard-library-types) is the spelling listed
     there: `""` for a `PathBuf`, `1` for a `NonZeroU32`,

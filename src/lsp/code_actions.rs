@@ -419,11 +419,18 @@ impl<'a> NestedWalk<'a> {
             true => Vec::new(),
             false => super::type_utils::missing_required_fields(&target.fields, present),
         };
-        let all = match offer_all {
+        let all: Vec<_> = match offer_all {
             true => super::type_utils::missing_fields(&target.fields, present)
                 .cloned()
                 .collect(),
             false => Vec::new(),
+        };
+        // The required fields are a subset of the missing ones, so when there
+        // are as many of each the two actions would make the very same edit.
+        // Offering both just puts two indistinguishable entries in the menu.
+        let all = match all.len() == required.len() {
+            true => Vec::new(),
+            false => all,
         };
         let suffix = match target.path.is_empty() {
             true => String::new(),
@@ -1944,16 +1951,10 @@ mod tests {
         let actions = missing_field_actions(content, &root, &analyzer);
         assert_eq!(
             actions,
-            vec![
-                (
-                    "Add 2 required fields".to_string(),
-                    "Cfg(\n    mode: Dev,\n    owner: UserId(0),\n)".to_string(),
-                ),
-                (
-                    "Add all 2 missing fields".to_string(),
-                    "Cfg(\n    mode: Dev,\n    owner: UserId(0),\n)".to_string(),
-                ),
-            ]
+            vec![(
+                "Add 2 required fields".to_string(),
+                "Cfg(\n    mode: Dev,\n    owner: UserId(0),\n)".to_string(),
+            )]
         );
 
         for (title, fixed) in actions {
@@ -2022,6 +2023,51 @@ mod tests {
         analyzer: &RustAnalyzer,
     ) -> Vec<(String, String)> {
         missing_field_actions_in(content, type_info, analyzer, WHOLE_DOCUMENT)
+    }
+
+    /// "Add all missing fields" is only worth offering when it adds something
+    /// "Add required fields" doesn't. When every missing field is required the
+    /// two made the same edit, and the menu showed the fix twice under two
+    /// titles. With an optional field missing too, both stay on offer.
+    #[test]
+    fn test_add_all_is_not_offered_when_it_adds_only_the_required_fields() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let root = TypeInfo {
+            name: "Cfg".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("port", "u16"),
+                field("host", "String"),
+                field("timeout", "Option<u64>"),
+            ]),
+            ..Default::default()
+        };
+        let analyzer = RustAnalyzer::new();
+        let titles = |content: &str| -> Vec<String> {
+            missing_field_actions(content, &root, &analyzer)
+                .into_iter()
+                .map(|(title, _)| title)
+                .collect()
+        };
+
+        // Only required fields are missing: one action.
+        assert_eq!(
+            titles("Cfg(\n    timeout: None,\n)"),
+            vec!["Add 2 required fields"]
+        );
+        // An optional field is missing as well: both, since they now differ.
+        assert_eq!(
+            titles("Cfg(\n)"),
+            vec!["Add 2 required fields", "Add all 3 missing fields"]
+        );
+        // Only an optional field is missing: just the "all" action.
+        assert_eq!(
+            titles("Cfg(\n    port: 1,\n    host: \"\",\n)"),
+            vec!["Add all 1 missing field"]
+        );
     }
 
     /// [`missing_field_actions`] for an editor asking about `range` only.
