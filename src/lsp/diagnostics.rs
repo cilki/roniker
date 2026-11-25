@@ -616,15 +616,21 @@ fn validate_nested_value<'a>(
         // as `expected Mode, got ()`.
         //
         // An `Option`'s `None` is the one spelling with nothing wrapped to look
-        // at.
+        // at. `Some(..)` and `None` are the `Option`'s own, though: a `Box` is
+        // written as the bare value it holds, and `ron` stops at the `Some` of
+        // `Some(Limits(..))` written for a `Box<Limits>` ("Expected struct
+        // `Limits` but found `Some`"), so only an `Option` is seen through.
         if unregistered(inner_type) {
             diagnostics.push(unknown_type_diag(inner_type));
         } else {
-            let is_none = field_type_normalized.starts_with("Option<")
-                && super::ts_utils::node_text(value_node, content) == Some("None");
+            let is_option = field_type_normalized.starts_with("Option<");
+            let is_none =
+                is_option && super::ts_utils::node_text(value_node, content) == Some("None");
             if !is_none {
-                let inner =
-                    super::ts_utils::unwrap_some(value_node, content).unwrap_or(*value_node);
+                let inner = is_option
+                    .then(|| super::ts_utils::unwrap_some(value_node, content))
+                    .flatten()
+                    .unwrap_or(*value_node);
                 diagnostics.extend(validate_typed_value(&inner, content, inner_type, analyzer));
             }
             settled = true;
@@ -1029,6 +1035,15 @@ fn check_declared_type(
         // Otherwise a struct, whose value names the struct itself.
         if named == short_name(&expected) {
             return None;
+        }
+        // `Some(..)` and `None` are an `Option`'s spellings, not a misspelled
+        // type: say what was written, the way a primitive field does.
+        if analyzer.get_type_info(named).is_none() {
+            match named {
+                "Some" => return Some(format!("expected {}, got Some(...)", expected_type)),
+                "None" => return Some(format!("expected {}, got None", expected_type)),
+                _ => {}
+            }
         }
         // A different name that nothing in the workspace defines is a
         // misspelled or missing type, which is worth saying instead of just
@@ -3021,6 +3036,87 @@ mod tests {
             assert!(
                 errors.iter().any(|m| m.contains("Unknown type 'Ghost'")),
                 "{literal} in {type_name} should report the unregistered type, got {errors:?}"
+            );
+        }
+    }
+
+    /// `Some(..)` and `None` are an `Option`'s spellings and no other
+    /// wrapper's: a `Box` is written as the bare value it holds, and `ron`
+    /// refuses `Some(..)` and `None` for one ("Expected struct `Retry` but
+    /// found `Some`"). Seeing through `Some(..)` for every single-value
+    /// wrapper passed `Some((attempts: 3))` for a `Box<Retry>` as clean, and
+    /// `None` came back as an unknown type of that name.
+    #[test]
+    fn test_some_and_none_belong_to_option_alone() {
+        let errors_for = |type_name: &str, literal: &str| -> Vec<String> {
+            let mut analyzer = RustAnalyzer::new();
+            analyzer.add_type(TypeInfo {
+                name: "Retry".to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "attempts".to_string(),
+                    type_name: "u8".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            analyzer.add_type(TypeInfo {
+                name: "Mode".to_string(),
+                kind: TypeKind::Enum(vec![EnumVariant {
+                    name: "Fast".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            let config = single_field_type(type_name);
+            validate_ron_with_analyzer(&format!("Cfg(n: {literal})"), None, &config, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
+        };
+
+        for (type_name, literal, expected) in [
+            (
+                "Box<Retry>",
+                "Some((attempts: 3))",
+                "expected Retry, got Some(...)",
+            ),
+            (
+                "Box<Retry>",
+                "Some(Retry(attempts: 3))",
+                "expected Retry, got Some(...)",
+            ),
+            ("Box<Retry>", "None", "expected Retry, got None"),
+            ("Retry", "None", "expected Retry, got None"),
+            (
+                "Vec<Retry>",
+                "[Some((attempts: 3))]",
+                "expected Retry, got Some(...)",
+            ),
+            ("Arc<u8>", "Some(3)", "expected u8, got Some(...)"),
+            ("Box<Mode>", "Some(Fast)", "Unknown variant 'Some'"),
+        ] {
+            let errors = errors_for(type_name, literal);
+            assert!(
+                errors.len() == 1 && errors[0].contains(expected),
+                "{literal} in {type_name} should report only {expected:?}, got {errors:?}"
+            );
+        }
+
+        // Through an `Option`, and through a `Box` around one, both spellings
+        // still fit.
+        for (type_name, literal) in [
+            ("Option<Retry>", "Some((attempts: 3))"),
+            ("Option<Retry>", "None"),
+            ("Box<Option<Retry>>", "Some(Retry(attempts: 3))"),
+            ("Box<Option<Retry>>", "None"),
+            ("Box<Retry>", "(attempts: 3)"),
+            ("Box<Mode>", "Fast"),
+        ] {
+            let errors = errors_for(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is valid for {type_name}, got {errors:?}"
             );
         }
     }
