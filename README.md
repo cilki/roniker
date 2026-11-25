@@ -275,6 +275,12 @@ whole, and the one message lands on the array (`in Vec: expected u16, got
 string`). Either way a non-array written where a `Vec` belongs is reported as
 the mismatch it is (`expected Vec<String>, got number`).
 
+A document that enables `unwrap_newtypes` in its header
+(`#![enable(unwrap_newtypes)]`) writes a newtype struct such as
+`struct Port(u16)` as the value it wraps, so `port: 80` is checked as the `u16`
+it stands for, and the wrapped `Port(80)` — which `ron` refuses under that
+extension — is a `type-mismatch`.
+
 ### Standard-library types
 
 A configuration type is mostly made of standard-library types, and the analyzer

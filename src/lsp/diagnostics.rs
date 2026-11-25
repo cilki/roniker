@@ -654,6 +654,31 @@ fn validate_nested_value<'a>(
             }
             settled = true;
         }
+    } else if let Some(inner_type) = analyzer
+        .get_type_info(&field_type_normalized)
+        .and_then(newtype_inner)
+        && super::ts_utils::extension_enabled(value_node, content, "unwrap_newtypes")
+    {
+        // Under `unwrap_newtypes` a newtype struct is written as the value it
+        // wraps and nothing else: `ron` reads `port: 80` straight into a
+        // `Port(u16)`, and refuses both `Port(80)` and `(80)` with the error
+        // the inner type gives (`ExpectedInteger`). The value is the inner
+        // type's, so it is checked against that, the way a `Box`'s is — but
+        // the wrapped spelling is named for what it is first, since checked
+        // against the inner type it would read as a stray struct or array.
+        let name = short_name(&field_type_normalized);
+        if super::ts_utils::struct_name(value_node, content) == Some(name) {
+            let tail = format!(
+                "expected {inner_type}, got {name}(..): with unwrap_newtypes enabled, \
+                 {name} is written as the value it wraps"
+            );
+            diagnostics.push(type_mismatch(value_node, content, &tail));
+        } else {
+            diagnostics.extend(validate_typed_value(
+                value_node, content, inner_type, analyzer,
+            ));
+        }
+        settled = true;
     } else if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized) {
         // A plain struct/enum the workspace defines — validate the node
         // directly. Asked before the standard-library table below, so a
@@ -704,6 +729,18 @@ fn validate_nested_value<'a>(
     Nested {
         diagnostics,
         settled,
+    }
+}
+
+/// The type a newtype struct (`struct Port(u16);`) wraps, or `None` for any
+/// other struct or enum.
+fn newtype_inner(type_info: &TypeInfo) -> Option<&str> {
+    match &type_info.kind {
+        TypeKind::Struct(fields) => match fields.as_slice() {
+            [only] if only.is_positional() => Some(&only.type_name),
+            _ => None,
+        },
+        TypeKind::Enum(_) => None,
     }
 }
 
@@ -2969,6 +3006,101 @@ mod tests {
             assert!(
                 errors.iter().any(|m| m.contains(expected)),
                 "{literal} for {type_name} should report {expected:?}, got {errors:?}"
+            );
+        }
+    }
+
+    /// Under `#![enable(unwrap_newtypes)]` `ron` reads a newtype struct from
+    /// the bare value it wraps, and refuses the wrapped `Port(80)` spelling
+    /// with the inner type's error. A correct `port: 80` used to be reported as
+    /// `expected Port, got integer`, and the `Port(80)` that fails to load
+    /// passed. Every case here was checked against `ron` 0.12.
+    #[test]
+    fn test_unwrap_newtypes_reads_a_newtype_as_the_value_it_wraps() {
+        let errors_for = |header: &str, type_name: &str, literal: &str| -> Vec<String> {
+            let mut analyzer = RustAnalyzer::new();
+            for (name, inner) in [("Port", "u16"), ("Wrap", "Inner")] {
+                analyzer.add_type(TypeInfo {
+                    name: name.to_string(),
+                    kind: TypeKind::Struct(vec![FieldInfo {
+                        name: "0".to_string(),
+                        type_name: inner.to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                });
+            }
+            analyzer.add_type(TypeInfo {
+                name: "Inner".to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
+                    name: "a".to_string(),
+                    type_name: "u8".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            let config = single_field_type(type_name);
+            let content = format!("{header}\nCfg(n: {literal})");
+            validate_ron_with_analyzer(&content, None, &config, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| d.message)
+                .collect()
+        };
+        let unwrap = "#![enable(unwrap_newtypes)]";
+
+        for (header, type_name, literal) in [
+            (unwrap, "Port", "80"),
+            (unwrap, "Vec<Port>", "[1, 2]"),
+            (unwrap, "Option<Wrap>", "Some((a: 1))"),
+            (unwrap, "Option<Wrap>", "Some(Inner(a: 1))"),
+            ("#![enable(implicit_some, unwrap_newtypes)]", "Port", "80"),
+            // Without the extension the wrapped spelling is the right one.
+            ("", "Port", "Port(80)"),
+            ("", "Option<Wrap>", "Some(Wrap((a: 1)))"),
+        ] {
+            let errors = errors_for(header, type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is valid for {type_name} under {header:?}, got {errors:?}"
+            );
+        }
+
+        for (header, type_name, literal, expected) in [
+            (unwrap, "Port", "Port(80)", "expected u16, got Port(..)"),
+            (
+                unwrap,
+                "Option<Wrap>",
+                "Some(Wrap(Inner(a: 1)))",
+                "got Wrap(..)",
+            ),
+            // The bare value is checked against the type it stands for.
+            (unwrap, "Port", "70000", "70000 is out of range for u16"),
+            (
+                unwrap,
+                "Vec<Port>",
+                r#"[1, "x"]"#,
+                "expected u16, got string",
+            ),
+            (
+                unwrap,
+                "Option<Wrap>",
+                "Some((a: 300))",
+                "300 is out of range for u8",
+            ),
+            // An extension other than `unwrap_newtypes` changes nothing here.
+            (
+                "#![enable(implicit_some)]",
+                "Port",
+                "80",
+                "expected Port, got integer",
+            ),
+            ("", "Port", "80", "expected Port, got integer"),
+        ] {
+            let errors = errors_for(header, type_name, literal);
+            assert!(
+                errors.len() == 1 && errors[0].contains(expected),
+                "{literal} for {type_name} under {header:?} should report {expected:?}, got {errors:?}"
             );
         }
     }

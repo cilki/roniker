@@ -907,6 +907,34 @@ pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
     None
 }
 
+/// Whether the document `node` belongs to switches on the RON extension `name`
+/// in an `#![enable(...)]` line of its header. An extension changes what `ron`
+/// accepts everywhere below it — under `unwrap_newtypes` a newtype struct is
+/// written as the bare value it wraps — so it is asked of the document, not of
+/// the value at hand.
+pub fn extension_enabled(node: &Node, content: &str, name: &str) -> bool {
+    let mut root = *node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    let Some(extensions) = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "extensions")
+    else {
+        return false;
+    };
+    let mut cursor = extensions.walk();
+    extensions.named_children(&mut cursor).any(|extension| {
+        let mut cursor = extension.walk();
+        let mut words = extension
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .filter_map(|child| node_text(&child, content));
+        words.next() == Some("enable") && words.any(|word| word == name)
+    })
+}
+
 /// The single value inside an explicit `Some(...)`, which is how RON spells an
 /// inhabited `Option`. `None` for every other shape, including the bare `value`
 /// form that RON also accepts and a struct that happens to be named `Some`.
