@@ -222,11 +222,13 @@ Opening a RON file matched by the pattern above gets you:
     inside are not `Configuration`'s fields gone wrong. Mind the code if you
     filter by it: a message reading *unknown type* or *unknown variant* is
     still tagged `type-mismatch`, not `unknown-type` or `unknown-variant`.
-    Lastly it is the three ways a tuple or fixed-size array field can go wrong,
+    Lastly it is the four ways a tuple or fixed-size array field can go wrong,
     for which see [Tuples and arrays](#tuples-and-arrays) below: the bracket
-    spelling (`[u32; 3] is written as a tuple, not an array`), the wrong number
-    of elements (`expected 3 elements for [u32; 3], got 2`), and an element
-    that doesn't fit the type its position declares, reported on that element.
+    spelling (`[u32; 3] is written as a tuple, not an array`), a name in front
+    of the parentheses (`(String, u16) is written as a tuple, without a name,
+    not as Pair(..)`), the wrong number of elements (`expected 3 elements for
+    [u32; 3], got 2`), and an element that doesn't fit the type its position
+    declares, reported on that element.
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file.
     This is about the *declaration*; a value naming a type nobody registered is
@@ -319,7 +321,8 @@ RON writes a Rust tuple and a fixed-size array **both** as a parenthesized
 tuple. Brackets belong to the types whose length the value decides — `Vec`,
 slices, `HashSet`, `BTreeSet` — and `ron` refuses them for the other two, so a
 `(String, u16)` field is written `("a", 2)` and a `[u32; 3]` field is written
-`(1, 2, 3)`, not `[1, 2, 3]`.
+`(1, 2, 3)`, not `[1, 2, 3]`. Nor does either take a name: `Pair("a", 2)` is
+a tuple struct, and `ron` refuses it at the name whatever is inside.
 
 The server follows `ron` here. A field declared as either gets its arity and
 each of its positions checked against the type that position declares, and a

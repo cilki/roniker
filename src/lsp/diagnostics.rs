@@ -745,6 +745,18 @@ fn validate_tuple_value(
                 "{field_type} is written as a tuple, not an array"
             )));
         }
+        // A name in front of the parentheses makes it a tuple struct, and
+        // `ron` refuses one for a tuple or a fixed-size array at the name
+        // ("Expected opening `(`"), whatever is inside. Neither the grammar,
+        // which calls it a `struct`, nor `ron::Value`, which drops the name and
+        // keeps the elements, tells the two apart, so `Pair(300, 4)` for a
+        // `(u8, String)` passed as clean, elements and all.
+        "struct" => {
+            let name = super::ts_utils::struct_name(value_node, content)?;
+            return Some(mismatch(format!(
+                "{field_type} is written as a tuple, without a name, not as {name}(..)"
+            )));
+        }
         _ => return None,
     };
 
@@ -2376,6 +2388,21 @@ mod tests {
             ("(String, u16)", "5", "got number"),
             ("(String, u16)", r#""x""#, "got string"),
             ("(String, u16)", r#"(host: "h")"#, "got map/struct"),
+            // A name makes it a tuple struct, which `ron` refuses at the name
+            // however well the elements fit — and `ron::Value`, dropping the
+            // name, used to let through whatever elements it held.
+            (
+                "(String, u16)",
+                r#"Pair("a", 2)"#,
+                "written as a tuple, without a name, not as Pair(..)",
+            ),
+            (
+                "(String, u16)",
+                "Pair(300, 4)",
+                "written as a tuple, without a name, not as Pair(..)",
+            ),
+            ("[u32; 2]", "Pair()", "not as Pair(..)"),
+            ("Vec<(String, u16)>", r#"[Pair("a", 1)]"#, "not as Pair(..)"),
             // A wrapper around a composite is seen through to it.
             (
                 "Vec<(String, u16)>",
