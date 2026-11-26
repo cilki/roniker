@@ -134,8 +134,11 @@ pub fn format_ron(content: &str) -> String {
 ///
 /// Each level of nesting is indented by one `indent`, which is
 /// [`indent_unit`] of the client's formatting options.
+///
+/// A selection the layout leaves alone comes back as it was.
 pub fn format_selection(content: &str, newline: &'static str, base: &str, indent: &str) -> String {
     layout(&ts_utils::parse(content), content, newline, base, indent)
+        .unwrap_or_else(|| content.to_string())
 }
 
 /// Lay `content` out, whose parse tree the caller already has.
@@ -147,7 +150,14 @@ pub fn format_selection(content: &str, newline: &'static str, base: &str, indent
 ///
 /// Each level of nesting is indented by one `indent`, as in
 /// [`format_selection`].
-pub fn format_tree(tree: &Tree, content: &str, indent: &str) -> String {
+///
+/// `None` when the document is to be left alone — it doesn't parse, or is too
+/// deep to lay out. That is not the same as handing `content` back: the layout
+/// ends at the root value, so the caller compares it with the text up to the
+/// end of the last line, and an unchanged document ending in a line break
+/// never matched. Every format-on-save of a half-typed file appended another
+/// blank line to it.
+pub fn format_tree(tree: &Tree, content: &str, indent: &str) -> Option<String> {
     layout(tree, content, ts_utils::line_ending(content), "", indent)
 }
 
@@ -155,11 +165,19 @@ pub fn format_tree(tree: &Tree, content: &str, indent: &str) -> String {
 /// `newline` and starting each but the first with `base`, then one `indent`
 /// per level of nesting. Comments and other leaves are copied verbatim, line
 /// breaks inside them included.
-fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str, indent: &str) -> String {
+///
+/// `None` when `content` is to be left as it is.
+fn layout(
+    tree: &Tree,
+    content: &str,
+    newline: &'static str,
+    base: &str,
+    indent: &str,
+) -> Option<String> {
     // Laying the document out is recursive, so a tree too deep to walk is left
     // alone, exactly as an unparseable one is.
     if ts_utils::exceeds_max_depth(&tree.root_node()) {
-        return content.to_string();
+        return None;
     }
 
     // So is a tree tree-sitter had to recover from a syntax error. Its ERROR
@@ -169,11 +187,11 @@ fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str, indent:
     // `timeout,\n:,`. Editors format on save, which is exactly when a document
     // is most often half-typed, so the text is left alone until it parses.
     if tree.root_node().has_error() {
-        return content.to_string();
+        return None;
     }
 
     let Some(main_value) = ts_utils::find_main_value(tree) else {
-        return String::new();
+        return Some(String::new());
     };
 
     let mut formatter = Formatter {
@@ -209,10 +227,10 @@ fn layout(tree: &Tree, content: &str, newline: &'static str, base: &str, indent:
     // show for it; the layout notices them on the way and they are left alone
     // for the same reason a syntax error is.
     if formatter.malformed {
-        return content.to_string();
+        return None;
     }
 
-    formatter.output.trim_end().to_string()
+    Some(formatter.output.trim_end().to_string())
 }
 
 /// The document being laid out, and the text being laid out from it.
