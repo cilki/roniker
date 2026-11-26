@@ -184,12 +184,11 @@ pub fn find_current_variant_context(
         if node.kind() != "struct" || is_some_wrapper(&node, content) {
             return None;
         }
-        // A struct is a variant when it has a name that starts uppercase.
-        let name = struct_name(&node, content)?;
-        name.chars()
-            .next()
-            .filter(|c| c.is_uppercase())
-            .map(|_| name.to_string())
+        // Whatever the name's case: serde spells a variant renamed by
+        // `rename_all = "snake_case"` and the like in lowercase, `custom(..)`.
+        // Whether it really names a variant is the caller's to decide, against
+        // the enum's serialized names.
+        struct_name(&node, content).map(str::to_string)
     })
 }
 

@@ -2500,7 +2500,32 @@ Document::new(content.to_string()),
         let mut analyzer = RustAnalyzer::with_root_type("Config");
         analyzer.add_type(TypeInfo {
             name: "Config".to_string(),
-            kind: TypeKind::Struct(vec![field("port", "Port"), field("shapes", "Vec<Shape>")]),
+            kind: TypeKind::Struct(vec![
+                field("port", "Port"),
+                field("shapes", "Vec<Shape>"),
+                field("levels", "Vec<Level>"),
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Level".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Info".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Custom".to_string(),
+                    fields: vec![field("verbosity", "u8")],
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Pair".to_string(),
+                    fields: vec![field("0", "Mode"), field("1", "Mode")],
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("snake_case".to_string()),
             ..Default::default()
         });
         analyzer.add_type(TypeInfo {
@@ -2569,6 +2594,9 @@ Document::new(content.to_string()),
             ("Config(shapes: [Many([|])])", &modes),
             // A struct variant still takes its fields by name.
             ("Config(shapes: [Circle(|)])", &vec!["radius"]),
+            // A variant serde spells in lowercase is one all the same.
+            ("Config(levels: [custom(|)])", &vec!["verbosity"]),
+            ("Config(levels: [pair(|)])", &modes),
         ] {
             let offset = marked.find('|').unwrap();
             let content = marked.replacen('|', "", 1);
