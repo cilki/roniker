@@ -583,18 +583,19 @@ impl EnumVariant {
     }
 
     /// Whether a document naming `name` is naming this variant: its serialized
-    /// name (honoring `rename`/`rename_all`) or its Rust name, the latter also
-    /// matched case-insensitively.
+    /// name, honoring `rename`/`rename_all`, spelled exactly.
     ///
-    /// The case-insensitive fallback is deliberately lenient. A `rename_all`
-    /// convention the analyzer failed to record would otherwise turn every
-    /// variant in a correct document into an "unknown variant" error, and a
-    /// false error is worse than a missed one. This is the one place that
-    /// decides the question, so every feature answers it the same way.
+    /// That is the only name serde's derived deserializer matches a variant
+    /// by, and `ron` refuses anything else with "no such enum variant" — the
+    /// Rust name once a rename applies, and any other capitalization of either
+    /// (`production` for a `Production`). Accepting those here reported a
+    /// document the application cannot load as clean. Every `rename_all`
+    /// convention serde accepts is applied by [`rename_all_variant`], and serde
+    /// rejects any other at compile time, so there is no convention left for
+    /// a looser match to cover for. This is the one place that decides the
+    /// question, so every feature answers it the same way.
     pub fn accepts_name(&self, name: &str, container_rename_all: Option<&str>) -> bool {
-        self.name == name
-            || self.serialized_name(container_rename_all) == name
-            || self.name.eq_ignore_ascii_case(name)
+        self.serialized_name(container_rename_all) == name
     }
 }
 

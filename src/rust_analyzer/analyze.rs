@@ -1222,7 +1222,8 @@ mod tests {
 
         let mode = analyzer.get_type_info("crate::Mode").unwrap();
         assert_eq!(mode.rename_all.as_deref(), Some("snake_case"));
-        let old = mode.find_variant("OldMode").unwrap();
+        let old = mode.find_variant("legacy").unwrap();
+        assert_eq!(old.name, "OldMode");
         assert_eq!(old.rename.as_deref(), Some("legacy"));
 
         // Serialized-name resolution built on the extracted attributes
@@ -1240,7 +1241,7 @@ mod tests {
         );
         assert_eq!(old.serialized_name(mode.rename_all.as_deref()), "legacy");
         assert_eq!(
-            mode.find_variant("FastMode")
+            mode.find_variant("fast_mode")
                 .unwrap()
                 .serialized_name(mode.rename_all.as_deref()),
             "fast_mode"
@@ -1251,19 +1252,22 @@ mod tests {
         assert!(config.find_field_serialized("maxConnections").is_some());
         assert!(config.find_field_serialized("max_connections").is_none());
 
-        // Every variant lookup goes through EnumVariant::accepts_name: the
-        // serialized name, the Rust name, and the Rust name case-insensitively.
+        // Every variant lookup goes through EnumVariant::accepts_name, which
+        // matches the serialized name and nothing else, exactly as serde does:
+        // the Rust name of a renamed variant and any other capitalization are
+        // "no such enum variant" to `ron`.
         let rename_all = mode.rename_all.as_deref();
-        for accepted in ["fast_mode", "FastMode", "fastmode"] {
+        assert!(mode.find_variant("fast_mode").is_some(), "rename_all");
+        for rejected in ["FastMode", "fastmode", "FAST_MODE", "Fast_Mode"] {
             assert!(
-                mode.find_variant(accepted).is_some(),
-                "'{accepted}' names FastMode"
+                mode.find_variant(rejected).is_none(),
+                "serde does not accept '{rejected}' for FastMode"
             );
         }
         assert!(mode.find_variant("legacy").is_some(), "explicit rename");
         assert!(
-            mode.find_variant("OldMode").is_some(),
-            "an explicit rename does not retire the Rust name"
+            mode.find_variant("OldMode").is_none(),
+            "an explicit rename retires the Rust name"
         );
         assert!(mode.find_variant("nonsense").is_none());
         assert!(!old.accepts_name("old_mode", rename_all), "rename wins");

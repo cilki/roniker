@@ -4768,7 +4768,7 @@ mod tests {
         };
 
         // rename_all applies to the first variant, explicit rename to the second
-        for content in ["fast_mode", "legacy", "FastMode"] {
+        for content in ["fast_mode", "legacy"] {
             let diagnostics = validate_ron_with_analyzer(content, None, &type_info, &analyzer);
             assert!(
                 !diagnostics
@@ -4788,6 +4788,88 @@ mod tests {
             "Unknown variant should still error. Got: {:?}",
             diagnostics
         );
+
+        // serde matches a variant by its serialized name and nothing else, so
+        // `ron` refuses the Rust name of a renamed variant ("no such enum
+        // variant") and so does the server, pointing at the name serde wants.
+        for (content, wanted) in [
+            ("FastMode", "fast_mode"),
+            ("FAST_MODE", "fast_mode"),
+            ("OldMode", "legacy"),
+        ] {
+            let errors: Vec<_> = validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+            assert_eq!(errors.len(), 1, "'{content}': {errors:?}");
+            assert_eq!(
+                errors[0].code,
+                Some(NumberOrString::String(codes::UNKNOWN_VARIANT.to_string())),
+                "'{content}': {errors:?}"
+            );
+            if content != "OldMode" {
+                // `OldMode` is too far from `legacy` for a "did you mean".
+                assert!(
+                    errors[0]
+                        .message
+                        .ends_with(&format!("(did you mean '{wanted}'?)")),
+                    "'{content}': {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// A variant written in another case than its declaration, on an enum
+    /// with no serde renames at all: `production` for `Production`. serde
+    /// compares variant names exactly, so `ron` refuses the document, and the
+    /// server used to accept it through a case-insensitive fallback. Reported
+    /// as an unknown variant whose "did you mean" names the right spelling —
+    /// which is also what the *Change to* quick-fix writes.
+    #[test]
+    fn test_variant_in_another_case_is_unknown() {
+        let analyzer = RustAnalyzer::new();
+        let type_info = TypeInfo {
+            name: "ServerMode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let errors = |content: &str| -> Vec<Diagnostic> {
+            validate_ron_with_analyzer(content, None, &type_info, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect()
+        };
+
+        assert!(errors("Production").is_empty(), "{:?}", errors("Production"));
+        for content in ["production", "PRODUCTION", "development"] {
+            let found = errors(content);
+            assert_eq!(found.len(), 1, "'{content}': {found:?}");
+            assert_eq!(
+                found[0].code,
+                Some(NumberOrString::String(codes::UNKNOWN_VARIANT.to_string())),
+                "'{content}': {found:?}"
+            );
+            let wanted = if content == "development" {
+                "Development"
+            } else {
+                "Production"
+            };
+            assert_eq!(
+                found[0].data,
+                Some(LSPAny::String(wanted.to_string())),
+                "'{content}' should suggest '{wanted}': {found:?}"
+            );
+        }
     }
 
     /// A raw string is a string. The grammar used to lex `r"h"` on to the last

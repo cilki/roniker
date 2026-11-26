@@ -192,7 +192,9 @@ Opening a RON file matched by the pattern above gets you:
     on the struct's name — or at the value's first character when the struct is
     written without one
   - `unknown-variant` - the value names something the enum the field expects has
-    no variant for
+    no variant for. Variant names are compared exactly, the way serde compares
+    them, so `production` for a `Production` variant is reported, with the
+    right spelling as its "did you mean"
   - `type-mismatch` - the value doesn't fit the type the field is declared as.
     That is a primitive of the wrong shape, e.g. a string where a `u16` is
     expected, or an integer the field's type can't hold (`port: -1` for a
@@ -378,7 +380,9 @@ your application will deserialize:
   `rename(deserialize = "...")` form is read too, since that's the direction a
   config file travels. A renamed field written under its Rust name is reported
   as `unknown-field`, suggesting the serde name: serde ignores that key, so the
-  value never reaches your application.
+  value never reaches your application. A renamed enum variant written under its
+  Rust name is reported as `unknown-variant` the same way, since `ron` refuses
+  it outright.
 - `#[serde(alias = "...")]` names are accepted alongside the primary one — on a
   struct field. An alias on an *enum variant* is dropped by the analyzer, so the
   `mode: production` serde accepts for an aliased `Prod` is reported as
