@@ -34,6 +34,9 @@ syn = { version = "2", features = [
   "full",
   "parsing",
   "extra-traits",
+  # To rewrite the `self::`/`super::`/`Self` paths inside a field's type into
+  # the full paths the types are registered under.
+  "visit-mut",
 ], optional = true }
 quote = { version = "1", optional = true }
 proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
