@@ -230,7 +230,11 @@ Opening a RON file matched by the pattern above gets you:
     of the parentheses (`(String, u16) is written as a tuple, without a name,
     not as Pair(..)`), the wrong number of elements (`expected 3 elements for
     [u32; 3], got 2`), and an element that doesn't fit the type its position
-    declares, reported on that element.
+    declares, reported on that element. A tuple struct (`struct Route(String,
+    u32)`, written `Route("a", 1)` or `("a", 1)`) and a tuple variant's payload
+    are held to the same two checks (`expected 2 elements for Route, got 1`,
+    `expected 2 elements for variant 'Rect', got 3`); fewer values are accepted
+    only where serde has a `#[serde(default)]` to fill the rest in from.
   - `unknown-type` - a field's declared type was never registered with the
     analyzer, which usually means the build script is missing a source file.
     This is about the *declaration*; a value naming a type nobody registered is

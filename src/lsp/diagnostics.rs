@@ -222,7 +222,8 @@ fn validate_struct_node(
         return diagnostics;
     }
     // Tuple/newtype structs and variants have positional fields ("0", "1", ...)
-    // — named-field validation doesn't apply to them.
+    // and are checked by [`validate_positional_values`] instead; what is left
+    // here is a struct that declares no fields at all, with nothing to check.
     if expected.fields.iter().all(|(_, f)| f.is_positional()) {
         return diagnostics;
     }
@@ -780,6 +781,100 @@ fn validate_tuple_value(
     )
 }
 
+/// Whether `fields` are those of a tuple or newtype struct or variant: named by
+/// position (`"0"`, `"1"`, ...) and written as values in order. A struct that
+/// declares no fields at all is not one — it has nothing to be positional.
+fn is_positional(fields: &[(String, FieldInfo)]) -> bool {
+    !fields.is_empty() && fields.iter().all(|(_, f)| f.is_positional())
+}
+
+/// Check the value written for a tuple struct (`Route("a", 80)`, `("a", 80)`)
+/// or a tuple variant's payload (`Rect(1, 2)`) against the positional `fields`
+/// it declares — by count, and then value by value against the type each
+/// position declares, the way [`validate_tuple_value`] checks a Rust tuple.
+///
+/// `ron` refuses a value with more elements than the type declares ("Expected
+/// closing `)`") and one with fewer ("Expected tuple struct Route with 2
+/// elements but found one element instead") — fewer is fine only where serde
+/// has a default to fill the rest in from: a container-level
+/// `#[serde(default)]`, or a `#[serde(default)]` on each position left out.
+/// `label` names the type or variant in the message.
+///
+/// Values written as named fields are left alone when there is a single
+/// position, since `#![enable(unwrap_variant_newtypes)]` lets `V(a: 1)` stand
+/// for `V(Inner(a: 1))`; with more than one, `ron` refuses them. A payload the
+/// grammar could not parse (see #203) is left alone too, since the values it
+/// would count are not the ones written.
+fn validate_positional_values(
+    node: &tree_sitter::Node,
+    content: &str,
+    label: &str,
+    fields: &[(String, FieldInfo)],
+    has_default: bool,
+    analyzer: &RustAnalyzer,
+) -> Vec<Diagnostic> {
+    use super::ts_utils;
+
+    let values = match node.kind() {
+        "struct" => {
+            if !ts_utils::struct_fields(node).is_empty() {
+                if fields.len() == 1 {
+                    return Vec::new();
+                }
+                return vec![type_mismatch(
+                    node,
+                    content,
+                    &format!("{label} is written with its values in order, not with named fields"),
+                )];
+            }
+            ts_utils::struct_values(node, content)
+        }
+        "tuple" => ts_utils::tuple_elements(node),
+        "unit" => Vec::new(),
+        // A literal, an array or a map: the surface check reports it by shape.
+        _ => return Vec::new(),
+    };
+    let mut cursor = node.walk();
+    if node.children(&mut cursor).any(|child| child.is_error()) {
+        return Vec::new();
+    }
+
+    // The fewest values serde accepts: up to the last position it has no
+    // default for.
+    let required = if has_default {
+        0
+    } else {
+        fields
+            .iter()
+            .rposition(|(_, f)| !f.has_default)
+            .map_or(0, |last| last + 1)
+    };
+    if values.len() > fields.len() || values.len() < required {
+        let expected = match required {
+            r if r == fields.len() => r.to_string(),
+            0 => format!("at most {}", fields.len()),
+            r => format!("{r} to {}", fields.len()),
+        };
+        return vec![type_mismatch(
+            node,
+            content,
+            &format!(
+                "expected {expected} element{} for {label}, got {}",
+                if fields.len() == 1 { "" } else { "s" },
+                values.len()
+            ),
+        )];
+    }
+
+    values
+        .iter()
+        .zip(fields)
+        .flat_map(|(value, (_, field))| {
+            validate_typed_value(value, content, &field.type_name, analyzer)
+        })
+        .collect()
+}
+
 /// The "unknown variant" diagnostic for a name the enum `type_info` does not
 /// accept, reported at `range` with a "did you mean" suggestion drawn from the
 /// enum's serialized variant names.
@@ -822,10 +917,21 @@ fn validate_node_with_type_info<'a>(
             if let Some(diagnostic) = struct_spelling_error(node, content, type_info) {
                 return vec![diagnostic];
             }
+            // The names serde accepts: serialized names, `skip` excluded,
+            // `flatten` expanded when the analyzer can resolve the target.
+            let fields = analyzer.effective_fields(type_info);
+            if is_positional(&fields) {
+                return validate_positional_values(
+                    node,
+                    content,
+                    short_name(&type_info.name),
+                    &fields,
+                    type_info.has_default,
+                    analyzer,
+                );
+            }
             let expected = ExpectedStruct {
-                // The names serde accepts: serialized names, `skip` excluded,
-                // `flatten` expanded when the analyzer can resolve the target.
-                fields: analyzer.effective_fields(type_info),
+                fields,
                 allow_unknown_fields: type_info.has_unresolved_flatten(analyzer),
                 has_default: type_info.has_default,
                 variant: None,
@@ -953,17 +1059,15 @@ fn validate_enum_node(
 
     // A tuple variant's fields are named by position ("0", "1", ...), so they
     // are matched to the payload values in order rather than by name.
-    if expected.iter().all(|(_, f)| f.is_positional()) {
-        let mut diagnostics = Vec::new();
-        for (value_node, (_, field)) in payload.iter().zip(&expected) {
-            diagnostics.extend(validate_typed_value(
-                value_node,
-                content,
-                &field.type_name,
-                analyzer,
-            ));
-        }
-        return diagnostics;
+    if is_positional(&expected) {
+        return validate_positional_values(
+            node,
+            content,
+            &format!("variant '{}'", named.name),
+            &expected,
+            type_info.has_default,
+            analyzer,
+        );
     }
 
     let expected = ExpectedStruct {
@@ -5211,6 +5315,165 @@ mod tests {
                 panic!("a tuple variant's payload must be checked. Got: {diagnostics:?}")
             });
         assert_eq!(mismatch.range.start, Position::new(0, 8));
+    }
+
+    /// A tuple struct's value and a tuple variant's payload are held to the
+    /// number of positions they declare and to each position's type, wherever
+    /// they sit: `ron` refuses every one of the documents below that this
+    /// reports, and loads every one it doesn't. Until this was checked, only a
+    /// tuple *variant*'s element types were, and `route: ("a")`,
+    /// `routes: [("a", "b")]` or `shape: Rect(1)` passed as clean.
+    #[test]
+    fn test_tuple_struct_and_variant_arity_and_elements() {
+        let mut analyzer = RustAnalyzer::new();
+        let positional = |types: &[&str], has_default: bool| -> Vec<FieldInfo> {
+            types
+                .iter()
+                .enumerate()
+                .map(|(i, t)| FieldInfo {
+                    name: i.to_string(),
+                    type_name: t.to_string(),
+                    has_default,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            has_default: true,
+            ..Default::default()
+        };
+        analyzer.add_type(TypeInfo {
+            name: "crate::Route".to_string(),
+            kind: TypeKind::Struct(positional(&["String", "u32"], false)),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Port".to_string(),
+            kind: TypeKind::Struct(positional(&["u16"], false)),
+            ..Default::default()
+        });
+        // `#[serde(default)]` on the container: serde fills in what is left out.
+        analyzer.add_type(TypeInfo {
+            name: "crate::Pad".to_string(),
+            kind: TypeKind::Struct(positional(&["u8", "u8"], false)),
+            has_default: true,
+            ..Default::default()
+        });
+        // `#[serde(default)]` on the second position only.
+        let mut trailing = positional(&["u8", "u8"], false);
+        trailing[1].has_default = true;
+        analyzer.add_type(TypeInfo {
+            name: "crate::Trailing".to_string(),
+            kind: TypeKind::Struct(trailing),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Shape".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Rect".to_string(),
+                fields: positional(&["u32", "u32"], false),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "crate::R".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("route", "Route"),
+                field("routes", "HashMap<String, Route>"),
+                field("list", "Vec<Route>"),
+                field("port", "Option<Port>"),
+                field("pad", "Pad"),
+                field("trailing", "Trailing"),
+                field("shape", "Shape"),
+            ]),
+            ..Default::default()
+        };
+        let errors = |content: &str| -> Vec<(Position, String)> {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| (d.range.start, d.message))
+                .collect()
+        };
+
+        for content in [
+            r#"R(route: Route("a", 1), list: [("a", 1)], routes: {"k": ("a", 2)})"#,
+            r#"R(route: ("a", 1,), port: Some(Port(80)), shape: Rect(1, 2))"#,
+            "R(pad: Pad(), trailing: Trailing(1))",
+            "R(pad: (1, 2), trailing: (1, 2))",
+        ] {
+            assert_eq!(errors(content), Vec::new(), "{content}");
+        }
+
+        let mismatch =
+            |column, tail: &str| vec![(Position::new(0, column), format!("Type mismatch: {tail}"))];
+        let cases = [
+            (
+                r#"R(route: ("a", "b"))"#,
+                mismatch(15, "expected u32, got string"),
+            ),
+            (
+                r#"R(route: Route("a"))"#,
+                mismatch(9, "expected 2 elements for Route, got 1"),
+            ),
+            (
+                r#"R(route: ("a", 1, 2))"#,
+                mismatch(9, "expected 2 elements for Route, got 3"),
+            ),
+            (
+                "R(route: ())",
+                mismatch(9, "expected 2 elements for Route, got 0"),
+            ),
+            (
+                r#"R(list: [("a", "b")])"#,
+                mismatch(15, "expected u32, got string"),
+            ),
+            (
+                r#"R(routes: {"k": Route()})"#,
+                mismatch(16, "expected 2 elements for Route, got 0"),
+            ),
+            (
+                "R(port: Some(Port()))",
+                mismatch(13, "expected 1 element for Port, got 0"),
+            ),
+            (
+                r#"R(port: Some(Port("x")))"#,
+                mismatch(18, "expected u16, got string"),
+            ),
+            (
+                "R(pad: (1, 2, 3))",
+                mismatch(7, "expected at most 2 elements for Pad, got 3"),
+            ),
+            (
+                "R(trailing: Trailing())",
+                mismatch(12, "expected 1 to 2 elements for Trailing, got 0"),
+            ),
+            (
+                "R(shape: Rect(1))",
+                mismatch(9, "expected 2 elements for variant 'Rect', got 1"),
+            ),
+            (
+                "R(shape: Rect(1, 2, 3))",
+                mismatch(9, "expected 2 elements for variant 'Rect', got 3"),
+            ),
+            (
+                "R(route: Route(a: 1, b: 2))",
+                mismatch(
+                    9,
+                    "Route is written with its values in order, not with named fields",
+                ),
+            ),
+        ];
+        for (content, expected) in cases {
+            assert_eq!(errors(content), expected, "{content}");
+        }
+
+        // A newtype's payload written as named fields is what
+        // `unwrap_variant_newtypes` allows, so it is not judged here.
+        assert_eq!(errors("R(port: Some(Port(a: 1)))"), Vec::new());
     }
 
     #[test]
