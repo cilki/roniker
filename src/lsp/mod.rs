@@ -436,7 +436,9 @@ impl LanguageServer for Backend {
             // exactly this content, and parsing a large file again costs more
             // than the layout itself.
             let indent = format::indent_unit(params.options.tab_size, params.options.insert_spaces);
-            let formatted = format::format_tree(&doc.tree, &doc.content, &indent);
+            let Some(formatted) = format::format_tree(&doc.tree, &doc.content, &indent) else {
+                return Ok(None);
+            };
 
             // The edit stops at the end of the last line, so the line break a
             // file ends with is kept rather than replaced — and the layout,
@@ -2849,6 +2851,46 @@ Document::new(content.to_string()),
             edits[0].range,
             Range::new(Position::new(0, 0), Position::new(0, 18))
         );
+    }
+
+    /// A document the layout leaves alone — one that doesn't parse — gets no
+    /// edit at all. The handler used to be handed the whole text back and
+    /// compare it with the text up to the end of the last line, which never
+    /// matched a file ending in a line break, so every format-on-save of a
+    /// half-typed document appended another blank line to it.
+    #[tokio::test]
+    async fn formatting_an_unparseable_document_is_a_no_op() {
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
+
+        for (name, content) in [
+            ("syntax error", "Config(\n    name: \"x\" \"y\",\n)\n"),
+            ("half typed", "Config(\n    port: 8080,\n    timeout: \n)\n"),
+            ("comment only", "// nothing here yet\n"),
+            ("crlf", "Config(\r\n    port: 80 80,\r\n)\r\n"),
+        ] {
+            let uri: Uri = format!("file:///test/{}.ron", name.replace(' ', "_"))
+                .parse()
+                .unwrap();
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content.to_string()));
+
+            let edits = backend
+                .formatting(DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    options: four_spaces(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                edits, None,
+                "{name}: an unparseable document should produce no edit"
+            );
+        }
     }
 
     /// Both formatting requests indent the way the request's options ask. The
