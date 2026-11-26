@@ -99,26 +99,39 @@ impl RustAnalyzer {
     ) {
         for item in items {
             match item {
-                Item::Struct(item) => self.add_type(TypeInfo {
-                    unit: matches!(item.fields, Fields::Unit),
-                    ..type_info(
+                Item::Struct(item) => {
+                    let name = qualified_name(module_prefix, &item.ident.to_string());
+                    let scope = Scope::new(module_prefix, Some(&name));
+                    self.add_type(TypeInfo {
+                        unit: matches!(item.fields, Fields::Unit),
+                        ..type_info(
+                            &item.ident,
+                            &item.attrs,
+                            TypeKind::Struct(extract_fields(&item.fields, scope)),
+                            module_prefix,
+                            file_path,
+                        )
+                    })
+                }
+                Item::Enum(item) => {
+                    let name = qualified_name(module_prefix, &item.ident.to_string());
+                    let scope = Scope::new(module_prefix, Some(&name));
+                    self.add_type(type_info(
                         &item.ident,
                         &item.attrs,
-                        TypeKind::Struct(extract_fields(&item.fields)),
+                        TypeKind::Enum(
+                            item.variants
+                                .iter()
+                                .map(|variant| extract_variant(variant, scope))
+                                .collect(),
+                        ),
                         module_prefix,
                         file_path,
-                    )
-                }),
-                Item::Enum(item) => self.add_type(type_info(
-                    &item.ident,
-                    &item.attrs,
-                    TypeKind::Enum(item.variants.iter().map(extract_variant).collect()),
-                    module_prefix,
-                    file_path,
-                )),
+                    ))
+                }
                 Item::Type(item) => self.add_type_alias(
                     &qualified_name(module_prefix, &item.ident.to_string()),
-                    &type_to_string(&item.ty),
+                    &Scope::new(module_prefix, None).type_name(&item.ty),
                 ),
                 // Recurse into inline modules, extending the module path.
                 Item::Mod(item) => {
@@ -193,13 +206,13 @@ fn type_info(
     }
 }
 
-fn extract_variant(variant: &syn::Variant) -> EnumVariant {
+fn extract_variant(variant: &syn::Variant, scope: Scope<'_>) -> EnumVariant {
     let start = variant.ident.span().start();
     EnumVariant {
         // A raw identifier (`r#Type`) is the name without its `r#` to serde,
         // and so to RON: the prefix only gets a keyword past the Rust parser.
         name: variant.ident.unraw().to_string(),
-        fields: extract_fields(&variant.fields),
+        fields: extract_fields(&variant.fields, scope),
         docs: extract_docs(&variant.attrs),
         line: Some(start.line),
         column: Some(start.column),
@@ -216,9 +229,103 @@ fn qualified_name(module_prefix: &str, name: &str) -> String {
     }
 }
 
+/// Where a type is written, which is what the relative paths in it are relative
+/// to: the module the item is declared in, and the struct or enum `Self` names
+/// inside it.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    module: &'a str,
+    self_type: Option<&'a str>,
+}
+
+impl<'a> Scope<'a> {
+    fn new(module: &'a str, self_type: Option<&'a str>) -> Self {
+        Self { module, self_type }
+    }
+
+    /// The name of `ty` with every path in it that is relative to this scope
+    /// — `self::Mode`, `super::Mode`, `Self` — spelled out from the crate root,
+    /// the way the types it names are registered.
+    ///
+    /// Types are looked up by their registered path or any `::`-delimited tail
+    /// of it, and a relative path is neither: `super::Mode` declared in
+    /// `crate::config::inner` names `crate::config::Mode` and shares no tail
+    /// with it. Left as written, a field declared that way was reported as an
+    /// `unknown-type` on every document, and the value written for it was never
+    /// checked or completed.
+    fn type_name(mut self, ty: &syn::Type) -> String {
+        use syn::visit_mut::VisitMut;
+        let mut ty = ty.clone();
+        self.visit_type_mut(&mut ty);
+        type_to_string(&ty)
+    }
+
+    /// `path` from the crate root, if it is relative to this scope; `None` for
+    /// one that already isn't, or that can't be spelled from the root.
+    fn resolve(&self, path: &syn::Path) -> Option<syn::Path> {
+        use syn::parse::Parser;
+
+        let first = path.segments.first()?;
+        if first.ident == "Self" {
+            // `Self` alone is the type being declared. `Self::Assoc` names an
+            // associated type, which a struct or enum doesn't have.
+            if path.segments.len() != 1 || !first.arguments.is_none() {
+                return None;
+            }
+            return syn::Path::parse_mod_style.parse_str(self.self_type?).ok();
+        }
+
+        let mut module: Vec<&str> = self.module.split("::").filter(|s| !s.is_empty()).collect();
+        let mut rest = path.segments.iter().peekable();
+        let mut relative = false;
+        if rest.next_if(|s| s.ident == "self").is_some() {
+            relative = true;
+        }
+        while rest.next_if(|s| s.ident == "super").is_some() {
+            relative = true;
+            // `super` of the crate root doesn't compile; there is nothing above
+            // `crate` to step to.
+            if module.last().is_some_and(|m| *m != "crate") {
+                module.pop();
+            }
+        }
+        if !relative {
+            return None;
+        }
+
+        let mut resolved = syn::Path {
+            leading_colon: None,
+            segments: Default::default(),
+        };
+        for segment in module {
+            // A module named after a file that isn't an identifier (a
+            // `src/bin/my-tool.rs`) can't be written as a path; such a type is
+            // left as it was.
+            let ident = syn::Ident::parse_any.parse_str(segment).ok()?;
+            resolved.segments.push(ident.into());
+        }
+        resolved.segments.extend(rest.cloned());
+        (!resolved.segments.is_empty()).then_some(resolved)
+    }
+}
+
+impl syn::visit_mut::VisitMut for Scope<'_> {
+    fn visit_type_path_mut(&mut self, node: &mut syn::TypePath) {
+        // `<T as Trait>::Assoc` and `::std::...` are not relative to anything.
+        if node.qself.is_none()
+            && node.path.leading_colon.is_none()
+            && let Some(resolved) = self.resolve(&node.path)
+        {
+            node.path = resolved;
+        }
+        // Generic arguments are paths of their own: `Vec<super::Mode>`.
+        syn::visit_mut::visit_type_path_mut(self, node);
+    }
+}
+
 /// Extract FieldInfo entries from struct or enum-variant fields.
 /// Unnamed (tuple) fields are named by their index.
-fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
+fn extract_fields(fields: &Fields, scope: Scope<'_>) -> Vec<FieldInfo> {
     fields
         .iter()
         .enumerate()
@@ -240,7 +347,7 @@ fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
             };
             FieldInfo {
                 name,
-                type_name: type_to_string(&field.ty),
+                type_name: scope.type_name(&field.ty),
                 docs: extract_docs(&field.attrs),
                 line,
                 column,
@@ -865,6 +972,112 @@ mod tests {
             .map(|(_, field, _)| field)
             .collect();
         assert_eq!(unknown, ["pair"]);
+    }
+
+    /// A field type written relative to where it is declared — `self::`,
+    /// `super::`, `Self` — names a type registered under its path from the
+    /// crate root, and a type is only ever looked up by that path or a tail of
+    /// it. Each has to be spelled from the root, wherever in the type it
+    /// appears, or the field is an `unknown-type` in a crate that compiles.
+    #[test]
+    fn test_relative_paths_in_field_types_resolve_from_the_crate_root() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate::config",
+                r#"
+                pub struct App {
+                    pub a: self::Mode,
+                    pub b: Vec<self::inner::Deep>,
+                    pub c: super::config::Mode,
+                    pub d: Option<Box<Self>>,
+                    pub e: Alias,
+                    pub f: std::path::PathBuf,
+                    pub g: <Mode as Trait>::Out,
+                }
+
+                pub type Alias = self::Mode;
+
+                pub enum Mode {
+                    Fast,
+                    Chain(Vec<Self>),
+                }
+
+                pub mod inner {
+                    pub struct Deep {
+                        pub m: super::Mode,
+                        pub n: std::collections::HashMap<String, super::super::config::Mode>,
+                        pub o: self::super::inner::Deeper,
+                    }
+                    pub struct Deeper;
+                }
+                "#,
+            )
+            .unwrap();
+
+        let field_types = |path: &str| -> Vec<String> {
+            let info = analyzer.get_type_info(path).expect(path);
+            match &info.kind {
+                TypeKind::Struct(fields) => fields.iter().map(|f| f.type_name.clone()).collect(),
+                TypeKind::Enum(variants) => variants
+                    .iter()
+                    .flat_map(|v| &v.fields)
+                    .map(|f| f.type_name.clone())
+                    .collect(),
+            }
+        };
+
+        assert_eq!(
+            field_types("crate::config::App"),
+            [
+                "crate::config::Mode",
+                "Vec<crate::config::inner::Deep>",
+                "crate::config::Mode",
+                "Option<Box<crate::config::App>>",
+                "crate::config::Mode",
+                // Paths that aren't relative are left exactly as written.
+                "std::path::PathBuf",
+                "<Mode as Trait>::Out",
+            ]
+        );
+        assert_eq!(
+            field_types("crate::config::Mode"),
+            ["Vec<crate::config::Mode>"]
+        );
+        assert_eq!(
+            field_types("crate::config::inner::Deep"),
+            [
+                "crate::config::Mode",
+                "std::collections::HashMap<String, crate::config::Mode>",
+                "crate::config::inner::Deeper",
+            ]
+        );
+
+        // Every one of them now names a registered type; only the associated
+        // type, which no build script can register, is left over.
+        let unknown: Vec<_> = analyzer
+            .validate_field_types()
+            .into_iter()
+            .map(|(_, field, _)| field)
+            .collect();
+        assert_eq!(unknown, ["g"]);
+
+        // Under a bare prefix, `self::` and `super::` have no module to name
+        // and come off; `Self` is the type's bare name.
+        let mut bare = RustAnalyzer::new();
+        bare.add_source_with_prefix(
+            "",
+            "pub struct Node { pub kids: Vec<Self>, pub m: self::Mode, pub n: super::Mode }",
+        )
+        .unwrap();
+        let info = bare.get_type_info("Node").unwrap();
+        let types: Vec<&str> = info
+            .fields()
+            .unwrap()
+            .iter()
+            .map(|f| f.type_name.as_str())
+            .collect();
+        assert_eq!(types, ["Vec<Node>", "Mode", "Mode"]);
     }
 
     #[test]
