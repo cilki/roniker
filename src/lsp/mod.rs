@@ -127,6 +127,13 @@ fn order(a: Position, b: Position) -> (Position, Position) {
 /// `None` when the selection isn't a value and the document doesn't parse
 /// either: there is no tree to find the surrounding value in that the layout
 /// would accept.
+///
+/// Parsing the selected text on its own isn't enough to tell a whole value
+/// from part of one: a field's name (`host`), a struct's name in front of its
+/// parentheses (`DatabaseConfig`) or a piece of a word (`ho`) all parse as a
+/// value by themselves. Taken as one, each was laid out as itself and the
+/// request did nothing, so when the document parses the selection also has to
+/// be exactly one of its values.
 fn formatting_span(
     tree: &tree_sitter::Tree,
     content: &str,
@@ -136,17 +143,26 @@ fn formatting_span(
 ) -> Option<(usize, usize, Range)> {
     let selected = &content[start..end];
     let value = selected.trim();
-    if value.is_empty() || !ts_utils::parse(value).root_node().has_error() {
+    if value.is_empty() {
         return Some((start, end, range));
     }
+    let parses_alone = !ts_utils::parse(value).root_node().has_error();
     if tree.root_node().has_error() {
-        return None;
+        return parses_alone.then_some((start, end, range));
     }
 
     let value_start = start + (selected.len() - selected.trim_start().len());
+    let value_end = value_start + value.len();
     let mut node = tree
         .root_node()
-        .descendant_for_byte_range(value_start, value_start + value.len())?;
+        .descendant_for_byte_range(value_start, value_end)?;
+    if parses_alone
+        && node.start_byte() == value_start
+        && node.end_byte() == value_end
+        && !is_name(&node)
+    {
+        return Some((start, end, range));
+    }
     while !matches!(node.kind(), "struct" | "array" | "tuple" | "map") {
         node = node.parent()?;
     }
@@ -155,6 +171,18 @@ fn formatting_span(
         node.end_byte(),
         ts_utils::node_to_lsp_range(&node, content),
     ))
+}
+
+/// True for the identifier naming a field (`host` in `host: "h"`) or a struct
+/// (`DatabaseConfig` in `DatabaseConfig(..)`): the grammar puts both first in
+/// their parent. A bare identifier written as a value, such as the enum
+/// variant in `level: Warn`, is not a name.
+fn is_name(node: &tree_sitter::Node) -> bool {
+    node.kind() == "identifier"
+        && node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "field" | "struct")
+                && parent.child(0).is_some_and(|first| first.id() == node.id())
+        })
 }
 
 /// Compute the tree-sitter Point (row + byte column) for a byte offset.
@@ -3704,6 +3732,64 @@ PostReference(
             format(Range::new(Position::new(2, 0), Position::new(4, 0))).await,
             None
         );
+    }
+
+    /// A field's name, a struct's name and a piece of a word each parse as a
+    /// value on their own, which used to be taken to mean the selection was
+    /// one: it was laid out as itself and nothing happened. Each is only part
+    /// of the value around it, so it is widened like any other partial
+    /// selection. A selection that really is one whole value is still laid
+    /// out on its own.
+    #[tokio::test]
+    async fn test_range_formatting_widens_a_name_or_part_of_a_word() {
+        let service = create_test_backend_with_analyzer(RustAnalyzer::new()).await;
+        let backend = service.inner();
+        let url = "file:///test.ron".parse::<Uri>().unwrap();
+        let content = "Post(\n    author: User(\n      id:1,\n            name:\"Bob\",\n    ),\n    tags: [\"a\",   \"b\"],\n    level: Warn,\n)\n";
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: url.clone(),
+                    language_id: "ron".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+        let format = async |range| {
+            backend
+                .range_formatting(DocumentRangeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: url.clone() },
+                    range,
+                    options: four_spaces(),
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .unwrap()
+        };
+
+        let user = Some(vec![TextEdit {
+            range: Range::new(Position::new(1, 12), Position::new(4, 5)),
+            new_text: "User(\n        id: 1,\n        name: \"Bob\",\n    )".to_string(),
+        }]);
+        // The `start..end` columns of `line`.
+        let on =
+            |line, start, end| Range::new(Position::new(line, start), Position::new(line, end));
+        for (what, range) in [
+            ("a field name", on(3, 12, 16)),
+            ("part of a field name", on(3, 12, 15)),
+            ("a struct name", on(1, 12, 16)),
+        ] {
+            assert_eq!(format(range).await, user, "{what}");
+        }
+
+        // A whole value is formatted as it is, and these are formatted already.
+        for (what, range) in [
+            ("a string element", on(5, 11, 14)),
+            ("a bare variant", on(6, 11, 15)),
+        ] {
+            assert_eq!(format(range).await, None, "{what}");
+        }
     }
 
     #[test]
