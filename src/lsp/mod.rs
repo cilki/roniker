@@ -601,7 +601,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        if !is_valid_identifier(&new_name) {
+        if !type_utils::is_identifier(&new_name) {
             return Err(tower_lsp_server::jsonrpc::Error::invalid_params(format!(
                 "'{}' is not a valid identifier",
                 new_name
@@ -699,16 +699,6 @@ fn field_name_node_at<'a>(
     Some(name_node)
 }
 
-/// Whether a proposed rename target is a valid RON identifier
-fn is_valid_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
-}
-
 fn create_location_response(
     source_file: &Option<PathBuf>,
     line: Option<usize>,
@@ -773,7 +763,7 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     if start < end {
         let word: String = chars[start..end].iter().collect();
         // Only return identifiers (starts with a letter or underscore, not a number).
-        if is_valid_identifier(&word) {
+        if type_utils::is_identifier(&word) {
             return Some(word);
         }
     }
@@ -3790,17 +3780,6 @@ PostReference(
         ] {
             assert_eq!(format(range).await, None, "{what}");
         }
-    }
-
-    #[test]
-    fn test_is_valid_identifier() {
-        assert!(is_valid_identifier("name"));
-        assert!(is_valid_identifier("_private"));
-        assert!(is_valid_identifier("field2"));
-        assert!(!is_valid_identifier(""));
-        assert!(!is_valid_identifier("2fast"));
-        assert!(!is_valid_identifier("has space"));
-        assert!(!is_valid_identifier("has-dash"));
     }
 
     #[test]

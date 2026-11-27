@@ -34,11 +34,13 @@ pub fn extract_inner_type<'a>(type_str: &'a str, wrapper: &str) -> Option<&'a st
     }
 }
 
-/// Check if a type is a primitive type (not a custom enum/struct). A thin
-/// wrapper over [`crate::rust_analyzer::is_primitive`] that normalizes the name
-/// first, so callers holding a raw type name don't each have to.
-pub fn is_primitive_type(type_name: &str) -> bool {
-    crate::rust_analyzer::is_primitive(&normalize_type(type_name))
+/// Whether `text` is a plain RON identifier — a letter or `_`, then letters,
+/// digits and `_` — the way a field, a variant or a struct name is written
+/// without the `r#` prefix.
+pub fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Standard-library wrappers a value is written straight through: the document
@@ -116,14 +118,6 @@ pub fn is_number_type(clean: &str) -> bool {
 /// raw or pre-normalized.
 pub fn is_custom_type(type_name: &str) -> bool {
     crate::rust_analyzer::is_custom_type(&normalize_type(type_name))
-}
-
-/// The standard-library type `type_name` names, if it is one of those that take
-/// no generic arguments. A thin wrapper over
-/// [`crate::rust_analyzer::std_type`] that normalizes the name first, so
-/// callers holding a raw type name don't each have to.
-pub fn std_type(type_name: &str) -> Option<crate::rust_analyzer::StdType> {
-    crate::rust_analyzer::std_type(&normalize_type(type_name))
 }
 
 /// Largest number of positions [`tuple_element_types`] will enumerate. An
@@ -433,11 +427,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_is_identifier() {
+        assert!(is_identifier("name"));
+        assert!(is_identifier("_private"));
+        assert!(is_identifier("field2"));
+        assert!(!is_identifier(""));
+        assert!(!is_identifier("2fast"));
+        assert!(!is_identifier("has space"));
+        assert!(!is_identifier("has-dash"));
+    }
+
     /// The classifiers normalize internally, so a qualified std type lands on
     /// the same side of each of them as the bare spelling does.
     #[test]
     fn test_qualified_std_types_are_classified_as_std() {
-        assert!(is_primitive_type("std::string::String"));
         assert!(!is_custom_type("std::string::String"));
         assert!(!is_custom_type("std::collections::HashMap<String, u32>"));
         assert!(!is_custom_type("std::option::Option<u64>"));

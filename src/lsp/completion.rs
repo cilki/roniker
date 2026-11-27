@@ -1,10 +1,12 @@
 use super::tree_sitter_parser;
 use super::type_utils::{
     ARRAY_WRAPPERS, MAP_WRAPPERS, TRANSPARENT_WRAPPERS, extract_inner_type, is_number_type,
-    is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name, std_type,
+    is_wrapped_by, map_entry_types, missing_fields, normalize_type, short_name,
     tuple_element_types, wrapped_type,
 };
-use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind};
+use crate::rust_analyzer::{
+    EnumVariant, FieldInfo, RustAnalyzer, StdShape, TypeInfo, TypeKind, std_type,
+};
 use std::borrow::Cow;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
