@@ -800,15 +800,18 @@ fn is_positional(fields: &[(String, FieldInfo)]) -> bool {
 /// `#[serde(default)]`, or a `#[serde(default)]` on each position left out.
 /// `label` names the type or variant in the message.
 ///
-/// Values written as named fields are left alone when there is a single
-/// position, since `#![enable(unwrap_variant_newtypes)]` lets `V(a: 1)` stand
-/// for `V(Inner(a: 1))`; with more than one, `ron` refuses them. A payload the
-/// grammar could not parse (see #203) is left alone too, since the values it
+/// Values written as named fields are refused, the way `ron` refuses them,
+/// with one exception: `#![enable(unwrap_variant_newtypes)]` lets a newtype
+/// *variant* holding a struct (`V(Inner)`) be written `V(a: 1)` for
+/// `V(Inner(a: 1))`, so `is_variant` asks for that spelling to be accepted —
+/// and checked against the fields of the struct it stands for. A payload the
+/// grammar could not parse (see #203) is left alone, since the values it
 /// would count are not the ones written.
 fn validate_positional_values(
     node: &tree_sitter::Node,
     content: &str,
     label: &str,
+    is_variant: bool,
     fields: &[(String, FieldInfo)],
     has_default: bool,
     analyzer: &RustAnalyzer,
@@ -818,13 +821,33 @@ fn validate_positional_values(
     let values = match node.kind() {
         "struct" => {
             if !ts_utils::struct_fields(node).is_empty() {
-                if fields.len() == 1 {
-                    return Vec::new();
+                if is_variant && let [(_, field)] = fields {
+                    match unwrapped_newtype_struct(&field.type_name, analyzer) {
+                        Unwrapped::Struct(inner) => {
+                            let expected = ExpectedStruct {
+                                fields: analyzer.effective_fields(inner),
+                                allow_unknown_fields: inner.has_unresolved_flatten(analyzer),
+                                has_default: inner.has_default,
+                                variant: None,
+                                at_root: false,
+                            };
+                            return validate_struct_node(node, content, &expected, analyzer);
+                        }
+                        // Not something this analyzer can look inside, so
+                        // there is nothing to hold the fields to.
+                        Unwrapped::Unknown => return Vec::new(),
+                        Unwrapped::NotAStruct => {}
+                    }
                 }
+                let how = if fields.len() == 1 {
+                    "its value alone"
+                } else {
+                    "its values in order"
+                };
                 return vec![type_mismatch(
                     node,
                     content,
-                    &format!("{label} is written with its values in order, not with named fields"),
+                    &format!("{label} is written with {how}, not with named fields"),
                 )];
             }
             ts_utils::struct_values(node, content)
@@ -873,6 +896,41 @@ fn validate_positional_values(
             validate_typed_value(value, content, &field.type_name, analyzer)
         })
         .collect()
+}
+
+/// What a newtype variant's single position holds, as far as writing its
+/// payload with named fields is concerned.
+enum Unwrapped<'a> {
+    /// A struct with named fields, whose fields the payload may spell out.
+    Struct(&'a TypeInfo),
+    /// A type the analyzer has no definition of.
+    Unknown,
+    /// Anything else: a primitive, a collection, an enum, a tuple struct.
+    NotAStruct,
+}
+
+/// The struct `type_name` holds once any `Option` and transparent wrappers
+/// (`Box`, `Rc`, ...) are looked through — `ron` sees through both when it
+/// unwraps a variant's newtype — for [`validate_positional_values`].
+fn unwrapped_newtype_struct<'a>(type_name: &str, analyzer: &'a RustAnalyzer) -> Unwrapped<'a> {
+    let mut clean = normalize_type(type_name).into_owned();
+    while let Some(inner) = single_value_wrapped_type(&clean) {
+        clean = inner.to_string();
+    }
+    if !is_custom_type(&clean) {
+        return Unwrapped::NotAStruct;
+    }
+    match analyzer.get_type_info(&clean) {
+        None => Unwrapped::Unknown,
+        Some(inner) => match inner.kind {
+            TypeKind::Struct(_)
+                if !inner.unit && !is_positional(&analyzer.effective_fields(inner)) =>
+            {
+                Unwrapped::Struct(inner)
+            }
+            _ => Unwrapped::NotAStruct,
+        },
+    }
 }
 
 /// The "unknown variant" diagnostic for a name the enum `type_info` does not
@@ -925,6 +983,7 @@ fn validate_node_with_type_info<'a>(
                     node,
                     content,
                     short_name(&type_info.name),
+                    false,
                     &fields,
                     type_info.has_default,
                     analyzer,
@@ -1064,6 +1123,7 @@ fn validate_enum_node(
             node,
             content,
             &format!("variant '{}'", named.name),
+            true,
             &expected,
             type_info.has_default,
             analyzer,
@@ -5471,9 +5531,101 @@ mod tests {
             assert_eq!(errors(content), expected, "{content}");
         }
 
-        // A newtype's payload written as named fields is what
-        // `unwrap_variant_newtypes` allows, so it is not judged here.
-        assert_eq!(errors("R(port: Some(Port(a: 1)))"), Vec::new());
+        // A newtype *struct* is never unwrapped, `unwrap_variant_newtypes`
+        // or not: `ron` wants the `u16` itself.
+        assert_eq!(
+            errors("R(port: Some(Port(a: 1)))"),
+            mismatch(
+                13,
+                "Port is written with its value alone, not with named fields"
+            )
+        );
+    }
+
+    /// `#![enable(unwrap_variant_newtypes)]` lets a newtype variant that holds
+    /// a struct be written with that struct's fields, `V(a: 1)` for
+    /// `V(Inner(a: 1))` — and only such a variant. Those fields used to be
+    /// waved through unchecked whatever the variant held, so `Sleep(secs: 5)`
+    /// for a `Sleep(u64)` and `V(b: 1)` for an `Inner { a }` both came back
+    /// clean and then failed to load. Each case agrees with `ron` 0.12.
+    #[test]
+    fn test_newtype_variant_written_with_named_fields() {
+        let mut analyzer = RustAnalyzer::new();
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let newtype = |name: &str, type_name: &str| EnumVariant {
+            name: name.to_string(),
+            fields: vec![field("0", type_name)],
+            ..Default::default()
+        };
+        analyzer.add_type(TypeInfo {
+            name: "crate::Inner".to_string(),
+            kind: TypeKind::Struct(vec![field("a", "u8")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "crate::Step".to_string(),
+            kind: TypeKind::Enum(vec![
+                newtype("Sleep", "u64"),
+                newtype("Run", "Inner"),
+                newtype("Boxed", "Box<Inner>"),
+                newtype("Maybe", "Option<Inner>"),
+                newtype("Opaque", "Unregistered"),
+            ]),
+            ..Default::default()
+        });
+        let root = TypeInfo {
+            name: "crate::R".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                has_default: true,
+                ..field("step", "Step")
+            }]),
+            ..Default::default()
+        };
+        let errors = |content: &str| -> Vec<(Position, String)> {
+            validate_ron_with_analyzer(content, None, &root, &analyzer)
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|d| (d.range.start, d.message))
+                .collect()
+        };
+
+        for content in [
+            "R(step: Run(a: 1))",
+            "R(step: Boxed(a: 1))",
+            "R(step: Maybe(a: 1))",
+            // Nothing to hold the fields to, so nothing is reported.
+            "R(step: Opaque(x: 1))",
+        ] {
+            assert_eq!(errors(content), Vec::new(), "{content}");
+        }
+
+        assert_eq!(
+            errors("R(step: Sleep(secs: 5))"),
+            vec![(
+                Position::new(0, 8),
+                "Type mismatch: variant 'Sleep' is written with its value alone, not with named fields"
+                    .to_string()
+            )]
+        );
+        // The unwrapped fields are the struct's, and held to it.
+        assert_eq!(
+            errors("R(step: Run(b: 1))"),
+            vec![
+                (Position::new(0, 12), "Unknown field 'b'".to_string()),
+                (Position::new(0, 8), "Required fields: a".to_string()),
+            ]
+        );
+        assert_eq!(
+            errors("R(step: Boxed(a: 300))"),
+            vec![(
+                Position::new(0, 17),
+                "Type mismatch: 300 is out of range for u8".to_string()
+            )]
+        );
     }
 
     #[test]
