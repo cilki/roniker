@@ -80,10 +80,7 @@ pub fn generate_respell_actions(diagnostics: &[Diagnostic], url: &Uri) -> Vec<Co
 /// a plain identifier, and as a raw identifier (`r#max-retries`) otherwise —
 /// the only way RON can spell a serde name such as a kebab-case rename.
 fn ron_identifier(name: &str) -> String {
-    let mut chars = name.chars();
-    let plain = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-        && chars.all(|c| c.is_alphanumeric() || c == '_');
-    if plain {
+    if super::type_utils::is_identifier(name) {
         name.to_string()
     } else {
         format!("r#{name}")
@@ -867,7 +864,7 @@ fn generate_default_value_depth(type_name: &str, analyzer: &RustAnalyzer, depth:
     // generator exists to avoid — and nor are `SocketAddr()` or `Duration()`.
     // Asked only once the analyzer has been, so a workspace type sharing a name
     // with one of them keeps its own constructor.
-    let unresolved = || match super::type_utils::std_type(&clean) {
+    let unresolved = || match crate::rust_analyzer::std_type(&clean) {
         Some(std) => std.placeholder.to_string(),
         None => opaque(),
     };

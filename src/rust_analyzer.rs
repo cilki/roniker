@@ -642,17 +642,18 @@ impl TypeInfo {
         }
     }
 
+    /// Every field the type declares: a struct's own, or those of each of an
+    /// enum's variants in turn.
+    fn all_fields(&self) -> impl Iterator<Item = &FieldInfo> {
+        let (fields, variants) = match &self.kind {
+            TypeKind::Struct(fields) => (fields.as_slice(), &[][..]),
+            TypeKind::Enum(variants) => (&[][..], variants.as_slice()),
+        };
+        fields.iter().chain(variants.iter().flat_map(|v| &v.fields))
+    }
+
     pub fn find_field(&self, field_name: &str) -> Option<&FieldInfo> {
-        match &self.kind {
-            TypeKind::Struct(fields) => fields.iter().find(|f| f.name == field_name),
-            TypeKind::Enum(variants) => {
-                // Search through all variants' fields
-                variants
-                    .iter()
-                    .flat_map(|v| &v.fields)
-                    .find(|f| f.name == field_name)
-            }
-        }
+        self.all_fields().find(|f| f.name == field_name)
     }
 
     /// Find the variant that a document naming `variant_name` is referring to,
@@ -673,16 +674,13 @@ impl TypeInfo {
     /// (honoring rename/rename_all) or one of its aliases — see
     /// [`FieldInfo::accepts_name`].
     pub fn find_field_serialized(&self, field_name: &str) -> Option<&FieldInfo> {
-        let rename_all = self.rename_all.as_deref();
-        match &self.kind {
-            TypeKind::Struct(fields) => fields
-                .iter()
-                .find(|f| f.accepts_name(field_name, rename_all)),
-            TypeKind::Enum(variants) => variants
-                .iter()
-                .flat_map(|v| &v.fields)
-                .find(|f| f.accepts_name(field_name, None)),
-        }
+        // An enum's `rename_all` renames its variants, not their fields.
+        let rename_all = match self.kind {
+            TypeKind::Struct(_) => self.rename_all.as_deref(),
+            TypeKind::Enum(_) => None,
+        };
+        self.all_fields()
+            .find(|f| f.accepts_name(field_name, rename_all))
     }
 
     /// The fields serde accepts for this struct: `skip` fields are excluded,
@@ -966,12 +964,7 @@ impl RustAnalyzer {
         let mut errors = Vec::new();
 
         for type_info in self.type_cache.values() {
-            let fields: Vec<&FieldInfo> = match &type_info.kind {
-                TypeKind::Struct(fields) => fields.iter().collect(),
-                TypeKind::Enum(variants) => variants.iter().flat_map(|v| &v.fields).collect(),
-            };
-
-            for field in fields {
+            for field in type_info.all_fields() {
                 if let Some(unknown) = self.check_field_type_known(&field.type_name) {
                     errors.push((type_info.name.clone(), field.name.clone(), unknown));
                 }

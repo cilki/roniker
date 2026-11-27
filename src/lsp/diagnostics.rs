@@ -1,11 +1,12 @@
 use super::type_utils::{
     ARRAY_WRAPPERS, MAP_WRAPPERS, TRANSPARENT_WRAPPERS, closest_name, extract_inner_type,
-    is_custom_type, is_primitive_type, is_wrapped_by, map_entry_types, matching_field,
+    is_custom_type, is_identifier, is_wrapped_by, map_entry_types, matching_field,
     missing_required_fields, normalize_type, short_name, single_value_wrapped_type,
     tuple_element_types, wrapped_type,
 };
 use crate::rust_analyzer::{
-    FieldInfo, IntegerBounds, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds, std_type,
+    FieldInfo, IntegerBounds, RustAnalyzer, StdShape, TypeInfo, TypeKind, integer_bounds,
+    is_primitive, std_type,
 };
 use ron::Value;
 use std::borrow::Cow;
@@ -1100,7 +1101,7 @@ fn check_declared_type(
         // `()`, so the shape check below would answer "got ()" for a value
         // that contains no parentheses at all. Name what was written instead.
         if matches!(value, Value::Unit)
-            && let Some(name) = value_text.map(str::trim).filter(|t| is_bare_name(t))
+            && let Some(name) = value_text.map(str::trim).filter(|t| is_identifier(t))
         {
             return bare_name_mismatch(name, expected_type);
         }
@@ -1115,7 +1116,7 @@ fn check_declared_type(
     // quote — even when a `(` turns up further in, inside an element or the
     // string, so what comes before that paren is no name.
     let head = trimmed.split('(').next().unwrap_or("").trim();
-    let named = if is_bare_name(head.strip_prefix("r#").unwrap_or(head)) {
+    let named = if is_identifier(head.strip_prefix("r#").unwrap_or(head)) {
         head
     } else {
         ""
@@ -1123,7 +1124,7 @@ fn check_declared_type(
 
     // A name that could be a type or a variant is resolved against the
     // analyzer; anything else (`42`, `"x"`) is judged by its shape below.
-    if !named.is_empty() && !is_primitive_type(named) {
+    if !named.is_empty() && !is_primitive(named) {
         // The declared type resolves here: [`validate_nested_value`] runs
         // first and reports an unresolvable one itself, which stops this check
         // from running at all.
@@ -1175,16 +1176,6 @@ fn check_declared_type(
         _ => literal_kind(trimmed)?,
     };
     Some(format!("expected {}, got {}", expected_type, found))
-}
-
-/// Whether `text` is a lone identifier, the way RON writes a unit variant or a
-/// unit struct's name.
-fn is_bare_name(text: &str) -> bool {
-    let mut chars = text.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_')
-        && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// What is wrong with the bare name `name` written for the non-custom type
