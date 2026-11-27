@@ -287,6 +287,66 @@ pub fn with_open_unnamed_struct(content: &str, position: Position) -> Option<Str
     Some(patched)
 }
 
+/// `content` with the delimiters it leaves open closed at its end, or `None`
+/// when it closes everything it opens.
+///
+/// A document typed top to bottom has none of its closing delimiters yet, and
+/// tree-sitter makes one `ERROR` of it, holding the names typed so far as loose
+/// identifiers. Neither a struct nor a field can be found around the cursor in
+/// that, so completion answered for the root type wherever the cursor was:
+/// `AppConfig(\n    server: ServerConfig(\n        |` offered the root's
+/// fields, and so did `AppConfig(\n    log_level: |`, where the field's values
+/// belong ([#183]). Closing what is open makes the document the one the user
+/// is on the way to writing, which parses, so the tree says where the cursor
+/// is.
+///
+/// The closers go after everything in the document, on a line of their own so
+/// that a line comment at its end doesn't swallow them. Nothing moves, so a
+/// position means the same in both documents, and the fields written after the
+/// cursor are still there to be left out of the field-name completions.
+///
+/// Delimiters inside comments, strings and chars are not counted. A document
+/// that ends inside a string or block comment is left alone: closing it is a
+/// guess at where the literal ends.
+///
+/// [#183]: https://git.cilki.net/cilki/roniker/issues/183
+pub fn with_closed_delimiters(content: &str) -> Option<String> {
+    let masked = super::ts_utils::mask_for_grammar(content);
+    let bytes = masked.as_bytes();
+    let mut open = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = super::ts_utils::skip_comment_or_quoted(bytes, i) {
+            // Past the end means unterminated; only a line comment ends there
+            // on its own.
+            if end > bytes.len() && !bytes[i..].starts_with(b"//") {
+                return None;
+            }
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => open.push(b')'),
+            b'[' => open.push(b']'),
+            b'{' => open.push(b'}'),
+            b')' | b']' | b'}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if open.is_empty() {
+        return None;
+    }
+
+    let mut closed = String::with_capacity(content.len() + 1 + open.len());
+    closed.push_str(content);
+    closed.push('\n');
+    closed.extend(open.iter().rev().map(|&b| b as char));
+    Some(closed)
+}
+
 /// Determine what we're completing based on cursor position using tree-sitter
 fn get_completion_context(tree: &Tree, content: &str, position: Position) -> CompletionContext {
     use super::ts_utils;
@@ -1069,6 +1129,42 @@ fn generate_value_completions_by_type(
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo, TypeInfo, TypeKind};
+
+    #[test]
+    fn test_with_closed_delimiters() {
+        for (content, closed) in [
+            ("Config(", Some("Config(\n)")),
+            (
+                "Config(\n    a: [Some((1, ",
+                Some("Config(\n    a: [Some((1, \n))])"),
+            ),
+            ("Config(a: {\"k\": X(", Some("Config(a: {\"k\": X(\n)})")),
+            // Closed delimiters are not closed again.
+            (
+                "Config(a: [1], b: X(c: 1), ",
+                Some("Config(a: [1], b: X(c: 1), \n)"),
+            ),
+            // Delimiters in comments, strings, raw strings and chars don't count.
+            (
+                "Config(a: \"(\", b: '[', c: r#\"{\"#, /* ( */",
+                Some("Config(a: \"(\", b: '[', c: r#\"{\"#, /* ( */\n)"),
+            ),
+            // A line comment at the end is fine; the closers go below it.
+            ("Config( // (", Some("Config( // (\n)")),
+            // Nothing left open.
+            ("Config(a: 1)", None),
+            ("", None),
+            // Inside a string or block comment the literal's end is unknown.
+            ("Config(a: \"(", None),
+            ("Config(/* (", None),
+        ] {
+            assert_eq!(
+                with_closed_delimiters(content).as_deref(),
+                closed,
+                "{content:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_enum_variant_field_completion() {

@@ -431,6 +431,11 @@ What gets offered depends on where in the value the cursor sits:
 - Every registered type, as a fallback, when the field's declared type yields
   none of the above — anything the build script was not given the source for.
 
+None of this waits for the closing delimiters: a document typed top to bottom,
+`AppConfig(\n    server: ServerConfig(\n        mode: |` with nothing closed
+yet, is completed as though its open `(`, `[` and `{` were closed at the end of
+the file, so `mode`'s variants are offered there rather than the root's fields.
+
 Nothing is offered inside a comment or a string, so typing `// port: 80` or
 `"a, b"` doesn't pop up suggestions.
 

@@ -394,12 +394,24 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
+        // A document still being typed has delimiters it hasn't closed yet,
+        // which leaves tree-sitter nothing to say where the cursor is. It is
+        // completed from a copy that closes them at its end instead.
+        let closed = completion::with_closed_delimiters(&doc.content).map(|content| {
+            let tree = ts_utils::parse(&content);
+            (content, tree)
+        });
+        let (content, tree) = match &closed {
+            Some((content, tree)) => (content.as_str(), tree),
+            None => (doc.content.as_str(), &doc.tree),
+        };
+
         // Parentheses just opened for an unnamed struct don't parse as one, so
         // they are completed from a copy of the document in which they do —
         // when the value written there really is a struct with named fields.
         // A unit struct's `()` is already complete, and a tuple's or a tuple
         // struct's parentheses take values, not field names.
-        if let Some(patched) = completion::with_open_unnamed_struct(&doc.content, position) {
+        if let Some(patched) = completion::with_open_unnamed_struct(content, position) {
             let tree = ts_utils::parse(&patched);
             if let Some(type_info) = self
                 .resolve_completion_owner_at(&patched, &tree, position)
@@ -421,13 +433,12 @@ impl LanguageServer for Backend {
             }
         }
 
-        let Some(type_info) = self.resolve_completion_owner_at(&doc.content, &doc.tree, position)
-        else {
+        let Some(type_info) = self.resolve_completion_owner_at(content, tree, position) else {
             return Ok(None);
         };
         let completions = completion::generate_completions_for_type(
-            &doc.tree,
-            &doc.content,
+            tree,
+            content,
             position,
             type_info,
             &self.rust_analyzer,
@@ -2506,6 +2517,125 @@ Document::new(content.to_string()),
             };
             let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
             assert_eq!(&labels, expected, "completion in {marked:?}");
+        }
+    }
+
+    /// A document typed top to bottom has none of its closing delimiters yet.
+    /// tree-sitter made one `ERROR` of it, so completion found neither a struct
+    /// nor a field around the cursor and offered the root's fields wherever it
+    /// was — inside a nested struct, after a field's colon, inside a `[` or a
+    /// `Some(`; see <https://git.cilki.net/cilki/roniker/issues/183>.
+    #[tokio::test]
+    async fn test_completion_before_the_closing_delimiters_are_typed() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("port", "u16"),
+                field("server", "Server"),
+                field("modes", "Vec<Mode>"),
+                field("backup", "Option<Mode>"),
+            ]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Server".to_string(),
+            kind: TypeKind::Struct(vec![field("host", "String"), field("mode", "Mode")]),
+            ..Default::default()
+        });
+        analyzer.add_type(TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Fast".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Slow".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        });
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+
+        let modes = vec!["Fast", "Slow"];
+        for (marked, expected) in [
+            (
+                "Config(\n    server: Server(\n        |",
+                vec!["host", "mode"],
+            ),
+            (
+                "Config(\n    server: Server(\n        host: \"a\",\n        |",
+                vec!["mode"],
+            ),
+            (
+                "Config(\n    server: Server(\n        mode: |",
+                modes.clone(),
+            ),
+            (
+                "Config(\n    server: Server(\n        mode: Fa|",
+                modes.clone(),
+            ),
+            ("Config(\n    server: Serv|", vec!["Server"]),
+            (
+                "Config(\n    backup: |",
+                vec!["Some(Fast)", "Some(Slow)", "None"],
+            ),
+            ("Config(port: 1, server: Server(mode: |", modes.clone()),
+            ("Config(\n    modes: [|", modes.clone()),
+            ("Config(\n    modes: [Fast, |", modes.clone()),
+            ("Config(\n    backup: Some(|", modes.clone()),
+            // A field written after the cursor is still left out.
+            (
+                "Config(\n    |\n    port: 1,",
+                vec!["server", "modes", "backup"],
+            ),
+            // A line comment at the end doesn't swallow the closers.
+            (
+                "Config(\n    server: Server(\n        | // the server",
+                vec!["host", "mode"],
+            ),
+            // Neither does a delimiter inside a string or a comment count.
+            (
+                "Config(\n    server: Server(host: \"(\", /* ( */ |",
+                vec!["mode"],
+            ),
+        ] {
+            let offset = marked.find('|').unwrap();
+            let content = marked.replacen('|', "", 1);
+            let line = content[..offset].matches('\n').count() as u32;
+            let character = (offset - content[..offset].rfind('\n').map_or(0, |i| i + 1)) as u32;
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(content));
+
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(line, character),
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, expected, "completion in {marked:?}");
         }
     }
 
