@@ -1,0 +1,133 @@
+name: CI
+on:
+  pull_request:
+    branches:
+    - main
+    - master
+  push:
+    branches:
+    - main
+    - master
+permissions:
+  contents: read
+jobs:
+  rust-audit:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    env:
+      CARGO_HOME: .cargo-home
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Trust the checkout
+      run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: cargo-audit-cache-run${{ github.run_id }}
+        path: .cargo-home/
+        restore-keys: cargo-audit-cache-run
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    - name: Run audit
+      run: cargo audit
+    timeout-minutes: 10
+  rust-clippy:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    env:
+      CARGO_HOME: .cargo-home
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Trust the checkout
+      run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-cache-run${{ github.run_id }}
+        path: |-
+          target/
+          .cargo-home/
+        restore-keys: rust-cache-run
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Run clippy
+      run: cargo clippy --all-features -- -D warnings
+    timeout-minutes: 15
+  rust-doc:
+    runs-on: ubuntu-latest
+    container: rustlang/rust:nightly
+    env:
+      CARGO_HOME: .cargo-home
+      RUSTDOCFLAGS: --cfg docsrs
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Trust the checkout
+      run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-doc-cache-run${{ github.run_id }}
+        path: |-
+          target/
+          .cargo-home/
+        restore-keys: rust-doc-cache-run
+    - name: Build docs
+      run: cargo doc --no-deps --all-features
+    timeout-minutes: 15
+  rust-feature-combos:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    env:
+      CARGO_HOME: .cargo-home
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Trust the checkout
+      run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-cache-run${{ github.run_id }}
+        path: |-
+          target/
+          .cargo-home/
+        restore-keys: rust-cache-run
+    - name: Install cargo-hack
+      run: curl -fsSL https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
+    - name: Check feature powerset
+      run: cargo hack --feature-powerset check
+    timeout-minutes: 30
+  rust-test:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    env:
+      CARGO_HOME: .cargo-home
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Trust the checkout
+      run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-cache-run${{ github.run_id }}
+        path: |-
+          target/
+          .cargo-home/
+        restore-keys: rust-cache-run
+    - name: Run tests
+      run: cargo test --all-features
+    timeout-minutes: 30

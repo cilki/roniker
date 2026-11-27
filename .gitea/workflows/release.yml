@@ -1,0 +1,23 @@
+name: Release
+on:
+  push:
+    tags:
+      - v*
+permissions:
+  contents: read
+jobs:
+  rust-release:
+    runs-on: tcc-build
+    container: rust:latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Trust the checkout
+        run: if command -v git >/dev/null; then git config --global --add safe.directory "$GITHUB_WORKSPACE"; fi
+      - name: Publish to crates.io
+        run: cargo publish
+    timeout-minutes: 15

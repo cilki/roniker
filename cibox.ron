@@ -1,0 +1,8 @@
+(
+    rust_fmt: (
+        enabled: false,
+    ),
+    rust_minimal_versions: (
+        enabled: false,
+    ),
+)

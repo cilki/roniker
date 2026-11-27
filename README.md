@@ -49,12 +49,12 @@ You should only include the crate with exactly one of these features:
 ```toml
 [dependencies]
 # This is what serves the LSP
-roniker = { version = "0.4", features = ["lsp"] }
+roniker = { version = "0.5", features = ["lsp"] }
 serde_json = "1"
 
 [build-dependencies]
 # This is what analyzes the config structs
-roniker = { version = "0.4", features = ["analyze"] }
+roniker = { version = "0.5", features = ["analyze"] }
 serde_json = "1"
 ```
 
