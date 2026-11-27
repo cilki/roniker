@@ -30,83 +30,37 @@ struct Comment {
     start_byte: usize,
     /// The byte position where this comment ends
     end_byte: usize,
-    /// True if this comment appears on the same line as code before it
+    /// True if this comment follows one of the items being laid out on that
+    /// item's own line, and so stays after it there.
     is_trailing: bool,
 }
 
-/// Collect comments that are direct children of a container node
-/// Returns comments with their positions relative to sibling nodes
-fn collect_inner_comments(node: &Node, content: &str) -> Vec<Comment> {
-    let mut result = Vec::new();
+/// Collect the comments among `node`'s children, `items` being the children
+/// that are laid out one per line.
+///
+/// A comment is trailing when an item ends on the line it starts on. Only an
+/// item counts: the struct name ahead of the `(` and the punctuation between
+/// items are never anchors, so `Foo( // c` keeps its comment above the first
+/// item, while `A, // c` keeps it after `A` — whatever kind of node `A` is.
+fn collect_inner_comments(node: &Node, content: &str, items: &[Node]) -> Vec<Comment> {
     let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).collect();
-
-    for (i, child) in children.iter().enumerate() {
-        if ts_utils::is_comment(child)
-            && let Some(text) = ts_utils::node_text(child, content)
-        {
+    node.children(&mut cursor)
+        .filter(ts_utils::is_comment)
+        .filter_map(|child| {
+            let text = ts_utils::node_text(&child, content)?;
             let start_byte = child.start_byte();
-
-            // Determine if this is a trailing comment by checking if there's
-            // a non-comment, non-punctuation sibling before it on the same line
-            let is_trailing = is_trailing_comment_in_context(content, start_byte, &children[..i]);
-
-            result.push(Comment {
+            let is_trailing = items.iter().any(|item| {
+                item.end_byte() <= start_byte
+                    && !content[item.end_byte()..start_byte].contains('\n')
+            });
+            Some(Comment {
                 text: text.trim_end_matches('\r').to_string(),
-                start_byte: child.start_byte(),
+                start_byte,
                 end_byte: child.end_byte(),
                 is_trailing,
-            });
-        }
-    }
-
-    result
-}
-
-/// Determine if a comment is trailing by checking if there's a significant sibling
-/// (field, value, etc.) before it on the same line
-fn is_trailing_comment_in_context(
-    content: &str,
-    comment_start: usize,
-    siblings_before: &[Node],
-) -> bool {
-    // Find the line start for the comment
-    let before = &content[..comment_start];
-    let line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-
-    // Check if any significant sibling ends on this same line (after line_start)
-    for sibling in siblings_before.iter().rev() {
-        let kind = sibling.kind();
-        // Skip punctuation like ( ) , :
-        if !sibling.is_named() {
-            continue;
-        }
-        // Skip other comments
-        if ts_utils::is_comment(sibling) {
-            continue;
-        }
-        // Skip identifiers that are struct names (first child of struct)
-        // We only want to consider fields and values as trailing anchors
-        if kind == "identifier" {
-            // Check if this identifier is the first named child (struct name)
-            // by seeing if there are any fields/values before it
-            let has_field_before = siblings_before
-                .iter()
-                .any(|s| s.kind() == "field" || s.kind() == "map_entry");
-            if !has_field_before {
-                // This is likely the struct name, skip it
-                continue;
-            }
-        }
-        // This is a significant node - check if it ends on or after the line start
-        if sibling.end_byte() > line_start {
-            return true;
-        }
-        // If this sibling is on a previous line, stop looking
-        break;
-    }
-
-    false
+            })
+        })
+        .collect()
 }
 
 /// Format RON content using tree-sitter AST, preserving comments.
@@ -349,7 +303,7 @@ impl Formatter<'_> {
     /// item on lines of their own after it. Every line written ends in a line
     /// break, the last one included.
     fn lines(&mut self, node: &Node, items: &[Node<'_>], level: usize, terminator: &str) {
-        let comments = collect_inner_comments(node, self.content);
+        let comments = collect_inner_comments(node, self.content, items);
 
         self.prev_end = None;
         for (i, item) in items.iter().enumerate() {
@@ -404,7 +358,7 @@ impl Formatter<'_> {
         // A comment among the values is the one thing that line can't hold, so
         // it gives up the shorter form rather than the comment.
         if let [only] = values.as_slice()
-            && collect_inner_comments(node, self.content).is_empty()
+            && collect_inner_comments(node, self.content, &values).is_empty()
         {
             self.output.push('(');
             self.node(only, level);
@@ -587,6 +541,30 @@ mod tests {
         let formatted = format_ron(input);
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("id: 1, // User identifier"));
+    }
+
+    /// A bare identifier written as a value — an enum variant — anchors the
+    /// comment after it on its line like any other value. It used to be taken
+    /// for a struct's name and skipped, so the comment was moved onto a line of
+    /// its own above the next value.
+    #[test]
+    fn test_inline_comment_after_bare_variant() {
+        for (input, expected) in [
+            ("[\n    A, // c\n    B,\n]", "[\n    A, // c\n    B,\n]"),
+            (
+                "Foo(\n    A, // c\n    B,\n)",
+                "Foo(\n    A, // c\n    B,\n)",
+            ),
+            ("(A, /* c */ B)", "(\n    A, /* c */\n    B,\n)"),
+        ] {
+            assert_eq!(format_ron(input), expected, "{input}");
+        }
+        // The struct's name is not an item: a comment after its `(` stays
+        // above the first one.
+        assert_eq!(
+            format_ron("Foo( // c\n    A,\n    B,\n)"),
+            "Foo(\n    // c\n    A,\n    B,\n)"
+        );
     }
 
     #[test]
