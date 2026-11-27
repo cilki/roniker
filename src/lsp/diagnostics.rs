@@ -1171,6 +1171,17 @@ fn check_declared_type(
         {
             return bare_name_mismatch(name, expected_type);
         }
+        // Only a value written as a struct is read as the record; any other
+        // shape keeps the plainer "expected Duration, got string" below. A
+        // workspace type sharing the name keeps its own meaning, as it does
+        // everywhere else; only std's own `Duration` is std's to judge.
+        if let Some(text) = value_text
+            && matches!(value, Value::Map(_))
+            && analyzer.get_type_info(expected_type).is_none()
+            && let Some(tail) = std_record_mismatch(&normalize_type(expected_type), text, value)
+        {
+            return Some(tail);
+        }
         return check_type_mismatch(value, expected_type);
     }
 
@@ -1262,6 +1273,38 @@ fn bare_name_mismatch(name: &str, expected_type: &str) -> Option<String> {
         String::new()
     };
     Some(format!("expected {clean_type}, got '{name}'{hint}"))
+}
+
+/// What is wrong with `text`, the value written for the standard-library
+/// record type `clean` (`Duration`, `SystemTime`), worded as the tail of a
+/// "Type mismatch: ..." message. `None` when `clean` is no such type, or the
+/// value is one.
+///
+/// The analyzer has no definition of these to walk field by field, but the
+/// types themselves are right here: deserializing the value into the real one
+/// is exactly what the application will do, so it decides. A missing `nanos`,
+/// a misspelled field, a string for `secs`, a `{..}` map or a value naming
+/// some other struct all came back clean and then failed to load.
+///
+/// The wording is taken from deserializing the parsed `value` where that fails
+/// too, since it names what was found (`Expected u64 but found the floating
+/// point number `1.5` instead`) where reading the text stops at the first
+/// character it can't use (`Expected comma`). Only the text sees the struct's
+/// name and its brackets, though, so that is the fallback.
+fn std_record_mismatch(clean: &str, text: &str, value: &Value) -> Option<String> {
+    fn mismatch<T: serde::de::DeserializeOwned>(text: &str, value: &Value) -> Option<String> {
+        let error = ron::from_str::<T>(text).err()?;
+        Some(match value.clone().into_rust::<T>() {
+            Err(from_value) => from_value.to_string(),
+            Ok(_) => error.code.to_string(),
+        })
+    }
+    let reason = match clean {
+        "Duration" => mismatch::<std::time::Duration>(text, value),
+        "SystemTime" => mismatch::<std::time::SystemTime>(text, value),
+        _ => None,
+    }?;
+    Some(format!("invalid {clean}: {reason}"))
 }
 
 /// What a bare RON literal is, named the way a "got ..." message wants it.
@@ -2854,6 +2897,108 @@ mod tests {
                 "{literal} in {type_name} is a std type, not an unknown one: {errors:?}"
             );
         }
+    }
+
+    /// A `Duration` or `SystemTime` is written as the struct serde gives it,
+    /// and its fields used to go unchecked: any parenthesized value passed, so
+    /// a document missing `nanos` looked clean and then failed to load. Every
+    /// verdict below is the one `ron` 0.12 gives deserializing the real type.
+    #[test]
+    fn test_std_record_fields_are_held_to_the_real_type() {
+        for (type_name, literal) in [
+            ("Duration", "(secs: 5, nanos: 0)"),
+            ("Duration", "Duration(secs: 5, nanos: 0)"),
+            ("Duration", "(nanos: 1, secs: 2)"),
+            ("std::time::Duration", "(secs: 5, nanos: 0)"),
+            ("SystemTime", "(secs_since_epoch: 5, nanos_since_epoch: 0)"),
+            ("Option<Duration>", "Some((secs: 1, nanos: 0))"),
+            ("Vec<Duration>", "[(secs: 1, nanos: 0), (secs: 2, nanos: 3)]"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        for (type_name, literal, expected) in [
+            (
+                "Duration",
+                "(secs: 5)",
+                "invalid Duration: Unexpected missing field named `nanos`",
+            ),
+            ("Duration", "(secs: 5, nanos: 0, x: 1)", "Unexpected field named `x`"),
+            ("Duration", r#"(secs: "5", nanos: 0)"#, "Expected u64"),
+            ("Duration", "(secs: -1, nanos: 0)", "Expected u64"),
+            ("Duration", "(secs: 1.5, nanos: 0)", "floating point number `1.5`"),
+            (
+                "Duration",
+                "(secs: 18446744073709551615, nanos: 2000000000)",
+                "overflow deserializing Duration",
+            ),
+            // Only the text knows the brackets and the name, which a parsed
+            // value has already forgotten.
+            (
+                "Duration",
+                r#"{"secs": 5, "nanos": 0}"#,
+                "Expected opening `(` for struct `Duration`",
+            ),
+            (
+                "Duration",
+                "Timeout(secs: 5, nanos: 0)",
+                "Expected struct `Duration` but found `Timeout`",
+            ),
+            (
+                "SystemTime",
+                "(secs: 5, nanos: 0)",
+                "expected either `secs_since_epoch` or `nanos_since_epoch`",
+            ),
+            // Wherever the record sits.
+            ("Option<Duration>", "Some((secs: 1))", "missing field named `nanos`"),
+            (
+                "Vec<Duration>",
+                "[(secs: 1, nanos: 0), (secs: 2)]",
+                "missing field named `nanos`",
+            ),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
+            );
+        }
+
+        // A workspace enum that happens to be called `Duration` is judged by
+        // its own variants, not by std's record, even where a struct variant
+        // is written in the record's shape.
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Duration".to_string(),
+            kind: TypeKind::Enum(vec![EnumVariant {
+                name: "Long".to_string(),
+                fields: vec![FieldInfo {
+                    name: "secs".to_string(),
+                    type_name: "u64".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let errors: Vec<_> = validate_ron_with_analyzer(
+            "Cfg(n: Long(secs: 5))",
+            None,
+            &single_field_type("Duration"),
+            &analyzer,
+        )
+        .into_iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .map(|d| d.message)
+        .collect();
+        assert!(
+            errors.is_empty(),
+            "Long is a Duration variant, got {errors:?}"
+        );
     }
 
     /// An address is a string `ron` reads through the type's `FromStr`, so a

@@ -90,8 +90,8 @@ pub(crate) enum StdShape {
     Text,
     /// An integer literal, bounded the way the primitive behind it is.
     Integer,
-    /// A struct of fields the analyzer has no definition of, so nothing beyond
-    /// "it is written as a struct" is checked.
+    /// A struct of fields the analyzer has no definition of. The LSP checks a
+    /// value written as one by deserializing it into the real type.
     Record,
 }
 

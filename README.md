@@ -303,8 +303,11 @@ name instead, by the RON spelling serde reads each one from:
   range, which is what `ron` does with it; a `0` in a signed one is refused by
   `ron` too but is not reported
 - written as a struct of their own: `Duration` as `(secs: 0, nanos: 0)` and
-  `SystemTime` as `(secs_since_epoch: 0, nanos_since_epoch: 0)`. The fields
-  inside those are not checked
+  `SystemTime` as `(secs_since_epoch: 0, nanos_since_epoch: 0)`. Such a value
+  is deserialized into the real type to check it, so a missing or misspelled
+  field, a field of the wrong type, a `{..}` map, or another struct's name in
+  front of the parentheses is reported the way `ron` reports it (``invalid
+  Duration: Unexpected missing field named `nanos` ``)
 - written as an array of their elements: `VecDeque<T>`, `LinkedList<T>`,
   `BinaryHeap<T>`, alongside the `Vec<T>`, `HashSet<T>` and `BTreeSet<T>`
   already handled
