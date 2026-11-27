@@ -482,9 +482,10 @@ fn tree_satisfies(node: &tree_sitter::Node, content: &str, declared: &str) -> bo
     // literal's kind: the tree already knows whether the `String` or `PathBuf`
     // field holds a string. The integer ones fall through to the
     // `integer` arm below, which has the range the literal must fit, and the
-    // record ones to the full check.
+    // record ones to the full check. An address is a string with a syntax of
+    // its own, which only the full check reads.
     if std_type(declared).map(|std| std.shape) == Some(StdShape::Text) {
-        return node.kind() == "string";
+        return node.kind() == "string" && address_parser(declared).is_none();
     }
 
     match (node.kind(), declared) {
@@ -1341,6 +1342,14 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
         Value::String(_) if std_shape != Some(StdShape::Text) => {
             return Some(format!("expected {}, got string", display_type));
         }
+        // An address is a string `ron` hands to the type's `FromStr`, and a
+        // document whose string doesn't parse fails to load ("invalid IP
+        // address syntax") however much it looks like a string field.
+        Value::String(text) => {
+            return address_parser(&clean_type)
+                .filter(|accepts| !accepts(text))
+                .map(|_| format!("\"{text}\" is not a valid {display_type}"));
+        }
         Value::Seq(_) => {
             if is_wrapped_by(&clean_type, &ARRAY_WRAPPERS) {
                 // [`validate_nested_value`] walks a `Vec` or a set written as
@@ -1391,6 +1400,25 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Whether a string is a valid value of the address type `clean` — an
+/// already-normalized name — or `None` when `clean` is no address type.
+///
+/// serde reads these from a human-readable format through the type's own
+/// `FromStr`, so that is what decides: `"127.0.0.1"` is an `IpAddr` but not a
+/// `SocketAddr`, and `"[::1]:80"` a `SocketAddr` but not an `IpAddr`.
+fn address_parser(clean: &str) -> Option<fn(&str) -> bool> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    Some(match clean {
+        "IpAddr" => |s| s.parse::<IpAddr>().is_ok(),
+        "Ipv4Addr" => |s| s.parse::<Ipv4Addr>().is_ok(),
+        "Ipv6Addr" => |s| s.parse::<Ipv6Addr>().is_ok(),
+        "SocketAddr" => |s| s.parse::<SocketAddr>().is_ok(),
+        "SocketAddrV4" => |s| s.parse::<SocketAddrV4>().is_ok(),
+        "SocketAddrV6" => |s| s.parse::<SocketAddrV6>().is_ok(),
+        _ => return None,
+    })
 }
 
 /// Where to report a syntax error: the span RON failed in, translated into LSP
@@ -2768,6 +2796,69 @@ mod tests {
             assert!(
                 !errors.iter().any(|m| m.contains("Unknown type")),
                 "{literal} in {type_name} is a std type, not an unknown one: {errors:?}"
+            );
+        }
+    }
+
+    /// An address is a string `ron` reads through the type's `FromStr`, so a
+    /// string that doesn't parse fails to load ("invalid IP address syntax").
+    /// It used to pass as any string would, and the config looked clean.
+    #[test]
+    fn test_address_string_is_held_to_the_types_syntax() {
+        for (type_name, literal) in [
+            ("IpAddr", r#""127.0.0.1""#),
+            ("IpAddr", r#""::1""#),
+            ("Ipv4Addr", r#"r"10.0.0.1""#),
+            // The escape is read before the address is.
+            ("Ipv4Addr", r#""\u{31}0.0.0.1""#),
+            ("Ipv6Addr", r#""fe80::1""#),
+            ("SocketAddr", r#""[::1]:80""#),
+            ("SocketAddrV4", r#""127.0.0.1:80""#),
+            ("SocketAddrV6", r#""[::1]:80""#),
+            ("std::net::IpAddr", r#""10.0.0.1""#),
+            // A string that only looks like an address is still a string.
+            ("String", r#""nope""#),
+            ("PathBuf", r#""127.0.0.1:80""#),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.is_empty(),
+                "{literal} is a valid {type_name}, got {errors:?}"
+            );
+        }
+
+        for (type_name, literal, expected) in [
+            ("IpAddr", r#""nope""#, r#""nope" is not a valid IpAddr"#),
+            ("IpAddr", r#""127.0.0.1:80""#, "not a valid IpAddr"),
+            ("IpAddr", r#"" 127.0.0.1""#, "not a valid IpAddr"),
+            ("Ipv4Addr", r#""::1""#, "not a valid Ipv4Addr"),
+            ("Ipv6Addr", r#""127.0.0.1""#, "not a valid Ipv6Addr"),
+            ("SocketAddr", r#""127.0.0.1""#, "not a valid SocketAddr"),
+            ("SocketAddrV4", r#""[::1]:80""#, "not a valid SocketAddrV4"),
+            (
+                "SocketAddrV6",
+                r#""127.0.0.1:80""#,
+                "not a valid SocketAddrV6",
+            ),
+            ("std::net::IpAddr", r#""nope""#, "not a valid IpAddr"),
+            // Wherever the address sits.
+            ("Option<IpAddr>", r#"Some("nope")"#, "not a valid IpAddr"),
+            (
+                "Vec<SocketAddr>",
+                r#"["[::1]:80", "nope"]"#,
+                "not a valid SocketAddr",
+            ),
+            (
+                "HashMap<IpAddr, u8>",
+                r#"{"nope": 1}"#,
+                "not a valid IpAddr",
+            ),
+            ("Box<Ipv4Addr>", r#""nope""#, "not a valid Ipv4Addr"),
+        ] {
+            let errors = numeric_errors(type_name, literal);
+            assert!(
+                errors.iter().any(|m| m.contains(expected)),
+                "{literal} in {type_name} should report {expected:?}, got {errors:?}"
             );
         }
     }

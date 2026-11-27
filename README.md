@@ -294,7 +294,10 @@ is given, so no build script can register a `PathBuf`. These are understood by
 name instead, by the RON spelling serde reads each one from:
 
 - written as a string: `PathBuf`, `Path`, `OsString`, `OsStr`, `IpAddr`,
-  `Ipv4Addr`, `Ipv6Addr`, `SocketAddr`, `SocketAddrV4`, `SocketAddrV6`
+  `Ipv4Addr`, `Ipv6Addr`, `SocketAddr`, `SocketAddrV4`, `SocketAddrV6`. An
+  address is also held to its type's syntax, the way `ron` parses it:
+  `"127.0.0.1"` is an `IpAddr` but not a `SocketAddr`, so it is reported as
+  `"127.0.0.1" is not a valid SocketAddr`
 - written as an integer: the `NonZero` family, under both the `NonZeroU32` and
   the `NonZero<u32>` spelling. A `0` in an *unsigned* one is reported as out of
   range, which is what `ron` does with it; a `0` in a signed one is refused by
