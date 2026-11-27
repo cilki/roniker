@@ -762,24 +762,52 @@ fn validate_tuple_value(
         _ => return None,
     };
 
-    if elements.len() != element_types.len() {
-        return Some(mismatch(format!(
-            "expected {} element{} for {field_type}, got {}",
-            element_types.len(),
-            if element_types.len() == 1 { "" } else { "s" },
-            elements.len()
-        )));
+    Some(validate_elements(
+        value_node,
+        content,
+        field_type,
+        &elements,
+        element_types,
+        element_types.len(),
+        analyzer,
+    ))
+}
+
+/// Check the `values` written inside `node` against the `types` its positions
+/// declare: by count first — no more than `types`, and no fewer than
+/// `required` — and then value by value against the type of its position.
+/// `label` names the type in the count message.
+fn validate_elements(
+    node: &tree_sitter::Node,
+    content: &str,
+    label: &str,
+    values: &[tree_sitter::Node],
+    types: &[&str],
+    required: usize,
+    analyzer: &RustAnalyzer,
+) -> Vec<Diagnostic> {
+    if values.len() > types.len() || values.len() < required {
+        let expected = match required {
+            r if r == types.len() => r.to_string(),
+            0 => format!("at most {}", types.len()),
+            r => format!("{r} to {}", types.len()),
+        };
+        return vec![type_mismatch(
+            node,
+            content,
+            &format!(
+                "expected {expected} element{} for {label}, got {}",
+                if types.len() == 1 { "" } else { "s" },
+                values.len()
+            ),
+        )];
     }
 
-    Some(
-        elements
-            .iter()
-            .zip(element_types)
-            .flat_map(|(element, declared)| {
-                validate_typed_value(element, content, declared, analyzer)
-            })
-            .collect(),
-    )
+    values
+        .iter()
+        .zip(types)
+        .flat_map(|(value, declared)| validate_typed_value(value, content, declared, analyzer))
+        .collect()
 }
 
 /// Whether `fields` are those of a tuple or newtype struct or variant: named by
@@ -791,8 +819,7 @@ fn is_positional(fields: &[(String, FieldInfo)]) -> bool {
 
 /// Check the value written for a tuple struct (`Route("a", 80)`, `("a", 80)`)
 /// or a tuple variant's payload (`Rect(1, 2)`) against the positional `fields`
-/// it declares — by count, and then value by value against the type each
-/// position declares, the way [`validate_tuple_value`] checks a Rust tuple.
+/// it declares, through [`validate_elements`] like a Rust tuple.
 ///
 /// `ron` refuses a value with more elements than the type declares ("Expected
 /// closing `)`") and one with fewer ("Expected tuple struct Route with 2
@@ -873,30 +900,8 @@ fn validate_positional_values(
             .rposition(|(_, f)| !f.has_default)
             .map_or(0, |last| last + 1)
     };
-    if values.len() > fields.len() || values.len() < required {
-        let expected = match required {
-            r if r == fields.len() => r.to_string(),
-            0 => format!("at most {}", fields.len()),
-            r => format!("{r} to {}", fields.len()),
-        };
-        return vec![type_mismatch(
-            node,
-            content,
-            &format!(
-                "expected {expected} element{} for {label}, got {}",
-                if fields.len() == 1 { "" } else { "s" },
-                values.len()
-            ),
-        )];
-    }
-
-    values
-        .iter()
-        .zip(fields)
-        .flat_map(|(value, (_, field))| {
-            validate_typed_value(value, content, &field.type_name, analyzer)
-        })
-        .collect()
+    let types: Vec<&str> = fields.iter().map(|(_, f)| f.type_name.as_str()).collect();
+    validate_elements(node, content, label, &values, &types, required, analyzer)
 }
 
 /// What a newtype variant's single position holds, as far as writing its
