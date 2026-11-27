@@ -19,10 +19,12 @@ impl RustAnalyzer {
     /// `crate::models::user`). A path with no `src` component gets no prefix at
     /// all, and its types are registered under their bare names.
     ///
-    /// `file_path` is also recorded on every type extracted from it and is what
-    /// go-to-definition resolves to, so pass an absolute path: a relative one
-    /// cannot be turned into the `file://` URL the LSP has to answer with, and
-    /// definition requests then come back empty.
+    /// In a debug build `file_path` is also recorded on every type extracted
+    /// from it and is what go-to-definition resolves to, so pass an absolute
+    /// path: a relative one cannot be turned into the `file://` URL the LSP has
+    /// to answer with, and definition requests then come back empty. A release
+    /// build records no path at all, so none ends up embedded in the
+    /// application, and go-to-definition is not offered.
     ///
     /// # Arguments
     /// * `file_path` - Absolute path to the Rust source file
@@ -40,11 +42,12 @@ impl RustAnalyzer {
     ///
     /// Parses the source and extracts all type definitions. The file need not
     /// exist; `file_path` is used exactly as [`RustAnalyzer::add_file`] uses it,
-    /// both to infer the module path and as the go-to-definition target, so the
-    /// same absolute-path and `src`-component rules apply.
+    /// both to infer the module path and, in a debug build, as the
+    /// go-to-definition target, so the same absolute-path and `src`-component
+    /// rules apply.
     ///
     /// # Arguments
-    /// * `file_path` - Path to associate with this source (module path inference and go-to-definition)
+    /// * `file_path` - Path to associate with this source (module path inference and, in debug builds, go-to-definition)
     /// * `source` - Rust source code to parse
     ///
     /// # Returns
@@ -190,7 +193,13 @@ fn type_info(
         name: qualified_name(module_prefix, &ident.to_string()),
         kind,
         docs: extract_docs(attrs),
-        source_file: file_path.map(Path::to_path_buf),
+        // The path travels into the application's binary with the rest of the
+        // analyzer, so it is only kept where go-to-definition is served: a
+        // release build would otherwise embed the absolute path of the
+        // machine it was built on.
+        source_file: file_path
+            .filter(|_| cfg!(debug_assertions))
+            .map(Path::to_path_buf),
         line: Some(start.line),
         column: Some(start.column),
         // Only a container `#[serde(default)]` makes the fields optional. A bare
@@ -742,6 +751,24 @@ mod tests {
         // Should be accessible via the inferred module path
         let config = analyzer.get_type_info("crate::settings::config::Config");
         assert!(config.is_some(), "Config should be at inferred path");
+    }
+
+    /// The source path is the go-to-definition target, and it is embedded in
+    /// the application along with the rest of the analyzer. A release build
+    /// serves no go-to-definition, so it keeps no path to leak.
+    #[test]
+    fn test_source_file_is_only_kept_in_debug_builds() {
+        let mut analyzer = RustAnalyzer::new();
+        let file_path = PathBuf::from("/home/you/code/app/src/config.rs");
+        analyzer
+            .add_source(&file_path, "pub struct Config { pub debug: bool }")
+            .unwrap();
+
+        let config = analyzer
+            .get_type_info("crate::config::Config")
+            .expect("the module path is still inferred from the file path");
+        let expected = cfg!(debug_assertions).then_some(file_path);
+        assert_eq!(config.source_file, expected);
     }
 
     /// The module prefix derived from a file path is what a build script's root

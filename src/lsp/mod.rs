@@ -254,7 +254,9 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
+                // Only debug builds keep the source paths a definition points
+                // at; see `goto_definition`.
+                definition_provider: cfg!(debug_assertions).then_some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
@@ -337,6 +339,13 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        // Go-to-definition is a debug-build feature: a release build's analyzer
+        // carries no source paths, so that none are embedded in the binary,
+        // and one registered by hand is not answered with either.
+        if !cfg!(debug_assertions) {
+            return Ok(None);
+        }
+
         let Some(symbol) = self.symbol_at(&params.text_document_position_params).await else {
             return Ok(None);
         };
@@ -2109,14 +2118,18 @@ Document::new(content.to_string()),
                 })
                 .await
                 .unwrap();
-            let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
-                panic!("goto_definition on nested 'port' returned nothing ({label})");
-            };
-            assert_eq!(
-                location.range.start,
-                Position::new(6, 4),
-                "definition should land on Server::port ({label})"
-            );
+            if cfg!(debug_assertions) {
+                let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+                    panic!("goto_definition on nested 'port' returned nothing ({label})");
+                };
+                assert_eq!(
+                    location.range.start,
+                    Position::new(6, 4),
+                    "definition should land on Server::port ({label})"
+                );
+            } else {
+                assert!(definition.is_none(), "release builds serve no definitions");
+            }
 
             // Completion on a fresh line inside the nested value must offer
             // Server's fields, not Config's — and of those, only the ones the
@@ -4289,14 +4302,18 @@ PostReference(
                 })
                 .await
                 .unwrap();
-            let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
-                panic!("goto_definition on the {label} returned nothing");
-            };
-            assert_eq!(
-                (location.range.start.line, location.range.start.character),
-                expected,
-                "definition of the {label}"
-            );
+            if cfg!(debug_assertions) {
+                let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+                    panic!("goto_definition on the {label} returned nothing");
+                };
+                assert_eq!(
+                    (location.range.start.line, location.range.start.character),
+                    expected,
+                    "definition of the {label}"
+                );
+            } else {
+                assert!(definition.is_none(), "release builds serve no definitions");
+            }
 
             let hover = backend
                 .hover(HoverParams {
@@ -4350,14 +4367,18 @@ PostReference(
             })
             .await
             .unwrap();
-        let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
-            panic!("goto_definition on a bare variant value returned nothing");
-        };
-        assert_eq!(
-            (location.range.start.line, location.range.start.character),
-            (19, 4),
-            "definition should land on PostType::Short"
-        );
+        if cfg!(debug_assertions) {
+            let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+                panic!("goto_definition on a bare variant value returned nothing");
+            };
+            assert_eq!(
+                (location.range.start.line, location.range.start.character),
+                (19, 4),
+                "definition should land on PostType::Short"
+            );
+        } else {
+            assert!(definition.is_none(), "release builds serve no definitions");
+        }
 
         let hover = backend
             .hover(HoverParams {
