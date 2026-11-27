@@ -187,13 +187,9 @@ fn is_name(node: &tree_sitter::Node) -> bool {
 
 /// Compute the tree-sitter Point (row + byte column) for a byte offset.
 fn byte_point(content: &str, byte_offset: usize, line: usize) -> tree_sitter::Point {
-    let line_start = content[..byte_offset]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
     tree_sitter::Point {
         row: line,
-        column: byte_offset - line_start,
+        column: byte_offset - ts_utils::line_start(content, byte_offset),
     }
 }
 
@@ -536,10 +532,7 @@ impl LanguageServer for Backend {
         // starts on, so a nested value closes at the column of the line that
         // opened it instead of at the left margin.
         let value_start = start + leading.len();
-        let line_start = doc.content[..value_start]
-            .rfind('\n')
-            .map_or(0, |newline| newline + 1);
-        let line = &doc.content[line_start..value_start];
+        let line = &doc.content[ts_utils::line_start(&doc.content, value_start)..value_start];
         let base = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
 
         // Lines end the way the document's do: a selection on one line has no

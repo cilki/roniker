@@ -1,7 +1,7 @@
 use super::ts_utils::{
     ancestor_chain, ancestors, child_by_kind, field_name, innermost_of_kind, is_some_wrapper,
-    node_at_position, node_text, owning_field_for_children, position_to_byte_offset, struct_fields,
-    struct_name,
+    node_at_position, node_text, owning_field_for_children, position_to_byte_offset,
+    struct_field_names, struct_name,
 };
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::Position;
@@ -79,29 +79,14 @@ pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> 
     // report the enclosing field instead (or nothing at all), so value
     // completion falls back to offering every workspace type. Recover the field
     // name from that `identifier ERROR(":")` pair first.
-    if let Some(field) = field_of_unterminated_value(tree, current, content, position) {
-        return Some(field);
+    if let Some(name) = unterminated_field_pair(tree, current, content, position)
+        .and_then(|(name, _)| node_text(&name, content))
+    {
+        return Some(name.to_string());
     }
 
     // Walk up to find a field node
     ancestors(tree, current).find_map(|node| field_name(&node, content).map(str::to_string))
-}
-
-/// Recover the field name for a value that is mid-edit and has no terminator.
-///
-/// Such a value defeats tree-sitter's `field` production, leaving the field name
-/// as a bare `identifier` immediately followed by an `ERROR` node holding the
-/// `:`. When the cursor sits at or past that identifier within the same struct,
-/// treat it as the field being edited. The cursor check keeps a well-formed
-/// earlier field on the same struct from being misattributed to the dangling one.
-fn field_of_unterminated_value(
-    tree: &Tree,
-    node: Node,
-    content: &str,
-    position: Position,
-) -> Option<String> {
-    let (name, _) = unterminated_field_pair(tree, node, content, position)?;
-    node_text(&name, content).map(str::to_string)
 }
 
 /// The field whose value the cursor is positioned to type, when that value is
@@ -208,12 +193,7 @@ pub fn extract_fields_from_ron<'a>(
     node_at_position(tree, content, position)
         .and_then(|node| innermost_of_kind(tree, node, "struct"))
         .or_else(|| child_by_kind(&tree.root_node(), "struct"))
-        .map(|struct_node| {
-            struct_fields(&struct_node)
-                .iter()
-                .filter_map(|field| field_name(field, content))
-                .collect()
-        })
+        .map(|struct_node| struct_field_names(&struct_node, content))
         .unwrap_or_default()
 }
 

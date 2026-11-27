@@ -111,8 +111,7 @@ pub fn generate_remove_field_actions(
             continue;
         }
 
-        let offset = ts_utils::position_to_byte_offset(content, diag.range.start);
-        let Some(node) = tree.root_node().descendant_for_byte_range(offset, offset) else {
+        let Some(node) = ts_utils::node_at_position(tree, content, diag.range.start) else {
             continue;
         };
         let Some(field_node) = ts_utils::innermost_of_kind(tree, node, "field") else {
@@ -404,10 +403,7 @@ impl<'a> NestedWalk<'a> {
         // would credit it with field names belonging to a nested type, which is
         // how a required field could be considered present because something
         // nested inside it happened to share its name.
-        let present: std::collections::HashSet<&str> = ts_utils::struct_fields(value)
-            .iter()
-            .filter_map(|field| ts_utils::field_name(field, self.content))
-            .collect();
+        let present = ts_utils::struct_field_names(value, self.content);
         let present = |name: &str| present.contains(name);
 
         // A container `#[serde(default)]` fills in whatever is absent, so none
@@ -539,15 +535,12 @@ fn generate_explicit_type_actions(
         ));
     }
 
-    let Some(fields) = type_info.fields() else {
+    if type_info.fields().is_none() {
         return actions;
-    };
-    let rename_all = type_info.rename_all.as_deref();
+    }
     for field_node in ts_utils::struct_fields(&main_value) {
         if let Some(field_name) = ts_utils::field_name(&field_node, content)
-            && let Some(field) = fields
-                .iter()
-                .find(|f| f.accepts_name(field_name, rename_all))
+            && let Some(field) = type_info.find_field_serialized(field_name)
             && let Some(value_node) = ts_utils::field_value(&field_node)
             && value_node.kind() == "struct"
             && ts_utils::struct_name(&value_node, content).is_none()

@@ -49,6 +49,14 @@ impl ValueSlot {
             steps: Vec::new(),
         }
     }
+
+    /// The type of the value at the cursor, given the type the field is
+    /// declared as, followed down through [`Self::steps`].
+    fn resolve(&self, declared: String) -> Option<String> {
+        self.steps
+            .iter()
+            .try_fold(declared, |declared, step| step.apply(&declared))
+    }
 }
 
 /// One step from the type a field is declared as down to the type of the value
@@ -159,13 +167,8 @@ fn value_steps<'a>(
                 // The element the cursor is at is the one after however many
                 // commas precede it; one not typed yet (`(1, |)`) is a
                 // `MISSING` node, which `tuple_elements` leaves out.
-                let mut walk = current.walk();
-                let index = current
-                    .children(&mut walk)
-                    .filter(|child| child.kind() == "," && child.end_byte() <= cursor)
-                    .count();
                 (
-                    ValueStep::TupleElement(index),
+                    ValueStep::TupleElement(element_index(&current, cursor)),
                     ts_utils::tuple_elements(&current)
                         .into_iter()
                         .find(contains),
@@ -305,10 +308,7 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
             // own name is not in the body yet, so it falls through to the
             // enclosing field instead. A `Some(..)` has no fields to name
             // either: what it wraps is the enclosing field's value.
-            "struct"
-                if !ts_utils::is_some_wrapper(&ancestor, content)
-                    && inside_struct_body(&ancestor, content, position) =>
-            {
+            "struct" if inside_struct_body(&ancestor, content, position) => {
                 return struct_body_context(&ancestor, tree, content, position);
             }
             "field" => return field_completion_context(&ancestor, content, position),
@@ -320,14 +320,27 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
     CompletionContext::FieldName
 }
 
-/// Whether `position` is inside `struct_node`'s parentheses rather than on the
-/// struct name that precedes them.
-fn inside_struct_body(struct_node: &tree_sitter::Node, content: &str, position: Position) -> bool {
+/// Whether `node` is a struct value and `position` is inside its parentheses
+/// rather than on the struct name that precedes them. A `Some(..)` is no
+/// struct of its own: what it wraps is the enclosing value.
+fn inside_struct_body(node: &tree_sitter::Node, content: &str, position: Position) -> bool {
     use super::ts_utils;
 
-    // The grammar gives every `struct` its `(`, so there is always one to find.
-    ts_utils::child_by_kind(struct_node, "(")
-        .is_some_and(|open| ts_utils::position_to_byte_offset(content, position) >= open.end_byte())
+    node.kind() == "struct"
+        && !ts_utils::is_some_wrapper(node, content)
+        // The grammar gives every `struct` its `(`, so there is always one to find.
+        && ts_utils::child_by_kind(node, "(").is_some_and(|open| {
+            ts_utils::position_to_byte_offset(content, position) >= open.end_byte()
+        })
+}
+
+/// The position inside the parenthesized `node` that `cursor` is at: one past
+/// however many commas precede it.
+fn element_index(node: &tree_sitter::Node, cursor: usize) -> usize {
+    let mut walk = node.walk();
+    node.children(&mut walk)
+        .filter(|child| child.kind() == "," && child.end_byte() <= cursor)
+        .count()
 }
 
 /// The context for a cursor inside a struct's parentheses: the value position of
@@ -464,13 +477,8 @@ pub fn generate_completions_for_type(
     // is written for, found by serialized or Rust name, followed down through
     // the containers the cursor is inside of.
     let field_type = |slot: ValueSlot| {
-        let declared = type_info
-            .find_field_serialized(&slot.field)?
-            .type_name
-            .clone();
-        slot.steps
-            .iter()
-            .try_fold(declared, |declared, step| step.apply(&declared))
+        let declared = type_info.find_field_serialized(&slot.field)?;
+        slot.resolve(declared.type_name.clone())
     };
 
     // Outside the root value's parentheses there are no fields to name: before
@@ -748,20 +756,13 @@ fn positional_completions(
 
     let cursor = ts_utils::position_to_byte_offset(content, position);
     let Some(body) = ts_utils::node_at_position(tree, content, position).and_then(|node| {
-        ts_utils::ancestors(tree, node).find(|ancestor| {
-            ancestor.kind() == "struct"
-                && !ts_utils::is_some_wrapper(ancestor, content)
-                && inside_struct_body(ancestor, content, position)
-        })
+        ts_utils::ancestors(tree, node)
+            .find(|ancestor| inside_struct_body(ancestor, content, position))
     }) else {
         return Vec::new();
     };
 
-    let mut walk = body.walk();
-    let index = body
-        .children(&mut walk)
-        .filter(|child| child.kind() == "," && child.end_byte() <= cursor)
-        .count();
+    let index = element_index(&body, cursor);
     // Past the last element there is nothing more to write.
     let Some((name, field)) = fields.get(index) else {
         return Vec::new();
@@ -782,13 +783,7 @@ fn positional_completions(
     };
     value_completions(
         value_context(slot, innermost, content, cursor),
-        |slot| {
-            slot.steps
-                .iter()
-                .try_fold(field.type_name.clone(), |declared, step| {
-                    step.apply(&declared)
-                })
-        },
+        |slot| slot.resolve(field.type_name.clone()),
         analyzer,
     )
 }

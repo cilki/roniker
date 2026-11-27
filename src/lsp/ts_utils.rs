@@ -2,6 +2,7 @@
 /// This module provides high-level helpers for working with tree-sitter AST nodes
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use tower_lsp_server::ls_types::{Position, Range};
 use tree_sitter::{Node, Parser, Point, Tree};
@@ -301,7 +302,7 @@ fn floor_char_boundary(s: &str, offset: usize) -> usize {
 /// counting rows forwards from the start of the document costs everything that
 /// precedes it — the difference between answering a request in time
 /// proportional to the node and in time proportional to the whole file.
-fn line_start(content: &str, byte_offset: usize) -> usize {
+pub fn line_start(content: &str, byte_offset: usize) -> usize {
     content[..byte_offset]
         .rfind('\n')
         .map(|newline| newline + 1)
@@ -801,6 +802,15 @@ pub fn struct_fields<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     }
 
     named_children_by_kind(node, "field")
+}
+
+/// The names of the fields a struct node writes itself — its direct
+/// [`struct_fields`], not those of the values nested inside them.
+pub fn struct_field_names<'a>(node: &Node, content: &'a str) -> HashSet<&'a str> {
+    struct_fields(node)
+        .iter()
+        .filter_map(|field| field_name(field, content))
+        .collect()
 }
 
 /// The values of a tuple-style struct — `Point(1, 2)`, `Some("value")` — with
