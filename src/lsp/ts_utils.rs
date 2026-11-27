@@ -22,6 +22,13 @@ use tree_sitter::{Node, Parser, Point, Tree};
 /// value runs to the last quote on the line — `user` vanishes from the tree and
 /// is reported missing — and a raw string spanning lines does not lex at all.
 ///
+/// The grammar's block comment neither nests nor closes on a `*/` whose `*`
+/// ends an even run of them, where `ron`'s does both: `/* a /* b */ c */` ends at
+/// the first `*/` for the grammar, leaving ` c */` as an `ERROR`, and
+/// `/** doc **/` or `/***/` runs on to the next `*/` in the file, or to its
+/// end. The `*`s and `/`s inside such a comment become spaces, which leaves
+/// its outer `/*` and `*/` the only delimiters the grammar sees.
+///
 /// Masking keeps every byte offset, row and column where it was, so the nodes
 /// tree-sitter returns still line up with `content`, and their text is still
 /// read from `content`: only the tree's shape comes from the masked text. Only
@@ -39,6 +46,22 @@ pub fn mask_for_grammar(content: &str) -> Cow<'_, str> {
     let mut i = 0;
     while i < bytes.len() {
         if let Some(end) = skip_comment_or_quoted(bytes, i) {
+            // A block comment the grammar would close early, or not at all.
+            if bytes[i..].starts_with(b"/*") && end <= bytes.len() {
+                let interior = i + 2..end - 2;
+                let body = &bytes[interior.clone()];
+                // The grammar reads a `*` and the byte after it as one, so it
+                // only closes on a `*/` whose `*` ends an odd run of them.
+                let trailing_stars = body.iter().rev().take_while(|&&b| b == b'*').count();
+                if body.windows(2).any(|w| w == b"/*") || trailing_stars % 2 == 1 {
+                    let out = masked.get_or_insert_with(|| bytes.to_vec());
+                    for b in &mut out[interior] {
+                        if matches!(*b, b'*' | b'/') {
+                            *b = b' ';
+                        }
+                    }
+                }
+            }
             i = end;
             continue;
         }
@@ -1200,6 +1223,14 @@ mod tests {
                 "(a: -inf, b: +inf, c: -NaN, d: [+NaN])",
                 "(a: -0.0, b: -0.0, c: -0.0, d: [-0.0])",
             ),
+            // A nested block comment, and one closing after an even run of
+            // `*`s, keep only their outer delimiters. What looks like a raw
+            // string inside one is left alone.
+            (
+                r#"(a: /* /* r"y" */ r"z" */ 1)"#,
+                r#"(a: /*    r"y"    r"z" */ 1)"#,
+            ),
+            ("/** doc **/ /***/ (a: 1)", "/*  doc  */ /* */ (a: 1)"),
         ];
         for (content, expected) in cases {
             let masked = mask_for_grammar(content);
@@ -1216,7 +1247,11 @@ mod tests {
             r#"(a: "r\"x\"", b: 1)"#,
             r#"(a: "x", // r"y"
                 b: 1)"#,
-            r#"(a: /* /* r"y" */ r"z" */ 1)"#,
+            r#"(a: /* r"y" */ 1)"#,
+            // Block comments the grammar closes where `ron` does, and one `ron`
+            // never closes at all.
+            "/**/ /* a * b */ /* x ***/ (a: 1)",
+            "(a: 1) /* /* unterminated */",
             r#"(a: '"', b: r#type)"#,
             r#"(bar: 1, var: "x")"#,
             r#"(a: r"unterminated, b: 1)"#,
@@ -1261,6 +1296,30 @@ mod tests {
                 ("c", "string", r#"r"z""#),
             ]
         );
+    }
+
+    /// A block comment `ron` reads whole is one comment node spanning all of
+    /// it, and the value next to it keeps its shape.
+    #[test]
+    fn test_parse_block_comments_the_grammar_misreads() {
+        for comment in ["/* a /* b */ c */", "/** doc **/", "/***/"] {
+            let content = format!("{comment}\nCfg(a: 1, b: 2)");
+            let tree = parse(&content);
+            assert!(
+                !tree.root_node().has_error(),
+                "{comment}: {}",
+                tree.root_node().to_sexp()
+            );
+            let root = tree.root_node();
+            let first = root.child(0).unwrap();
+            assert_eq!(first.kind(), "block_comment");
+            assert_eq!(node_text(&first, &content), Some(comment));
+            let value = find_main_value(&tree).unwrap();
+            assert_eq!(
+                struct_field_names(&value, &content),
+                HashSet::from(["a", "b"])
+            );
+        }
     }
 
     /// A suffixed number is one literal spanning its suffix, and the value
