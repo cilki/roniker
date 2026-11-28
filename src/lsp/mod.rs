@@ -2911,6 +2911,96 @@ Document::new(content.to_string()),
         assert_eq!(labels, vec!["port"]);
     }
 
+    /// Inside the parentheses of a `Duration` or `SystemTime` value — which
+    /// `ron` reads as a struct of their own — what is offered is the fields
+    /// still missing from it, not the whole value again, and hovering one of
+    /// them describes it. Neither type is ever registered with the analyzer.
+    #[tokio::test]
+    async fn completes_and_hovers_the_fields_of_a_std_record_value() {
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..Default::default()
+        };
+        let mut analyzer = RustAnalyzer::with_root_type("Config");
+        analyzer.add_type(TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                field("timeout", "std::time::Duration"),
+                field("grace", "Option<Duration>"),
+                field("steps", "Vec<Duration>"),
+                field("since", "SystemTime"),
+            ]),
+            ..Default::default()
+        });
+        let service = create_test_backend_with_analyzer(analyzer).await;
+        let backend = service.inner();
+        let uri: Uri = "file:///test/config.ron".parse().unwrap();
+        let position_params = |marked: &str| {
+            let offset = marked.find('|').unwrap();
+            TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(0, offset as u32),
+            }
+        };
+
+        for (marked, expected) in [
+            ("Config(timeout: (|))", vec!["secs", "nanos"]),
+            ("Config(timeout: ( | ))", vec!["secs", "nanos"]),
+            ("Config(timeout: (secs: 1, |))", vec!["nanos"]),
+            ("Config(timeout: Duration(|))", vec!["secs", "nanos"]),
+            ("Config(grace: Some((nanos: 1, |)))", vec!["secs"]),
+            ("Config(grace: Some(Duration(|)))", vec!["secs", "nanos"]),
+            (
+                "Config(steps: [(secs: 1, nanos: 0), (|)])",
+                vec!["secs", "nanos"],
+            ),
+            (
+                "Config(since: (|))",
+                vec!["secs_since_epoch", "nanos_since_epoch"],
+            ),
+        ] {
+            backend
+                .documents
+                .write()
+                .await
+                .insert(uri.to_string(), Document::new(marked.replacen('|', "", 1)));
+            let completion = backend
+                .completion(CompletionParams {
+                    text_document_position: position_params(marked),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: None,
+                })
+                .await
+                .unwrap();
+            let Some(CompletionResponse::Array(items)) = completion else {
+                panic!("completion in {marked:?} returned nothing");
+            };
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, expected, "completion in {marked:?}");
+        }
+
+        let marked = "Config(timeout: (se|cs: 1, nanos: 0))";
+        backend
+            .documents
+            .write()
+            .await
+            .insert(uri.to_string(), Document::new(marked.replacen('|', "", 1)));
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params(marked),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .unwrap()
+            .expect("hovering a Duration's field should describe it");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("hover is markdown");
+        };
+        assert!(markup.value.contains("secs: u64"), "{}", markup.value);
+    }
+
     /// Whole-document formatting lays out the tree the document already
     /// carries instead of parsing its text again, so what the editor is handed
     /// has to be exactly what parsing from scratch would have produced — over

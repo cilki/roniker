@@ -63,7 +63,7 @@ fn step_by_type_name<'a>(
             field_type_base == context_name
         })
     {
-        return analyzer.get_type_info(&field.type_name);
+        return struct_value_type(analyzer, &normalize_type(&field.type_name));
     }
 
     // Try as direct type lookup
@@ -91,7 +91,9 @@ fn step_by_type_name<'a>(
         }
     }
 
-    None
+    // Last, since nothing the workspace defines may be shadowed by it: a
+    // `Duration(..)` written behind an `Option` or inside a `Vec`.
+    std_record_type(context_name)
 }
 
 /// Resolve the type of an unnamed struct value from the field it is the value
@@ -103,7 +105,96 @@ fn step_by_field_name<'a>(
     field_name: &str,
 ) -> Option<&'a TypeInfo> {
     let field = info.find_field_serialized(field_name)?;
-    value_type(analyzer, &field.type_name)
+    value_type_by(&field.type_name, |name| struct_value_type(analyzer, name))
+}
+
+/// The type whose fields a struct value written for a field declared as
+/// `type_name` (already normalized, wrappers removed) is made of: a registered
+/// type, or failing that one of the standard-library types `ron` reads as a
+/// struct of their own — see [`std_record_type`].
+fn struct_value_type<'a>(analyzer: &'a RustAnalyzer, type_name: &str) -> Option<&'a TypeInfo> {
+    analyzer
+        .get_type_info(type_name)
+        .or_else(|| std_record_type(type_name))
+}
+
+/// The fields of a standard-library type that `ron` reads as a struct of its
+/// own, `Duration` as `(secs: 0, nanos: 0)` and `SystemTime` as
+/// `(secs_since_epoch: 0, nanos_since_epoch: 0)`, or `None` for any other
+/// name.
+///
+/// Nothing in `std` is ever registered with the analyzer, so a value of either
+/// had no type to resolve to. A cursor inside `timeout: (|)` was completed as
+/// the field's value and offered the whole `(secs: 0, nanos: 0)` again — into
+/// parentheses already written, making `((secs: 0, nanos: 0))` — and one inside
+/// `timeout: (secs: 1, |)` was offered nothing, not even the `nanos` that is
+/// still missing. These describe the two to the features that look a struct
+/// value's fields up: completion and hover. Validating a value is left to
+/// deserializing it into the real type, as before.
+///
+/// A type of the consumer's own that shares the name is still found first, by
+/// [`struct_value_type`].
+pub fn std_record_type(type_name: &str) -> Option<&'static TypeInfo> {
+    use crate::rust_analyzer::{FieldInfo, TypeKind};
+    use std::sync::LazyLock;
+
+    fn record(name: &str, docs: &str, fields: [(&str, &str, &str); 2]) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            docs: Some(docs.to_string()),
+            kind: TypeKind::Struct(
+                fields
+                    .into_iter()
+                    .map(|(name, type_name, docs)| FieldInfo {
+                        name: name.to_string(),
+                        type_name: type_name.to_string(),
+                        docs: Some(docs.to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    static DURATION: LazyLock<TypeInfo> = LazyLock::new(|| {
+        record(
+            "Duration",
+            "`std::time::Duration`, as serde writes it.",
+            [
+                ("secs", "u64", "Whole seconds."),
+                (
+                    "nanos",
+                    "u32",
+                    "Nanoseconds past `secs`, below one billion.",
+                ),
+            ],
+        )
+    });
+    static SYSTEM_TIME: LazyLock<TypeInfo> = LazyLock::new(|| {
+        record(
+            "SystemTime",
+            "`std::time::SystemTime`, as serde writes it.",
+            [
+                (
+                    "secs_since_epoch",
+                    "u64",
+                    "Whole seconds since the Unix epoch.",
+                ),
+                (
+                    "nanos_since_epoch",
+                    "u32",
+                    "Nanoseconds past `secs_since_epoch`, below one billion.",
+                ),
+            ],
+        )
+    });
+
+    match type_name {
+        "Duration" => Some(&DURATION),
+        "SystemTime" => Some(&SYSTEM_TIME),
+        _ => None,
+    }
 }
 
 /// Deepest a chain of wrappers is followed by [`value_type`]. No declared type
@@ -122,9 +213,18 @@ const MAX_WRAPPER_DEPTH: usize = 16;
 /// generic layer stopped at `Box<Inner>`, and a map's `String,Limits` named no
 /// type at all, so hover, completion and go-to-definition found nothing there.
 pub fn value_type<'a>(analyzer: &'a RustAnalyzer, type_name: &str) -> Option<&'a TypeInfo> {
+    value_type_by(type_name, |name| analyzer.get_type_info(name))
+}
+
+/// [`value_type`], with the type a struct value's fields belong to looked up
+/// by `lookup` rather than in the analyzer alone.
+fn value_type_by<'a>(
+    type_name: &str,
+    lookup: impl Fn(&str) -> Option<&'a TypeInfo>,
+) -> Option<&'a TypeInfo> {
     let mut current = normalize_type(type_name).into_owned();
     for _ in 0..MAX_WRAPPER_DEPTH {
-        if let Some(info) = analyzer.get_type_info(&current) {
+        if let Some(info) = lookup(&current) {
             return Some(info);
         }
         let inner = single_value_wrapped_type(&current)

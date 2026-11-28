@@ -245,7 +245,9 @@ understood by name instead, by the RON spelling serde reads each one from:
   is deserialized into the real type to check it, so a missing or misspelled
   field, a field of the wrong type, a `{..}` map, or another struct's name in
   front of the parentheses is reported the way `ron` reports it (``invalid
-  Duration: Unexpected missing field named `nanos` ``)
+  Duration: Unexpected missing field named `nanos` ``). Inside the
+  parentheses of one, completion offers the fields not written yet (`secs`,
+  `nanos`) and hover describes them, as for a struct of the consumer's own
 - written as an array of their elements: `VecDeque<T>`, `LinkedList<T>`,
   `BinaryHeap<T>`, alongside the `Vec<T>`, `HashSet<T>` and `BTreeSet<T>`
   already handled
