@@ -433,6 +433,18 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Any other value's parentheses hold values, and are completed from a
+        // copy in which they parse as a tuple: the `( )` an editor leaves after
+        // `(` and Enter doesn't parse at all.
+        let tupled = completion::with_open_unnamed_tuple(content, position).map(|content| {
+            let tree = ts_utils::parse(&content);
+            (content, tree)
+        });
+        let (content, tree) = match &tupled {
+            Some((content, tree)) => (content.as_str(), tree),
+            None => (content, tree),
+        };
+
         let Some(type_info) = self.resolve_completion_owner_at(content, tree, position) else {
             return Ok(None);
         };
@@ -2461,6 +2473,7 @@ Document::new(content.to_string()),
                 field("servers", "Vec<Server>"),
                 field("backup", "Option<Server>"),
                 field("route", "(u16, u16)"),
+                field("routes", "Vec<(u16, u16)>"),
                 field("name", "String"),
             ]),
             ..Default::default()
@@ -2487,8 +2500,21 @@ Document::new(content.to_string()),
             ("Config(backup: Some((|)))", &server),
             // Once a field is written the value parsed as a struct already.
             ("Config(server: (host: \"a\", |))", &vec!["port"]),
-            // A tuple's parentheses still take the values of its positions.
+            // A tuple's parentheses still take the values of its positions,
+            // with space in them too, although `( )` isn't the `()` the
+            // grammar knows; see
+            // <https://git.cilki.net/cilki/roniker/issues/130>.
             ("Config(route: (|))", &vec!["0"]),
+            ("Config(route: ( | ))", &vec!["0"]),
+            ("Config(route: (\n    |\n))", &vec!["0"]),
+            ("Config(route: (1|))", &vec!["0"]),
+            ("Config(routes: [(\n    |\n)])", &vec!["0"]),
+            ("Config(\n    route: (\n        |", &vec!["0"]),
+            // And with more of the document after the value.
+            (
+                "Config(\n    route: (\n        |\n    ),\n    name: \"\",\n)",
+                &vec!["0"],
+            ),
         ] {
             let offset = marked.find('|').unwrap();
             let content = marked.replacen('|', "", 1);

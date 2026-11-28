@@ -243,6 +243,41 @@ const PLACEHOLDER_FIELD: &str = "__roniker_placeholder__: ()";
 ///
 /// [#157]: https://git.cilki.net/cilki/roniker/issues/157
 pub fn with_open_unnamed_struct(content: &str, position: Position) -> Option<String> {
+    with_placeholder_in_open_parens(content, position, PLACEHOLDER_FIELD)
+}
+
+/// The values the parentheses of an unnamed tuple are given by
+/// [`with_open_unnamed_tuple`] so that they parse as a tuple — two of them,
+/// since the grammar has no one-element tuple. Like [`PLACEHOLDER_FIELD`] it
+/// names nothing.
+const PLACEHOLDER_VALUES: &str = "__roniker_placeholder__, __roniker_placeholder__";
+
+/// `content` rewritten so that the unnamed parentheses the cursor has only just
+/// opened parse as a tuple with the cursor on its first value, or `None` when
+/// the cursor is anywhere else.
+///
+/// This is the counterpart of [`with_open_unnamed_struct`] for a value that
+/// isn't a struct with named fields — a tuple, a fixed-size array, a tuple
+/// struct. `retries: (|)` parses as a `()` with the cursor in it, and the
+/// value's first position is completed. But the grammar only knows `()` as one
+/// token ([#130]), so the `( )` or `(\n    |\n)` an editor leaves after `(` and
+/// Enter doesn't parse at all, and completion offered the fields of the struct
+/// *around* the value instead. [`PLACEHOLDER_VALUES`] at the cursor make the
+/// parentheses a tuple again, completed the way `(|)` is.
+///
+/// [#130]: https://git.cilki.net/cilki/roniker/issues/130
+pub fn with_open_unnamed_tuple(content: &str, position: Position) -> Option<String> {
+    with_placeholder_in_open_parens(content, position, PLACEHOLDER_VALUES)
+}
+
+/// `content` with `placeholder` put at the cursor when it is in parentheses
+/// just opened where a value goes, and whatever else is in them blanked; see
+/// [`with_open_unnamed_struct`].
+fn with_placeholder_in_open_parens(
+    content: &str,
+    position: Position,
+    placeholder: &str,
+) -> Option<String> {
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let bytes = content.as_bytes();
     let cursor = super::ts_utils::position_to_byte_offset(content, position);
@@ -278,10 +313,10 @@ pub fn with_open_unnamed_struct(content: &str, position: Position) -> Option<Str
             .map(|c| if c.is_ascii_whitespace() { c } else { ' ' })
             .collect()
     };
-    let mut patched = String::with_capacity(content.len() + PLACEHOLDER_FIELD.len());
+    let mut patched = String::with_capacity(content.len() + placeholder.len());
     patched.push_str(&content[..=open]);
     patched.push_str(&blank(&content[open + 1..cursor]));
-    patched.push_str(PLACEHOLDER_FIELD);
+    patched.push_str(placeholder);
     patched.push_str(&blank(&content[cursor..close]));
     patched.push_str(&content[close..]);
     Some(patched)
